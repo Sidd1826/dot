@@ -1,0 +1,103 @@
+-- Enable pgcrypto for gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- =============================================================================
+-- TABLE 1: export_files
+-- Tracks every FRI / MNRL Excel exported to Azure Blob.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS export_files (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    module       VARCHAR(10) NOT NULL CHECK (module IN ('FRI', 'MNRL')),
+    file_name    TEXT NOT NULL,
+    blob_name    TEXT NOT NULL,
+    container    TEXT NOT NULL,
+    record_count INTEGER NOT NULL CHECK (record_count >= 0),
+    export_date  DATE NOT NULL,
+    data_type    VARCHAR(20) NULL CHECK (data_type IN ('Normal', 'Reactivated') OR data_type IS NULL),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_export_files_module ON export_files (module, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_export_files_id_module ON export_files (id, module);
+
+
+-- =============================================================================
+-- TABLE 2: mobilecleanup
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS mobilecleanup (
+    cust_id       VARCHAR(100) NULL,
+    mob_num       VARCHAR(50) NULL,
+    final_mob_num VARCHAR(20) NULL,
+    ZBADID        VARCHAR(100) NULL,
+    ZBNAD1        VARCHAR(255) NULL,
+    ZBNAD2        VARCHAR(255) NULL,
+    ZBNAD3        VARCHAR(255) NULL,
+    ZBNAD4        VARCHAR(255) NULL,
+    ZBNAD5        VARCHAR(255) NULL,
+    ZBTENO        VARCHAR(50) NULL,
+    ZBTEN2        VARCHAR(50) NULL,
+    ZBTEN3        VARCHAR(50) NULL,
+    ZBPSCD        VARCHAR(20) NULL,
+    ZBIADD        VARCHAR(255) NULL
+);
+
+ALTER TABLE mobilecleanup SET UNLOGGED;
+
+-- Critical for Phase 3 chunked IN-clause queries on 30L rows.
+-- Without this, every chunk does a full sequential scan.
+CREATE INDEX IF NOT EXISTS idx_mobilecleanup_final_mob_num ON mobilecleanup (final_mob_num);
+
+-- Speeds up lookups if you ever query by mob_num directly.
+CREATE INDEX IF NOT EXISTS idx_mobilecleanup_mob_num ON mobilecleanup (mob_num);
+
+
+-- =============================================================================
+-- TABLE 3: matchoff_runs
+-- Tracks every Phase 3 match-off execution.
+-- One row per run: source file, output file, match statistics.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS matchoff_runs (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Source Excel (inside existing fri-exports / mnrl-exports blob)
+    source_container   TEXT NOT NULL CHECK (source_container IN ('fri-exports', 'mnrl-exports')),
+    source_date_folder TEXT NOT NULL,                             -- e.g., "2025-03-10"
+    source_file_name   TEXT NOT NULL,                             -- e.g., "mnrl_normal_2025-03-10_50000_records.xlsx"
+    
+    -- Output Excel (written to matchoff-output blob)
+    output_container   TEXT NOT NULL DEFAULT 'matchoff-output',
+    output_blob_path   TEXT NOT NULL,                             -- e.g., "2025-03-10/..._matched_1234_records.xlsx"
+    
+    -- Match statistics
+    input_row_count    INTEGER NOT NULL DEFAULT 0 CHECK (input_row_count >= 0),
+    matched_count      INTEGER NOT NULL DEFAULT 0 CHECK (matched_count >= 0),
+    mob_column         TEXT NOT NULL DEFAULT 'mob_num',
+    run_date           DATE NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+    CONSTRAINT chk_matched_lte_input CHECK (matched_count <= input_row_count)
+);
+
+CREATE INDEX IF NOT EXISTS idx_matchoff_runs_created_at ON matchoff_runs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_matchoff_runs_container ON matchoff_runs (source_container, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_matchoff_runs_date_folder ON matchoff_runs (source_date_folder);
+
+
+-- =============================================================================
+-- TABLE 4: jobs
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS jobs (
+    id          TEXT PRIMARY KEY,
+    status      TEXT NOT NULL DEFAULT 'pending', -- pending | running | done | failed
+    result      JSONB,                           -- populated when status 'done'
+    error       TEXT,                            -- last traceback line when status 'failed'
+    started_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Fast lookup for GET /export/status/<job_id>
+CREATE INDEX IF NOT EXISTS idx_jobs_id_status ON jobs (id, status);
+
+-- Fast cleanup queries (only scans finished rows)
+CREATE INDEX IF NOT EXISTS idx_jobs_finished_at ON jobs (finished_at) WHERE finished_at IS NOT NULL;
