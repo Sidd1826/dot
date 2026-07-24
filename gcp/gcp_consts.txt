@@ -9,6 +9,10 @@ def get_indp_bq_table():
     return get_env_var("INDP_BQ_TABLE")
 
 
+def get_indp_cust_bq_table():
+    return get_env_var("INDP_CUST_BQ_TABLE")
+
+
 def get_indp_partition_filter():
     return get_env_var("INDP_PARTITION_FILTER")
 

@@ -17,6 +17,7 @@ from consts import (
     get_az_sql_username,
     get_bq_batch_size,
     get_indp_bq_table,
+    get_indp_cust_bq_table,
     get_indp_gcp_creds,
     get_indp_partition_filter,
     get_sql_insert_chunk_size,
@@ -47,9 +48,18 @@ NEW_COLS = [
 KMS_KEY = "projects/test-test-test-test/locations/asia-test/test/test/test/test"
 
 BQ_TABLE = get_indp_bq_table()
+CUST_BQ_TABLE = get_indp_cust_bq_table()  # SSCUSTP mirror, joined on CUST_ID_COL
 PARTITION_FILTER = get_indp_partition_filter()
 DISTINCT_KEY_COL = "ZBTEN3"
 CUST_ID_COL = "IP_SRCE_KEY"
+ZGGHCL_COL = "ZGGHCL"
+GHO_CLASSIFICATION_COL = "CUST_GHO_classification"  # raw ZGGHCL value
+GHO_CODE_COL = "GHO_code"  # ZGGHCL mapped to business code
+
+# TODO: fill in the remaining ZGGHCL -> business code mappings
+GHO_CODE_MAP = {
+    "PRS": "IWPB",
+}
 
 # Batching & retry
 BATCH_SIZE = get_bq_batch_size()
@@ -249,11 +259,12 @@ def clean_mobile_number(raw_telno: str, country_res: str = "IN") -> str:
 
 
 # BIGQUERY
-def _build_base_where() -> str:
+def _build_base_where(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
     return (
         f"WHERE ({PARTITION_FILTER}) "
-        f"AND BATCH_DT = (SELECT MAX(BATCH_DT) FROM {BQ_TABLE} WHERE PARTI_MONTH IS NOT NULL) "
-        f"AND ZBADID = 'P1'"
+        f"AND {prefix}BATCH_DT = (SELECT MAX(BATCH_DT) FROM {BQ_TABLE} WHERE PARTI_MONTH IS NOT NULL) "
+        f"AND {prefix}ZBADID = 'P1'"
     )
 
 
@@ -266,11 +277,12 @@ def _build_count_query() -> str:
 
 
 def _build_batch_query(offset: int, batch_size: int) -> str:
+    new_cols_sql = ", ".join(f"a.{c}" for c in NEW_COLS)
     return (
-        f"SELECT {CUST_ID_COL}, {DISTINCT_KEY_COL}, "
-        f"ZBADID, ZBNAD1, ZBNAD2, ZBNAD3, ZBNAD4, ZBNADS, ZBTENO, ZBTEN2, ZBTEN3, ZBPSCD, ZBIADO "
-        f"FROM {BQ_TABLE} "
-        f"{_build_base_where()} "
+        f"SELECT a.{CUST_ID_COL}, a.{DISTINCT_KEY_COL}, {new_cols_sql}, c.{ZGGHCL_COL} "
+        f"FROM {BQ_TABLE} a "
+        f"LEFT JOIN {CUST_BQ_TABLE} c ON a.{CUST_ID_COL} = c.{CUST_ID_COL} "
+        f"{_build_base_where('a')} "
         f"LIMIT {batch_size} OFFSET {offset}"
     )
 
@@ -394,7 +406,9 @@ def fetch_and_clean_batch(offset: int, batch_size: int) -> Tuple[List, int, int]
             continue
 
         extra_vals = [str(row.get(c, "") or "") for c in NEW_COLS]
-        insert_rows.append((cust_id, mob_num, final_mob_num, *extra_vals))
+        gho_raw = str(row.get(ZGGHCL_COL, "") or "")
+        gho_code = GHO_CODE_MAP.get(gho_raw, "")
+        insert_rows.append((cust_id, mob_num, final_mob_num, *extra_vals, gho_raw, gho_code))
 
     return insert_rows, len(raw_rows), skipped
 
@@ -424,7 +438,7 @@ def bulk_insert_rows(engine: Engine, rows: List[Tuple[Any, ...]]) -> int:
     writer.writerows(rows)
     buffer.seek(0)
 
-    copy_cols = ["cust_id", "mob_num", "final_mob_num"] + NEW_COLS
+    copy_cols = ["cust_id", "mob_num", "final_mob_num"] + NEW_COLS + [GHO_CLASSIFICATION_COL, GHO_CODE_COL]
     copy_cols_sql = ", ".join(copy_cols)
 
     for attempt in range(1, MAX_RETRIES + 1):

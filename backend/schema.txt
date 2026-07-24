@@ -38,8 +38,14 @@ CREATE TABLE IF NOT EXISTS mobilecleanup (
     ZBTEN2        VARCHAR(50) NULL,
     ZBTEN3        VARCHAR(50) NULL,
     ZBPSCD        VARCHAR(20) NULL,
-    ZBIADD        VARCHAR(255) NULL
+    ZBIADD        VARCHAR(255) NULL,
+    CUST_GHO_classification VARCHAR(100) NULL,
+    GHO_code      VARCHAR(100) NULL
 );
+
+-- Run this if mobilecleanup already exists in Azure without the new columns.
+ALTER TABLE mobilecleanup ADD COLUMN IF NOT EXISTS CUST_GHO_classification VARCHAR(100) NULL;
+ALTER TABLE mobilecleanup ADD COLUMN IF NOT EXISTS GHO_code VARCHAR(100) NULL;
 
 ALTER TABLE mobilecleanup SET UNLOGGED;
 
