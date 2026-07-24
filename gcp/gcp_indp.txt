@@ -1,0 +1,561 @@
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import io
+from itertools import islice
+import json
+from logging import logger
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from consts import (
+    get_az_sql_db,
+    get_az_sql_host,
+    get_az_sql_password,
+    get_az_sql_table,
+    get_az_sql_username,
+    get_bq_batch_size,
+    get_indp_bq_table,
+    get_indp_gcp_creds,
+    get_indp_partition_filter,
+    get_sql_insert_chunk_size,
+)
+from fastapi import HTTPException
+from google.cloud import bigquery
+from google.oauth2 import service_account
+import psycopg2
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+GCP_CREDENTIALS_JSON = get_indp_gcp_creds()
+
+NEW_COLS = [
+    "ZBADID",
+    "ZBNAD1",
+    "ZBNAD2",
+    "ZBNAD3",
+    "ZBNAD4",
+    "ZBNADS",
+    "ZBTENO",
+    "ZBTEN2",
+    "ZBTEN3",
+    "ZBPSCD",
+    "ZBIADO",
+]
+
+KMS_KEY = "projects/test-test-test-test/locations/asia-test/test/test/test/test"
+
+BQ_TABLE = get_indp_bq_table()
+PARTITION_FILTER = get_indp_partition_filter()
+DISTINCT_KEY_COL = "ZBTEN3"
+CUST_ID_COL = "IP_SRCE_KEY"
+
+# Batching & retry
+BATCH_SIZE = get_bq_batch_size()
+SQL_INSERT_CHUNK = get_sql_insert_chunk_size()
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 5
+
+# Azure SQL
+SQL_SERVER = get_az_sql_host()
+SQL_DATABASE = get_az_sql_db()
+SQL_USERNAME = get_az_sql_username()
+SQL_PASSWORD = get_az_sql_password()
+SQL_TABLE = get_az_sql_table()
+
+DEFAULT_COUNTRY_RES = "IN"
+
+# MOBILE CLEANUP
+INDIAN_2D = {
+    "69", "60", "61", "62", "63", "64", "65", "66", "67", "68",
+    "70", "71", "72", "73", "74", "75", "76", "77", "78", "79",
+    "80", "81", "82", "83", "84", "85", "86", "87", "88", "89",
+    "90", "91", "92", "93", "94", "95", "96", "97", "98", "99",
+}
+
+INDIAN_800_SERIES = {"801", "805", "808", "809", "800"}
+
+INTL_COUNTRY_CONFIG = {
+    "971": 12,
+    "966": 12,
+    "974": 11,
+    "973": 11,
+    "968": 11,
+    "965": 11,
+    "852": 11,
+    "44": 12,
+    "65": 10,
+    "61": 11,
+}
+
+INTL_VALID_SERIES = {
+    "973": {"36", "38", "39"},
+    "965": {"92", "95", "99", "89"},
+    "968": {"92", "95", "99", "89"},
+    "974": {"50", "51", "52", "53", "54", "55", "56", "57", "58"},
+    "966": {"50", "53", "54", "55", "56"},
+    "971": {"50", "55", "56"},
+    "852": {
+        "17", "41", "45", "48", "49", "60", "61", "62", "63", "64",
+        "65", "66", "67", "68", "69", "90", "91", "92", "93", "94",
+        "95", "96", "97", "98", "81", "82", "83", "85",
+    },
+    "65": {"90", "91", "92", "93", "94", "96", "97", "98", "81", "82", "83", "85"},
+    "44": {"74", "75", "77", "78", "79"},
+    "61": {"48", "41", "42", "43"},
+}
+
+COUNTRY_CODE_MAP = {
+    "AE": "971",
+    "SA": "966",
+    "QA": "974",
+    "BH": "973",
+    "OM": "968",
+    "KW": "965",
+    "HK": "852",
+    "SG": "65",
+    "GB": "44",
+    "AU": "61",
+}
+
+INTL_COUNTRIES = set(COUNTRY_CODE_MAP.keys())
+
+
+def _strip_special_chars(number: str) -> str:
+    for delim in ["/", "\\", ",", "&", "X", ";", "(", "*", "//", "-"]:
+        idx = number.find(delim)
+        if idx > 0:
+            number = number[:idx]
+    number = number.replace(" ", "")
+    number = re.sub(r"[^0-9+]", "", number)
+    number = re.sub(r"^[^0-9]+", "", number)
+    return number.strip()
+
+
+def _normalise_intl_number(number: str, country_code: str) -> str:
+    cc_len = len(country_code)
+    expected = INTL_COUNTRY_CONFIG[country_code]
+    sub_len = expected - cc_len
+
+    for prefix, total_len in [
+        (f"0000{country_code}", 4 + cc_len + sub_len),
+        (f"000{country_code}", 3 + cc_len + sub_len),
+        (f"00{country_code}", 2 + cc_len + sub_len),
+        (f"0{country_code}", 1 + cc_len + sub_len),
+        (country_code, expected),
+    ]:
+        if number.startswith(prefix) and len(number) == total_len:
+            return number[len(prefix) - cc_len:]
+    return number
+
+
+def clean_indian_domestic(raw: str) -> str:
+    if not raw:
+        return ""
+    number = _strip_special_chars(raw.strip())
+    number = re.sub(r"[^0-9]", "", number)
+    if not number:
+        return ""
+
+    for prefix, expected_total in [
+        ("000919", 16), ("00919", 15), ("0919", 14), ("919", 13),
+        ("000918", 16), ("00918", 15), ("0918", 14), ("918", 13),
+        ("000917", 16), ("00917", 15), ("0917", 14), ("917", 13),
+        ("000916", 16), ("00916", 15), ("0916", 14), ("916", 13),
+    ]:
+        if number.startswith(prefix) and len(number) == expected_total:
+            number = number[len(prefix) - 2:]
+            break
+
+    if len(number) == 12 and number.startswith("91"):
+        number = number[2:]
+
+    for prefix in [
+        "090", "091", "092", "093", "094", "095", "096", "097", "098", "099",
+        "081", "082", "083", "084", "085", "086", "087", "088", "089",
+        "070", "071", "072", "073", "074", "075", "076", "077", "078", "079",
+        "060", "061", "062", "063", "064", "065", "066", "067", "068", "069",
+        "0801", "0805", "0808", "0809", "0800",
+    ]:
+        if number.startswith(prefix):
+            if len(number) == 11:
+                number = number[1:]
+            elif len(number) == 10:
+                pass
+            break
+
+    if len(number) != 10:
+        return ""
+
+    if number[:2] in INDIAN_2D or number[:3] in INDIAN_800_SERIES:
+        return "91" + number
+    return ""
+
+
+def clean_international(raw: str, country_res: str) -> str:
+    if not raw or not country_res:
+        return ""
+    number = re.sub(r"[^0-9+]", "", raw.strip())
+    if number.startswith("+"):
+        number = number[1:]
+    number = re.sub(r"[^0-9]", "", number)
+    if not number:
+        return ""
+
+    cc = COUNTRY_CODE_MAP.get(country_res.strip().upper())
+    if not cc:
+        return ""
+
+    expected = INTL_COUNTRY_CONFIG.get(cc)
+    if not expected:
+        return ""
+
+    canonical = _normalise_intl_number(number, cc)
+    if not canonical or len(canonical) != expected:
+        return ""
+
+    series = canonical[len(cc): len(cc) + 2]
+    valid = INTL_VALID_SERIES.get(cc, set())
+    if valid and series not in valid:
+        return ""
+
+    return canonical
+
+
+def clean_mobile_number(raw_telno: str, country_res: str = "IN") -> str:
+    if not raw_telno or not str(raw_telno).strip():
+        return ""
+
+    country_res = (country_res or DEFAULT_COUNTRY_RES).strip().upper()
+    raw = str(raw_telno).strip()
+
+    if country_res in INTL_COUNTRIES:
+        result = clean_international(raw, country_res)
+        if result:
+            return result
+
+    domestic = clean_indian_domestic(raw)
+    if domestic:
+        return domestic
+
+    digits_only = re.sub(r"[^0-9]", "", raw)
+    if not re.search(r"[A-Za-z]", raw) and len(digits_only) in (10, 12):
+        candidate = digits_only if len(digits_only) == 12 else "91" + digits_only
+        if candidate.startswith("91") and candidate[2] in "6789":
+            return candidate
+
+    return ""
+
+
+# BIGQUERY
+def _build_base_where() -> str:
+    return (
+        f"WHERE ({PARTITION_FILTER}) "
+        f"AND BATCH_DT = (SELECT MAX(BATCH_DT) FROM {BQ_TABLE} WHERE PARTI_MONTH IS NOT NULL) "
+        f"AND ZBADID = 'P1'"
+    )
+
+
+def _build_count_query() -> str:
+    return (
+        f"SELECT COUNT(DISTINCT {DISTINCT_KEY_COL}) AS total "
+        f"FROM {BQ_TABLE} "
+        f"{_build_base_where()}"
+    )
+
+
+def _build_batch_query(offset: int, batch_size: int) -> str:
+    return (
+        f"SELECT {CUST_ID_COL}, {DISTINCT_KEY_COL}, "
+        f"ZBADID, ZBNAD1, ZBNAD2, ZBNAD3, ZBNAD4, ZBNADS, ZBTENO, ZBTEN2, ZBTEN3, ZBPSCD, ZBIADO "
+        f"FROM {BQ_TABLE} "
+        f"{_build_base_where()} "
+        f"LIMIT {batch_size} OFFSET {offset}"
+    )
+
+
+def _build_column_names_query() -> str:
+    project, dataset, table = BQ_TABLE.split(".")
+    return (
+        f"SELECT column_name FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS` "
+        f"WHERE table_name = '{table}' ORDER BY ordinal_position"
+    )
+
+
+def _build_preview_query(limit: int = 5) -> str:
+    return f"SELECT * FROM `{BQ_TABLE}` {_build_base_where()} LIMIT {limit}"
+
+
+def get_column_names() -> List[str]:
+    logger.info("Fetching column names from BigQuery...")
+    rows = gcp_kms(GCP_CREDENTIALS_JSON, _build_column_names_query())
+    cols = [row["column_name"] for row in rows]
+    logger.info("Total columns: %d", len(cols))
+    return cols
+
+
+def print_first_rows(limit: int = 5) -> None:
+    logger.info("Fetching first %d rows from BigQuery...", limit)
+    rows = gcp_kms(GCP_CREDENTIALS_JSON, _build_preview_query(limit))
+    for i, row in enumerate(rows, start=1):
+        logger.info("Row %d: %s", i, dict(row))
+
+
+def gcp_kms(creds, query) -> List[dict]:
+    creds_dict = json.loads(creds)
+    try:
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+        credentials = service_account.Credentials.from_service_account_info(creds_dict)
+        client = bigquery.Client(credentials=credentials, project=creds_dict["project_id"])
+
+        job_config = None
+        if KMS_KEY:
+            enc = bigquery.EncryptionConfiguration(kms_key_name=KMS_KEY)
+            job_config = bigquery.QueryJobConfig(destination_encryption_configuration=enc)
+
+        job = client.query(query, job_config=job_config)
+        results = [dict(row) for row in job.result()]
+        logger.debug("Query executed successfully. Rows fetched %d", len(results))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error occurred while fetching data from BigQuery: {str(e)}")
+
+    return results
+
+
+def get_total_count() -> int:
+    logger.info("Fetching total row count from BigQuery...")
+    rows = gcp_kms(GCP_CREDENTIALS_JSON, _build_count_query())
+    total = int(rows[0]["total"])
+    logger.info("Total rows to process: %d", total)
+    return total
+
+
+def fetch_batch_with_retry(offset: int, batch_size: int) -> List[Dict]:
+    last_exc: Optional[Exception] = None
+    query = _build_batch_query(offset, batch_size)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            logger.info("BQ fetch offset=%d (attempt %d/%d)", offset, attempt, MAX_RETRIES)
+            rows = gcp_kms(GCP_CREDENTIALS_JSON, query)
+            logger.info("Fetched %d rows", len(rows))
+            return rows
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Attempt %d failed: %s", attempt, exc)
+            if attempt < MAX_RETRIES:
+                logger.info("Retrying in %ds", RETRY_DELAY_SECONDS)
+                time.sleep(RETRY_DELAY_SECONDS)
+
+    raise RuntimeError(f"All ({MAX_RETRIES}) retries exhausted for offset={offset}") from last_exc
+
+
+# AZURE SQL
+def _get_sql_engine() -> Engine:
+    from urllib.parse import quote_plus
+    pwd = quote_plus(SQL_PASSWORD)
+    url = f"postgresql+psycopg2://{SQL_USERNAME}:{pwd}@{SQL_SERVER}/{SQL_DATABASE}?sslmode=require"
+
+    return create_engine(
+        url,
+        max_overflow=2,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_size=3,
+        connect_args={
+            "connect_timeout": 30,
+            "keepalives": 1,
+            "keepalives_idle": 60,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        },
+    )
+
+
+def fetch_and_clean_batch(offset: int, batch_size: int) -> Tuple[List, int, int]:
+    raw_rows = fetch_batch_with_retry(offset, batch_size)
+    if not raw_rows:
+        return [], 0, 0
+
+    has_country_col = "COUNTRY_RES" in raw_rows[0]
+    insert_rows = []
+    skipped = 0
+
+    for row in raw_rows:
+        cust_id = str(row.get(CUST_ID_COL, "") or "")
+        mob_num = str(row.get(DISTINCT_KEY_COL, "") or "")
+        country_res = str(row.get("COUNTRY_RES", "") or DEFAULT_COUNTRY_RES) if has_country_col else DEFAULT_COUNTRY_RES
+
+        final_mob_num = clean_mobile_number(mob_num, country_res)
+        if not final_mob_num:
+            skipped += 1
+            continue
+
+        extra_vals = [str(row.get(c, "") or "") for c in NEW_COLS]
+        insert_rows.append((cust_id, mob_num, final_mob_num, *extra_vals))
+
+    return insert_rows, len(raw_rows), skipped
+
+
+def truncate_table(engine: Engine) -> None:
+    logger.info("Truncating table %s", SQL_TABLE)
+    with engine.begin() as conn:
+        conn.execute(text(f"TRUNCATE TABLE {SQL_TABLE}"))
+    logger.info("Table truncated.")
+
+
+def chunked(iterable, size: int):
+    it = iter(iterable)
+    while True:
+        chunk = list(islice(it, size))
+        if not chunk:
+            break
+        yield chunk
+
+
+def bulk_insert_rows(engine: Engine, rows: List[Tuple[Any, ...]]) -> int:
+    if not rows:
+        return 0
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, quoting=csv.QUOTE_MINIMAL)
+    writer.writerows(rows)
+    buffer.seek(0)
+
+    copy_cols = ["cust_id", "mob_num", "final_mob_num"] + NEW_COLS
+    copy_cols_sql = ", ".join(copy_cols)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            raw_conn = engine.raw_connection()
+            try:
+                with raw_conn.cursor() as cursor:
+                    cursor.copy_expert(
+                        f"COPY {SQL_TABLE} ({copy_cols_sql}) FROM STDIN WITH (FORMAT CSV)",
+                        buffer,
+                    )
+                raw_conn.commit()
+            finally:
+                raw_conn.close()
+            return len(rows)
+        except psycopg2.OperationalError as exc:
+            logger.warning("COPY failed attempt %d/%d: %s", attempt, MAX_RETRIES, exc)
+            buffer.seek(0)
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(RETRY_DELAY_SECONDS)
+
+    return 0
+
+
+def indp_bq_to_az() -> dict:
+    logger.info("-" * 60)
+    logger.info("Pipeline START")
+    logger.info("BQ Table: %s", BQ_TABLE)
+    logger.info("Filter : %s", PARTITION_FILTER)
+    logger.info("SQL Table: %s", SQL_TABLE)
+    logger.info("=" * 60)
+
+    total_rows = get_total_count()
+    if total_rows == 0:
+        logger.warning("No rows found in BQ. Pipeline exiting WITHOUT DB changes.")
+        return {"status": "skipped", "reason": "no_data_in_bq", "total_rows": 0}
+
+    # Step 3: Build offsets
+    offsets = []
+    for b in range(0, total_rows, BATCH_SIZE):
+        actual_size = min(BATCH_SIZE, total_rows - b)
+        offsets.append((b, actual_size))
+
+    num_batches = len(offsets)
+    logger.info(
+        "Total rows=%d batches=%d batch_size=%d last_batch_size=%d",
+        total_rows, num_batches, BATCH_SIZE, offsets[-1][1]
+    )
+
+    # Step 4: Fetch ALL batches FIRST (no Azure touch yet)
+    logger.info("Phase 1: fetching all batches from BQ...")
+    pipeline_start = time.time()
+    all_insert_rows = []
+    total_fetched = 0
+    total_skipped = 0
+    failed_batches = []
+    MAX_WORKERS = 4
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(fetch_and_clean_batch, offset, size): (batch_num, offset, size)
+            for batch_num, (offset, size) in enumerate(offsets, 1)
+        }
+
+        for future in as_completed(futures):
+            batch_num, offset, size = futures[future]
+            try:
+                insert_rows, fetched, skipped = future.result()
+                all_insert_rows.extend(insert_rows)
+                total_fetched += fetched
+                total_skipped += skipped
+                logger.info(
+                    "[FETCH] batch %d/%d offset=%d fetched=%d skipped=%d valid=%d",
+                    batch_num, num_batches, offset, fetched, skipped, len(insert_rows)
+                )
+            except Exception as exc:
+                logger.error(
+                    "[FETCH] batch %d/%d FAILED at offset=%d: %s",
+                    batch_num, num_batches, offset, exc
+                )
+                failed_batches.append((batch_num, offset, size, str(exc)))
+
+    # Step 5: Abort if any batch failed
+    if failed_batches:
+        logger.error("=" * 60)
+        logger.error("%d/%d batches FAILED during fetch.", len(failed_batches), num_batches)
+        logger.error("Pipeline ABORTED - Azure SQL data is preserved.")
+        for bn, off, sz, err in failed_batches:
+            logger.error(" Failed batch %d (offset=%d size=%d): %s", bn, off, sz, err)
+        logger.error("=" * 60)
+        return {
+            "status": "aborted",
+            "reason": "batch_fetch_failures",
+            "failed_batches": len(failed_batches),
+            "total_batches": num_batches,
+        }
+
+    logger.info("Phase 1 complete. Total valid rows ready to insert: %d", len(all_insert_rows))
+
+    # Step 6: Only NOW truncate + insert (we know all data is ready)
+    sql_engine = _get_sql_engine()
+    total_inserted = 0
+    try:
+        logger.info("Phase 2: truncating target table...")
+        truncate_table(sql_engine)
+        logger.info("Phase 2: inserting %d rows...", len(all_insert_rows))
+        insert_start = time.time()
+        total_inserted = bulk_insert_rows(sql_engine, all_insert_rows)
+        logger.info("[INSERT] done %d rows in %.2fs", total_inserted, time.time() - insert_start)
+    finally:
+        sql_engine.dispose()
+        logger.info("SQL engine disposed.")
+
+    # Step 7: Summary
+    total_elapsed = time.time() - pipeline_start
+    summary = {
+        "status": "success",
+        "total_rows_in_bq": total_rows,
+        "total_fetched": total_fetched,
+        "total_skipped": total_skipped,
+        "total_inserted": total_inserted,
+        "failed_batches": 0,
+        "time_elapsed_in_seconds": round(total_elapsed, 2),
+        "time_elapsed_in_minutes": round(total_elapsed / 60, 1),
+    }
+
+    logger.info("=" * 60)
+    logger.info("Pipeline Complete")
+    for k, v in summary.items():
+        logger.info("%-25s: %s", k, v)
+    logger.info("-" * 60)
+
+    return summary

@@ -1,0 +1,58 @@
+from datetime import datetime, timezone
+import time
+import azure.functions as func
+
+from inm_gcp_service import app as fastapi_app
+from inm_gcp_service.common.logging import get_logger
+from inm_gcp_service.functions.indp import indp_bq_to_az
+from inm_gcp_service.functions.indp._consts import get_cleanup_schedule, get_indp_schedule
+from inm_gcp_service.functions.indp._jobs import clean_old_jobs, get_job, start_job
+
+app = func.AsgiFunctionApp(app=fastapi_app, http_auth_level=func.AuthLevel.ANONYMOUS)
+
+logger = get_logger("GCP_function_app")
+
+INDP_SCHEDULE_TIME = get_indp_schedule()
+
+
+@app.function_name(name="indp_scheduler")
+@app.timer_trigger(schedule=get_indp_schedule(), arg_name="timer", run_on_startup=False)
+def indp_function(timer: func.TimerRequest) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    logger.info("Timer fired for indp at %s", now)
+
+    try:
+        job_id = start_job(indp_bq_to_az)
+        logger.info("Scheduled job accepted. job_id=%s", job_id)
+    except Exception as e:
+        logger.exception("Failed to start scheduled job: %s", e)
+        raise
+
+    poll_interval = 30
+
+    while True:
+        job = get_job(job_id)
+        if not job:
+            raise RuntimeError(f"Job {job_id} disappeared from DB")
+
+        if job["status"] in ("done", "failed"):
+            logger.info("Job %s finished: status=%s", job_id, job["status"])
+            if job["status"] == "failed":
+                raise RuntimeError(job.get("error") or "Pipeline failed")
+            return
+
+        time.sleep(poll_interval)
+
+
+@app.function_name(name="indp_clean_old_jobs")
+@app.timer_trigger(schedule=get_cleanup_schedule(), arg_name="timer", run_on_startup=False)
+def clean_old_jobs_timer(timer: func.TimerRequest) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    logger.info("Timer fired for clean_old_jobs at %s", now)
+
+    try:
+        removed = clean_old_jobs(hours=24 * 7)  # last week
+        logger.info("Cleaned %s old job(s) older than 7 days", removed)
+    except Exception as e:
+        logger.exception("Failed to clean old jobs: %s", e)
+        raise

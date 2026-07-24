@@ -1,0 +1,53 @@
+from inm_gcp_service.common.utils import get_env_var
+
+
+def get_indp_gcp_creds():
+    return get_env_var("INDP_GCP_CREDS")
+
+
+def get_indp_bq_table():
+    return get_env_var("INDP_BQ_TABLE")
+
+
+def get_indp_partition_filter():
+    return get_env_var("INDP_PARTITION_FILTER")
+
+
+def get_az_sql_host():
+    return get_env_var("AZ_SQL_HOST")
+
+
+def get_az_sql_db():
+    return get_env_var("AZ_SQL_DB")
+
+
+def get_az_sql_username():
+    return get_env_var("AZ_SQL_USERNAME")
+
+
+def get_az_sql_password():
+    return get_env_var("AZ_SQL_PASSWORD")
+
+
+def get_az_sql_table():
+    return get_env_var("AZ_SQL_TABLE")
+
+
+def get_bq_batch_size():
+    return int(get_env_var("BQ_BATCH_SIZE"))
+
+
+def get_sql_insert_chunk_size():
+    return int(get_env_var("SQL_INSERT_CHUNK_SIZE"))
+
+
+def get_azure_postgres_dsn():
+    return get_env_var("AZURE_POSTGRES_DSN")
+
+
+def get_indp_schedule():
+    return get_env_var("INDP_SCHEDULE")
+
+
+def get_cleanup_schedule():
+    return get_env_var("CLEANUP_SCHEDULE")
