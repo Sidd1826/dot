@@ -23,7 +23,7 @@ def count():
 def data():
     logger.info("/data api is called")
     try:
-        res = fetch_batch_with_retry(10, 10)
+        res = fetch_batch_with_retry(0, 10000)
         return {"Response": res}
     except Exception as e:
         logger.error("Failed fetching data")

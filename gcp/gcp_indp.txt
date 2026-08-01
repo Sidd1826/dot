@@ -261,8 +261,12 @@ def clean_mobile_number(raw_telno: str, country_res: str = "IN") -> str:
 # BIGQUERY
 def _build_base_where(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
+    partition_filter = PARTITION_FILTER
+    if alias:
+        # qualify bare PARTI_MONTH only (leave already-qualified alone)
+        partition_filter = re.sub(r"(?<!\.)\bPARTI_MONTH\b", f"{alias}.PARTI_MONTH", partition_filter)
     return (
-        f"WHERE ({PARTITION_FILTER}) "
+        f"WHERE ({partition_filter}) "
         f"AND {prefix}BATCH_DT = (SELECT MAX(BATCH_DT) FROM {BQ_TABLE} WHERE PARTI_MONTH IS NOT NULL) "
         f"AND {prefix}ZBADID = 'P1'"
     )
@@ -276,14 +280,35 @@ def _build_count_query() -> str:
     )
 
 
-def _build_batch_query(offset: int, batch_size: int) -> str:
+def _build_cust_subquery() -> str:
+    return (
+        f"SELECT {CUST_ID_COL}, {ZGGHCL_COL} "
+        f"FROM {CUST_BQ_TABLE} "
+        f"WHERE ({PARTITION_FILTER}) "
+        f"AND BATCH_DT = (SELECT MAX(BATCH_DT) FROM {CUST_BQ_TABLE} WHERE PARTI_MONTH IS NOT NULL) "
+        f"QUALIFY ROW_NUMBER() OVER (PARTITION BY {CUST_ID_COL} ORDER BY {ZGGHCL_COL}) = 1"
+    )
+
+
+def _build_batch_query(bucket: int, num_buckets: int) -> str:
+    """One disjoint slice of the data, selected by hash bucket.
+
+    LIMIT/OFFSET is NOT usable here: each batch runs as its own BigQuery job and
+    BigQuery gives no ordering guarantee without ORDER BY, so the same row can
+    land in two batches while another is never fetched at all. Hashing the
+    dedup key partitions the rows deterministically instead, so the batches are
+    disjoint and exhaustive no matter what order BigQuery scans in.
+    """
     new_cols_sql = ", ".join(f"a.{c}" for c in NEW_COLS)
     return (
         f"SELECT a.{CUST_ID_COL}, a.{DISTINCT_KEY_COL}, {new_cols_sql}, c.{ZGGHCL_COL} "
         f"FROM {BQ_TABLE} a "
-        f"LEFT JOIN {CUST_BQ_TABLE} c ON a.{CUST_ID_COL} = c.{CUST_ID_COL} "
+        f"LEFT JOIN ({_build_cust_subquery()}) c ON a.{CUST_ID_COL} = c.{CUST_ID_COL} "
         f"{_build_base_where('a')} "
-        f"LIMIT {batch_size} OFFSET {offset}"
+        f"AND MOD(ABS(FARM_FINGERPRINT(CAST(a.{DISTINCT_KEY_COL} AS STRING))), {num_buckets}) = {bucket} "
+        # final guard: one row per mobile, so a fan-out on either side of the
+        # join can never reach Azure as a duplicate
+        f"QUALIFY ROW_NUMBER() OVER (PARTITION BY a.{DISTINCT_KEY_COL} ORDER BY a.{CUST_ID_COL}) = 1"
     )
 
 
@@ -344,13 +369,13 @@ def get_total_count() -> int:
     return total
 
 
-def fetch_batch_with_retry(offset: int, batch_size: int) -> List[Dict]:
+def fetch_batch_with_retry(bucket: int, num_buckets: int) -> List[Dict]:
     last_exc: Optional[Exception] = None
-    query = _build_batch_query(offset, batch_size)
+    query = _build_batch_query(bucket, num_buckets)
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            logger.info("BQ fetch offset=%d (attempt %d/%d)", offset, attempt, MAX_RETRIES)
+            logger.info("BQ fetch bucket=%d/%d (attempt %d/%d)", bucket, num_buckets, attempt, MAX_RETRIES)
             rows = gcp_kms(GCP_CREDENTIALS_JSON, query)
             logger.info("Fetched %d rows", len(rows))
             return rows
@@ -361,7 +386,7 @@ def fetch_batch_with_retry(offset: int, batch_size: int) -> List[Dict]:
                 logger.info("Retrying in %ds", RETRY_DELAY_SECONDS)
                 time.sleep(RETRY_DELAY_SECONDS)
 
-    raise RuntimeError(f"All ({MAX_RETRIES}) retries exhausted for offset={offset}") from last_exc
+    raise RuntimeError(f"All ({MAX_RETRIES}) retries exhausted for bucket={bucket}") from last_exc
 
 
 # AZURE SQL
@@ -386,8 +411,8 @@ def _get_sql_engine() -> Engine:
     )
 
 
-def fetch_and_clean_batch(offset: int, batch_size: int) -> Tuple[List, int, int]:
-    raw_rows = fetch_batch_with_retry(offset, batch_size)
+def fetch_and_clean_batch(bucket: int, num_buckets: int) -> Tuple[List, int, int]:
+    raw_rows = fetch_batch_with_retry(bucket, num_buckets)
     if not raw_rows:
         return [], 0, 0
 
@@ -477,16 +502,13 @@ def indp_bq_to_az() -> dict:
         logger.warning("No rows found in BQ. Pipeline exiting WITHOUT DB changes.")
         return {"status": "skipped", "reason": "no_data_in_bq", "total_rows": 0}
 
-    # Step 3: Build offsets
-    offsets = []
-    for b in range(0, total_rows, BATCH_SIZE):
-        actual_size = min(BATCH_SIZE, total_rows - b)
-        offsets.append((b, actual_size))
-
-    num_batches = len(offsets)
+    # Step 3: Build hash buckets. Every row falls in exactly one bucket, so the
+    # batches stay disjoint even though each one runs as an independent BQ job.
+    num_batches = max(1, -(-total_rows // BATCH_SIZE))  # ceil
+    buckets = list(range(num_batches))
     logger.info(
-        "Total rows=%d batches=%d batch_size=%d last_batch_size=%d",
-        total_rows, num_batches, BATCH_SIZE, offsets[-1][1]
+        "Total rows=%d buckets=%d target_batch_size=%d",
+        total_rows, num_batches, BATCH_SIZE
     )
 
     # Step 4: Fetch ALL batches FIRST (no Azure touch yet)
@@ -500,35 +522,35 @@ def indp_bq_to_az() -> dict:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(fetch_and_clean_batch, offset, size): (batch_num, offset, size)
-            for batch_num, (offset, size) in enumerate(offsets, 1)
+            executor.submit(fetch_and_clean_batch, bucket, num_batches): bucket
+            for bucket in buckets
         }
 
         for future in as_completed(futures):
-            batch_num, offset, size = futures[future]
+            bucket = futures[future]
             try:
                 insert_rows, fetched, skipped = future.result()
                 all_insert_rows.extend(insert_rows)
                 total_fetched += fetched
                 total_skipped += skipped
                 logger.info(
-                    "[FETCH] batch %d/%d offset=%d fetched=%d skipped=%d valid=%d",
-                    batch_num, num_batches, offset, fetched, skipped, len(insert_rows)
+                    "[FETCH] bucket %d/%d fetched=%d skipped=%d valid=%d",
+                    bucket, num_batches, fetched, skipped, len(insert_rows)
                 )
             except Exception as exc:
                 logger.error(
-                    "[FETCH] batch %d/%d FAILED at offset=%d: %s",
-                    batch_num, num_batches, offset, exc
+                    "[FETCH] bucket %d/%d FAILED: %s",
+                    bucket, num_batches, exc
                 )
-                failed_batches.append((batch_num, offset, size, str(exc)))
+                failed_batches.append((bucket, str(exc)))
 
     # Step 5: Abort if any batch failed
     if failed_batches:
         logger.error("=" * 60)
         logger.error("%d/%d batches FAILED during fetch.", len(failed_batches), num_batches)
         logger.error("Pipeline ABORTED - Azure SQL data is preserved.")
-        for bn, off, sz, err in failed_batches:
-            logger.error(" Failed batch %d (offset=%d size=%d): %s", bn, off, sz, err)
+        for bucket, err in failed_batches:
+            logger.error(" Failed bucket %d: %s", bucket, err)
         logger.error("=" * 60)
         return {
             "status": "aborted",
@@ -536,6 +558,26 @@ def indp_bq_to_az() -> dict:
             "failed_batches": len(failed_batches),
             "total_batches": num_batches,
         }
+
+    # Different raw ZBTEN3 values can normalise to the same final_mob_num
+    # ("09876543210" / "919876543210" / "9876543210" -> "919876543210"), and
+    # they hash into different buckets, so this last dedup has to be global.
+    pre_dedup = len(all_insert_rows)
+    seen = set()
+    deduped_rows = []
+    for row in all_insert_rows:
+        final_mob_num = row[2]
+        if final_mob_num in seen:
+            continue
+        seen.add(final_mob_num)
+        deduped_rows.append(row)
+
+    all_insert_rows = deduped_rows
+    total_deduped = pre_dedup - len(all_insert_rows)
+    logger.info(
+        "Dedup on final_mob_num: %d -> %d rows (%d duplicates dropped)",
+        pre_dedup, len(all_insert_rows), total_deduped
+    )
 
     logger.info("Phase 1 complete. Total valid rows ready to insert: %d", len(all_insert_rows))
 
@@ -560,6 +602,7 @@ def indp_bq_to_az() -> dict:
         "total_rows_in_bq": total_rows,
         "total_fetched": total_fetched,
         "total_skipped": total_skipped,
+        "total_deduped": total_deduped,
         "total_inserted": total_inserted,
         "failed_batches": 0,
         "time_elapsed_in_seconds": round(total_elapsed, 2),
