@@ -278,10 +278,19 @@ def _build_count_query() -> str:
 
 def _build_batch_query(offset: int, batch_size: int) -> str:
     new_cols_sql = ", ".join(f"a.{c}" for c in NEW_COLS)
+    # The customer mirror is partitioned on the same key, so PARTITION_FILTER is
+    # applied to it here rather than in the outer WHERE: it shares column names
+    # (PARTI_MONTH, BATCH_DT, ...) with the main table, and PARTITION_FILTER is an
+    # unqualified env string, so filtering it after the join is ambiguous. Applied
+    # inside the subquery it resolves to the mirror alone and still prunes.
+    cust_subquery = (
+        f"(SELECT {CUST_ID_COL}, {ZGGHCL_COL} FROM {CUST_BQ_TABLE} "
+        f"WHERE ({PARTITION_FILTER}))"
+    )
     return (
         f"SELECT a.{CUST_ID_COL}, a.{DISTINCT_KEY_COL}, {new_cols_sql}, c.{ZGGHCL_COL} "
         f"FROM {BQ_TABLE} a "
-        f"LEFT JOIN {CUST_BQ_TABLE} c ON a.{CUST_ID_COL} = c.{CUST_ID_COL} "
+        f"LEFT JOIN {cust_subquery} c ON a.{CUST_ID_COL} = c.{CUST_ID_COL} "
         f"{_build_base_where('a')} "
         f"LIMIT {batch_size} OFFSET {offset}"
     )
