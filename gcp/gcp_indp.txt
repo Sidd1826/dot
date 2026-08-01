@@ -4,7 +4,6 @@ from datetime import datetime
 import io
 from itertools import islice
 import json
-from logging import logger
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,9 +24,16 @@ from consts import (
 from fastapi import HTTPException
 from google.cloud import bigquery
 from google.oauth2 import service_account
+
+# NOTE: `from logging import logger` raises ImportError - the stdlib logging
+# module has no `logger` attribute. Using the project logger factory instead
+# (same one gcp_function_app.py uses).
+from inm_gcp_service.common.logging import get_logger
 import psycopg2
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+
+logger = get_logger("indp")
 
 GCP_CREDENTIALS_JSON = get_indp_gcp_creds()
 
@@ -47,14 +53,18 @@ NEW_COLS = [
 
 KMS_KEY = "projects/test-test-test-test/locations/asia-test/test/test/test/test"
 
-BQ_TABLE = get_indp_bq_table()
-CUST_BQ_TABLE = get_indp_cust_bq_table()  # SSCUSTP mirror, joined on CUST_ID_COL
+BQ_TABLE = get_indp_bq_table()                # SSADDRP
+CUST_BQ_TABLE = get_indp_cust_bq_table()      # SSCUSTP mirror, joined on CUST_ID_COL
 PARTITION_FILTER = get_indp_partition_filter()
 DISTINCT_KEY_COL = "ZBTEN3"
 CUST_ID_COL = "IP_SRCE_KEY"
 ZGGHCL_COL = "ZGGHCL"
 GHO_CLASSIFICATION_COL = "CUST_GHO_classification"  # raw ZGGHCL value
-GHO_CODE_COL = "GHO_code"  # ZGGHCL mapped to business code
+GHO_CODE_COL = "GHO_code"                           # ZGGHCL mapped to business code
+
+# Set to None if SSCUSTP has no BATCH_DT column - the latest-batch filter
+# on the customer side is then skipped and dedup falls back to IP_SRCE_KEY.
+CUST_BATCH_DT_COL = "BATCH_DT"
 
 # TODO: fill in the remaining ZGGHCL -> business code mappings
 GHO_CODE_MAP = {
@@ -259,65 +269,91 @@ def clean_mobile_number(raw_telno: str, country_res: str = "IN") -> str:
 
 
 # BIGQUERY
-def _build_base_where(alias: str = "") -> str:
-    prefix = f"{alias}." if alias else ""
+#
+# DUPLICATE FIX
+# -------------
+# The old query did:
+#     FROM SSADDRP a LEFT JOIN SSCUSTP c ON a.IP_SRCE_KEY = c.IP_SRCE_KEY
+#     WHERE (PARTITION_FILTER) AND a.BATCH_DT = ... AND a.ZBADID = 'P1'
+#
+# Three problems, all producing duplicate rows:
+#   1. SSCUSTP holds one row per customer PER PARTI_MONTH / BATCH_DT. With no
+#      filter on `c`, every address row fanned out once per customer snapshot.
+#   2. PARTI_MONTH inside PARTITION_FILTER was unqualified. Once two tables are
+#      in scope BigQuery either errors on the ambiguity or applies it to one
+#      side only - so SSCUSTP was effectively unfiltered.
+#   3. COUNT(DISTINCT ZBTEN3) disagreed with the raw row count the batch query
+#      paged through, and LIMIT/OFFSET with no ORDER BY is non-deterministic in
+#      BigQuery - parallel workers pulled overlapping pages.
+#
+# Fix: build each table in its own single-table CTE. PARTI_MONTH is then
+# unambiguous and applied to BOTH tables, each side is deduped to one row per
+# key, and the join becomes strictly 1:1.
+
+
+def _latest_batch_dt(table: str) -> str:
+    """Latest BATCH_DT *within the same partition window*, not across all history."""
     return (
-        f"WHERE ({PARTITION_FILTER}) "
-        f"AND {prefix}BATCH_DT = (SELECT MAX(BATCH_DT) FROM {BQ_TABLE} WHERE PARTI_MONTH IS NOT NULL) "
-        f"AND {prefix}ZBADID = 'P1'"
+        f"SELECT MAX(BATCH_DT) FROM {table} "
+        f"WHERE ({PARTITION_FILTER}) AND PARTI_MONTH IS NOT NULL"
+    )
+
+
+def _addr_cte() -> str:
+    """SSADDRP: PARTI_MONTH + latest BATCH_DT + P1, one row per ZBTEN3."""
+    cols = ", ".join([CUST_ID_COL, DISTINCT_KEY_COL] + NEW_COLS)
+    return (
+        f"addr AS ("
+        f"  SELECT {cols}"
+        f"  FROM {BQ_TABLE}"
+        f"  WHERE ({PARTITION_FILTER})"
+        f"    AND BATCH_DT = ({_latest_batch_dt(BQ_TABLE)})"
+        f"    AND ZBADID = 'P1'"
+        f"    AND {DISTINCT_KEY_COL} IS NOT NULL"
+        f"    AND TRIM(CAST({DISTINCT_KEY_COL} AS STRING)) != ''"
+        f"  QUALIFY ROW_NUMBER() OVER ("
+        f"    PARTITION BY {DISTINCT_KEY_COL} ORDER BY {CUST_ID_COL}"
+        f"  ) = 1"
+        f")"
+    )
+
+
+def _cust_cte() -> str:
+    """SSCUSTP: same PARTI_MONTH filter, one row per IP_SRCE_KEY."""
+    batch_filter = (
+        f"    AND {CUST_BATCH_DT_COL} = ({_latest_batch_dt(CUST_BQ_TABLE)})"
+        if CUST_BATCH_DT_COL
+        else ""
+    )
+    order_by = f"{CUST_BATCH_DT_COL} DESC" if CUST_BATCH_DT_COL else CUST_ID_COL
+    return (
+        f"cust AS ("
+        f"  SELECT {CUST_ID_COL}, {ZGGHCL_COL}"
+        f"  FROM {CUST_BQ_TABLE}"
+        f"  WHERE ({PARTITION_FILTER})"
+        f"{batch_filter}"
+        f"  QUALIFY ROW_NUMBER() OVER ("
+        f"    PARTITION BY {CUST_ID_COL} ORDER BY {order_by}"
+        f"  ) = 1"
+        f")"
     )
 
 
 def _build_count_query() -> str:
-    return (
-        f"SELECT COUNT(DISTINCT {DISTINCT_KEY_COL}) AS total "
-        f"FROM {BQ_TABLE} "
-        f"{_build_base_where()}"
-    )
+    """Counts exactly the universe the batch query pages through."""
+    return f"WITH {_addr_cte()} SELECT COUNT(*) AS total FROM addr"
 
 
 def _build_batch_query(offset: int, batch_size: int) -> str:
-    """One row per distinct DISTINCT_KEY_COL, paged deterministically.
-
-    Three things here are load-bearing and must stay together:
-      * base dedups to one row per DISTINCT_KEY_COL, so the row count matches
-        _build_count_query()'s COUNT(DISTINCT ...);
-      * cust dedups the mirror to one row per customer, so the LEFT JOIN cannot
-        fan rows back out;
-      * ORDER BY on the (now unique) key makes LIMIT/OFFSET stable across the
-        parallel batches. Without it BigQuery is free to order each batch
-        differently and the same row lands in several of them.
-
-    PARTITION_FILTER is applied inside each CTE rather than after the join: it is
-    an unqualified env string and both tables carry PARTI_MONTH, so filtering
-    post-join is ambiguous. Inside a CTE it resolves to one table and still prunes.
-    """
     new_cols_sql = ", ".join(f"a.{c}" for c in NEW_COLS)
-    out_cols_sql = ", ".join(
-        [f"b.{CUST_ID_COL}", f"b.{DISTINCT_KEY_COL}"] + [f"b.{c}" for c in NEW_COLS]
-    )
     return (
-        f"WITH base AS ("
-        f"SELECT a.{CUST_ID_COL}, a.{DISTINCT_KEY_COL}, {new_cols_sql}, "
-        f"ROW_NUMBER() OVER ("
-        f"PARTITION BY a.{DISTINCT_KEY_COL} ORDER BY a.{CUST_ID_COL}"
-        f") AS dedup_rn "
-        f"FROM {BQ_TABLE} a "
-        f"{_build_base_where('a')}"
-        f"), cust AS ("
-        f"SELECT {CUST_ID_COL}, {ZGGHCL_COL}, "
-        f"ROW_NUMBER() OVER ("
-        f"PARTITION BY {CUST_ID_COL} ORDER BY {ZGGHCL_COL}"
-        f") AS dedup_rn "
-        f"FROM {CUST_BQ_TABLE} "
-        f"WHERE ({PARTITION_FILTER})"
-        f") "
-        f"SELECT {out_cols_sql}, c.{ZGGHCL_COL} "
-        f"FROM base b "
-        f"LEFT JOIN cust c "
-        f"ON b.{CUST_ID_COL} = c.{CUST_ID_COL} AND c.dedup_rn = 1 "
-        f"WHERE b.dedup_rn = 1 "
-        f"ORDER BY b.{DISTINCT_KEY_COL} "
+        f"WITH {_addr_cte()}, {_cust_cte()} "
+        f"SELECT a.{CUST_ID_COL}, a.{DISTINCT_KEY_COL}, {new_cols_sql}, c.{ZGGHCL_COL} "
+        f"FROM addr a "
+        f"LEFT JOIN cust c ON a.{CUST_ID_COL} = c.{CUST_ID_COL} "
+        # addr is deduped on ZBTEN3, so this ordering is unique and stable -
+        # without it, parallel OFFSET reads overlap and rows repeat.
+        f"ORDER BY a.{DISTINCT_KEY_COL} "
         f"LIMIT {batch_size} OFFSET {offset}"
     )
 
@@ -331,7 +367,12 @@ def _build_column_names_query() -> str:
 
 
 def _build_preview_query(limit: int = 5) -> str:
-    return f"SELECT * FROM `{BQ_TABLE}` {_build_base_where()} LIMIT {limit}"
+    return (
+        f"WITH {_addr_cte()}, {_cust_cte()} "
+        f"SELECT a.*, c.{ZGGHCL_COL} "
+        f"FROM addr a LEFT JOIN cust c ON a.{CUST_ID_COL} = c.{CUST_ID_COL} "
+        f"LIMIT {limit}"
+    )
 
 
 def get_column_names() -> List[str]:
@@ -366,7 +407,10 @@ def gcp_kms(creds, query) -> List[dict]:
         results = [dict(row) for row in job.result()]
         logger.debug("Query executed successfully. Rows fetched %d", len(results))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error occurred while fetching data from BigQuery: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error occurred while fetching data from BigQuery: {str(e)}",
+        )
 
     return results
 
@@ -433,7 +477,11 @@ def fetch_and_clean_batch(offset: int, batch_size: int) -> Tuple[List, int, int]
     for row in raw_rows:
         cust_id = str(row.get(CUST_ID_COL, "") or "")
         mob_num = str(row.get(DISTINCT_KEY_COL, "") or "")
-        country_res = str(row.get("COUNTRY_RES", "") or DEFAULT_COUNTRY_RES) if has_country_col else DEFAULT_COUNTRY_RES
+        country_res = (
+            str(row.get("COUNTRY_RES", "") or DEFAULT_COUNTRY_RES)
+            if has_country_col
+            else DEFAULT_COUNTRY_RES
+        )
 
         final_mob_num = clean_mobile_number(mob_num, country_res)
         if not final_mob_num:
@@ -446,6 +494,25 @@ def fetch_and_clean_batch(offset: int, batch_size: int) -> Tuple[List, int, int]
         insert_rows.append((cust_id, mob_num, final_mob_num, *extra_vals, gho_raw, gho_code))
 
     return insert_rows, len(raw_rows), skipped
+
+
+def _dedupe_on_final_mob_num(rows: List[Tuple[Any, ...]]) -> Tuple[List[Tuple[Any, ...]], int]:
+    """Last-line guard: one row per final_mob_num.
+
+    Different raw ZBTEN3 values can normalise to the SAME final_mob_num
+    (e.g. '09876543210' and '+919876543210'), which SQL-side dedup on ZBTEN3
+    cannot catch. Downstream matchoff keys on final_mob_num and silently keeps
+    only one row per number anyway, so collapse them here deterministically.
+    """
+    seen: set = set()
+    deduped: List[Tuple[Any, ...]] = []
+    for row in rows:
+        key = row[2]  # final_mob_num
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped, len(rows) - len(deduped)
 
 
 def truncate_table(engine: Engine) -> None:
@@ -473,7 +540,11 @@ def bulk_insert_rows(engine: Engine, rows: List[Tuple[Any, ...]]) -> int:
     writer.writerows(rows)
     buffer.seek(0)
 
-    copy_cols = ["cust_id", "mob_num", "final_mob_num"] + NEW_COLS + [GHO_CLASSIFICATION_COL, GHO_CODE_COL]
+    copy_cols = (
+        ["cust_id", "mob_num", "final_mob_num"]
+        + NEW_COLS
+        + [GHO_CLASSIFICATION_COL, GHO_CODE_COL]
+    )
     copy_cols_sql = ", ".join(copy_cols)
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -502,9 +573,10 @@ def bulk_insert_rows(engine: Engine, rows: List[Tuple[Any, ...]]) -> int:
 def indp_bq_to_az() -> dict:
     logger.info("-" * 60)
     logger.info("Pipeline START")
-    logger.info("BQ Table: %s", BQ_TABLE)
-    logger.info("Filter : %s", PARTITION_FILTER)
-    logger.info("SQL Table: %s", SQL_TABLE)
+    logger.info("BQ Table  : %s", BQ_TABLE)
+    logger.info("Cust Table: %s", CUST_BQ_TABLE)
+    logger.info("Filter    : %s", PARTITION_FILTER)
+    logger.info("SQL Table : %s", SQL_TABLE)
     logger.info("=" * 60)
 
     total_rows = get_total_count()
@@ -572,6 +644,13 @@ def indp_bq_to_az() -> dict:
             "total_batches": num_batches,
         }
 
+    # Step 5b: Dedup guard - one row per final_mob_num before it reaches the DB
+    all_insert_rows, dropped_duplicates = _dedupe_on_final_mob_num(all_insert_rows)
+    if dropped_duplicates:
+        logger.warning(
+            "Dropped %d duplicate final_mob_num row(s) before insert", dropped_duplicates
+        )
+
     logger.info("Phase 1 complete. Total valid rows ready to insert: %d", len(all_insert_rows))
 
     # Step 6: Only NOW truncate + insert (we know all data is ready)
@@ -595,6 +674,7 @@ def indp_bq_to_az() -> dict:
         "total_rows_in_bq": total_rows,
         "total_fetched": total_fetched,
         "total_skipped": total_skipped,
+        "duplicates_dropped": dropped_duplicates,
         "total_inserted": total_inserted,
         "failed_batches": 0,
         "time_elapsed_in_seconds": round(total_elapsed, 2),
