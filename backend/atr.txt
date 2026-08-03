@@ -360,19 +360,19 @@ def submit_batch(module: str, records: list[dict]) -> dict:
 
 
 # ── RUN LOGGING ──────────────────────────────────────────────────────────────
-def _create_run(module, segment, feed_date, gho_code, defaults, total, batch_size, dry_run) -> str:
+def _create_run(module, segment, feed_date, defaults, total, batch_size, dry_run) -> str:
     run_id = str(uuid.uuid4())
     with _cursor() as cur:
         cur.execute(
             """
             INSERT INTO atr_runs (
-                id, module, segment, feed_date, gho_code, action_type, action_taken,
+                id, module, segment, feed_date, action_type, action_taken,
                 total_selected, batch_size, status, dry_run, started_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'running', %s, NOW())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'running', %s, NOW())
             """,
             (
-                run_id, module.upper(), segment, ms._to_date(feed_date), gho_code,
+                run_id, module.upper(), segment, ms._to_date(feed_date),
                 (defaults or {}).get("action_type"), (defaults or {}).get("action_taken"),
                 total, batch_size, dry_run,
             ),
@@ -447,7 +447,6 @@ def run_atr(
     module: str,
     feed_date: Any = None,
     segment: str | None = None,
-    gho_code: str | None = None,
     batch_size: int = ATR_BATCH_SIZE,
     limit: int | None = None,
     dry_run: bool = False,
@@ -463,8 +462,8 @@ def run_atr(
     if not segment or segment.upper() == "ALL":
         results = []
         for seg in (ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB):
-            if ms.count_atr_pending(module, feed_date, seg, gho_code):
-                results.append(run_atr(module, feed_date, seg, gho_code,
+            if ms.count_atr_pending(module, feed_date, seg):
+                results.append(run_atr(module, feed_date, seg,
                                        batch_size, limit, dry_run))
         if not results:
             return {"status": "skipped", "reason": "no_pending_records",
@@ -484,14 +483,14 @@ def run_atr(
     if not defaults.get("is_active", True):
         raise ValueError(f"ATR defaults for {module} / {segment} are switched off")
 
-    total = ms.count_atr_pending(module, feed_date, segment, gho_code)
+    total = ms.count_atr_pending(module, feed_date, segment)
     if total == 0:
         return {"status": "skipped", "reason": "no_pending_records",
                 "module": module, "segment": segment, "sent": 0, "rejected": 0}
     if limit:
         total = min(total, limit)
 
-    run_id = _create_run(module, segment, feed_date, gho_code, defaults,
+    run_id = _create_run(module, segment, feed_date, defaults,
                          total, batch_size, dry_run)
 
     date_of_action = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -506,7 +505,7 @@ def run_atr(
     )
 
     try:
-        for rows in ms.iter_atr_queue(module, feed_date, segment, gho_code,
+        for rows in ms.iter_atr_queue(module, feed_date, segment,
                                       batch_size=current_batch, limit=limit):
             batches += 1
             by_mobile: dict[str, dict] = {}
@@ -619,7 +618,6 @@ def run_atr(
         "module": module,
         "segment": segment,
         "feed_date": str(ms._to_date(feed_date)) if feed_date else None,
-        "gho_code": gho_code,
         "action_type": defaults["action_type"],
         "action_taken": defaults["action_taken"],
         "selected": total,

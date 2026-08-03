@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
-  Database, FileSpreadsheet, Download, RefreshCw,
+  Info, Database, FileSpreadsheet, Download, RefreshCw,
   CheckCircle, AlertCircle, X, Calendar, Loader2,
   Cloud, HardDrive, Shield, Upload, BarChart3, Clock,
   GitMerge, ChevronDown, ArrowRight, Search, Send,
@@ -16,6 +16,10 @@ const BASE_URL =
     : process.env.REACT_APP_BASE_URL_DEV;
 
 const PAGE_SIZE = 10;
+
+// There are exactly two classifications. Non-IWPB is CIB.
+const SEGMENT_LABEL = { "IWPB": "IWPB", "Non-IWPB": "CIB", "ALL": "IWPB and CIB" };
+const segLabel = (s) => SEGMENT_LABEL[s] || s || "—";
 
 const POLL = {
   FAST_POLL_MS:   3_000,
@@ -71,7 +75,7 @@ const api = {
   listReconcileHistory:  ()        => api.get("/reconcile/history"),
 
   // Master
-  fetchGhoCodes:     (type)  => api.get(`/master/gho-codes?${qs({ type })}`),
+  fetchMasterSegments: (type, date) => api.get(`/master/segments?${qs({ type, date })}`),
   fetchMasterDates:  (type)  => api.get(`/master/dates?type=${type}`),
   fetchMasterCount:  (p)     => api.get(`/master/count?${qs(p)}`),
   fetchMasterStats:  (type)  => api.get(`/master/stats?type=${type}`),
@@ -150,6 +154,7 @@ const Alert = ({ type, message, onClose }) => {
     success: { bar: "#10b981", bg: "#f0fdf4", text: "#065f46", Icon: CheckCircle },
     error:   { bar: "#ef4444", bg: "#fef2f2", text: "#7f1d1d", Icon: AlertCircle },
     warning: { bar: "#f59e0b", bg: "#fffbeb", text: "#78350f", Icon: AlertCircle },
+    info:    { bar: "#3b82f6", bg: "#eff6ff", text: "#1e3a8a", Icon: Info },
   }[type] || { bar: "#6b7280", bg: "#f9fafb", text: "#111827", Icon: AlertCircle };
 
   return (
@@ -296,7 +301,7 @@ const SegmentedControl = ({ label, value, onChange, options, disabled }) => (
   </div>
 );
 
-const SearchableSelect = ({ label, value, onChange, options, placeholder, disabled, loading }) => {
+const SearchableSelect = ({ label, value, onChange, options, placeholder, disabled, loading, emptyText }) => {
   const [open, setOpen]   = useState(false);
   const [query, setQuery] = useState("");
   const wrapRef           = useRef(null);
@@ -325,8 +330,8 @@ const SearchableSelect = ({ label, value, onChange, options, placeholder, disabl
       {label && (
         <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">{label}</label>
       )}
-      <button type="button" disabled={disabled || loading}
-        onClick={() => { if (disabled || loading) return; setOpen((o) => !o); setQuery(""); setTimeout(() => inputRef.current?.focus(), 60); }}
+      <button type="button" disabled={disabled}
+        onClick={() => { if (disabled) return; setOpen((o) => !o); setQuery(""); setTimeout(() => inputRef.current?.focus(), 60); }}
         className="w-full flex items-center justify-between gap-2 px-4 py-3 rounded-xl
           border border-slate-200 bg-white text-sm font-medium shadow-sm transition-all
           focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent
@@ -357,7 +362,9 @@ const SearchableSelect = ({ label, value, onChange, options, placeholder, disabl
           )}
           <ul className="overflow-y-auto" style={{ maxHeight: 220 }}>
             {filtered.length === 0 ? (
-              <li className="px-4 py-3 text-sm text-slate-400 text-center">Nothing matches that search</li>
+              <li className="px-4 py-4 text-sm text-slate-400 text-center leading-relaxed">
+                {loading ? "Loading…" : query ? "Nothing matches that search" : (emptyText || "Nothing to choose yet")}
+              </li>
             ) : filtered.map((o) => (
               <li key={o.value}>
                 <button type="button" onClick={() => { onChange(o.value); setOpen(false); setQuery(""); }}
@@ -684,34 +691,60 @@ const MNRLModule = () => {
 // ─────────────────────────────────────────────
 // TAB 3 — RECONCILE
 // ─────────────────────────────────────────────
-const MasterFilters = ({ module, setModule, date, setDate, segment, setSegment,
-                         gho, setGho, dates, ghoCodes, loading, disabled }) => {
-  const ghoOptions = [
-    { value: "ALL", label: "All GHO codes" },
-    ...ghoCodes
-      .filter((g) => segment === "ALL" || g.segment === segment)
-      .map((g) => ({ value: g.gho_code, label: `${g.gho_code} · ${fmt(g.record_count)}` })),
+// Classification options carry their own counts, so there is nothing left for a
+// GHO dropdown to add — IWPB and CIB are the only two values the codes take.
+const classificationOptions = (segCounts) => {
+  const by = Object.fromEntries((segCounts?.segments || []).map((s) => [s.segment, s]));
+  return [
+    { value: "ALL", label: "Both", count: segCounts?.total },
+    { value: "IWPB", label: "IWPB", count: by["IWPB"]?.count },
+    { value: "Non-IWPB", label: "CIB", count: by["Non-IWPB"]?.count },
   ];
+};
+
+const UnclassifiedNote = ({ count, module }) => {
+  if (!count) return null;
+  return (
+    <div className="md:col-span-full flex items-start gap-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+      <AlertCircle size={14} className="text-amber-500 shrink-0 mt-0.5" />
+      <span>
+        {fmt(count)} {module} record{count === 1 ? " has" : "s have"} no GHO code in
+        the customer data, so {count === 1 ? "it sits" : "they sit"} outside both
+        classifications and won't be picked up by a report run. They're still
+        included when you pick "Both".
+      </span>
+    </div>
+  );
+};
+
+const MasterFilters = ({ module, setModule, date, setDate, segment, setSegment,
+                         dates, segCounts, loading, disabled }) => {
   const dateOptions = [
     { value: "ALL", label: "All dates in the window" },
     ...dates.map((d) => ({ value: d.feed_date, label: `${d.feed_date} · ${fmt(d.record_count)}` })),
   ];
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
       <SegmentedControl label="Source" value={module} onChange={setModule} disabled={disabled}
         options={[{ value: "FRI", label: "FRI" }, { value: "MNRL", label: "MNRL" }]} />
-      <SegmentedControl label="Classification" value={segment} onChange={(v) => { setSegment(v); setGho("ALL"); }}
-        disabled={disabled}
-        options={[
-          { value: "ALL", label: "Both" },
-          { value: "IWPB", label: "IWPB" },
-          { value: "Non-IWPB", label: "Non-IWPB" },
-        ]} />
       <SearchableSelect label="Data date" value={date} onChange={setDate}
-        options={dateOptions} loading={loading} disabled={disabled} placeholder="All dates" />
-      <SearchableSelect label="GHO code" value={gho} onChange={setGho}
-        options={ghoOptions} loading={loading} disabled={disabled} placeholder="All GHO codes" />
+        options={dateOptions} loading={loading} disabled={disabled} placeholder="All dates"
+        emptyText="No reconciled data yet — reconcile a file above first" />
+      <SegmentedControl label="Classification" value={segment} onChange={setSegment}
+        disabled={disabled} options={classificationOptions(segCounts)} />
+
+      <UnclassifiedNote count={segCounts?.unclassified} module={module} />
+
+      {!loading && dates.length === 0 && (
+        <div className="md:col-span-3 flex items-start gap-2 text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-4 py-3">
+          <Info size={14} className="text-slate-400 shrink-0 mt-0.5" />
+          <span>
+            The {module} master is empty, so there are no dates to pick. Reconcile a
+            file above and the dates will appear here.
+          </span>
+        </div>
+      )}
     </div>
   );
 };
@@ -733,9 +766,8 @@ const ReconcileModule = () => {
   const [module, setModule]   = useState("MNRL");
   const [mDate, setMDate]     = useState("ALL");
   const [segment, setSegment] = useState("ALL");
-  const [gho, setGho]         = useState("ALL");
   const [dates, setDates]     = useState([]);
-  const [ghoCodes, setGho2]   = useState([]);
+  const [segCounts, setSegC]  = useState(null);
   const [loadingMeta, setLM]  = useState(false);
   const [preview, setPreview] = useState(null);
   const [dlJob, setDlJob]     = useState(null);
@@ -748,7 +780,7 @@ const ReconcileModule = () => {
 
   const showAlert = (type, message) => {
     setAlert({ type, message });
-    if (type === "success") setTimeout(() => setAlert(null), 8000);
+    if (type === "success" || type === "info") setTimeout(() => setAlert(null), 9000);
   };
 
   const loadFolders = useCallback(async (c) => {
@@ -772,12 +804,15 @@ const ReconcileModule = () => {
     finally { setLFi(false); }
   }, []);
 
-  const loadMeta = useCallback(async (mod) => {
+  const loadMeta = useCallback(async (mod, dateFilter) => {
     setLM(true);
     try {
-      const [d, g] = await Promise.all([api.fetchMasterDates(mod), api.fetchGhoCodes(mod)]);
+      const [d, s] = await Promise.all([
+        api.fetchMasterDates(mod),
+        api.fetchMasterSegments(mod, dateFilter === "ALL" ? "" : dateFilter),
+      ]);
       setDates(d.dates || []);
-      setGho2(g.gho_codes || []);
+      setSegC(s);
     } catch (e) { showAlert("error", `Couldn't load filters: ${e.message}`); }
     finally { setLM(false); }
   }, []);
@@ -792,15 +827,15 @@ const ReconcileModule = () => {
   const refreshPreview = useCallback(async () => {
     try {
       setPreview(await api.fetchMasterCount({
-        type: module, date: mDate === "ALL" ? "" : mDate,
-        segment, gho_code: gho,
+        type: module, date: mDate === "ALL" ? "" : mDate, segment,
       }));
     } catch { setPreview(null); }
-  }, [module, mDate, segment, gho]);
+  }, [module, mDate, segment]);
 
   useEffect(() => { loadFolders(container); loadRuns(); }, []); // eslint-disable-line
   useEffect(() => { if (srcDate) loadSrcFiles(container, srcDate); }, [srcDate]); // eslint-disable-line
-  useEffect(() => { loadMeta(module); setMDate("ALL"); setGho("ALL"); }, [module, loadMeta]);
+  useEffect(() => { setMDate("ALL"); setSegment("ALL"); loadMeta(module, "ALL"); }, [module, loadMeta]);
+  useEffect(() => { loadMeta(module, mDate); }, [mDate]); // eslint-disable-line
   useEffect(() => { refreshPreview(); }, [refreshPreview]);
 
   const handleReconcile = async () => {
@@ -817,11 +852,32 @@ const ReconcileModule = () => {
     jobId: runJob, recordCount: 0,
     onDone: async (result) => {
       setRunJob(null); setLastRun(result);
-      await Promise.all([loadRuns(), loadMeta(module), refreshPreview()]);
+      await Promise.all([loadRuns(), loadMeta(module, mDate), refreshPreview()]);
+
+      // A file where nothing matches is a valid outcome, not a failure.
+      // A file that matches nothing, or one that was entirely compliant, is a
+      // valid outcome rather than a failure. Say what happened, in blue.
+      if (["no_matches", "all_compliant", "cleared_only"].includes(result.status)) {
+        showAlert("info", result.message);
+        return;
+      }
+
       const m = result.master || {};
-      showAlert("success",
+      const base =
         `Reconciled ${fmt(result.matched_count)} of ${fmt(result.input_row_count)} rows. ` +
-        `${fmt(m.master_inserted)} new, ${fmt(m.master_updated)} updated in the master.`);
+        `${fmt(m.master_inserted)} new, ${fmt(m.master_updated)} updated in the master.`;
+
+      // An export older than the retention window lands in the master but is
+      // purge-eligible once the grace period ends. Say so now rather than
+      // letting the rows disappear overnight.
+      if (m.retention?.outside_window) {
+        showAlert("warning",
+          `${base} Note: this file is dated ${m.retention.age_days} days ago, past the ` +
+          `${m.retention.retention_days}-day window, so these rows will be cleared in ` +
+          `about ${m.retention.grace_hours} hours. Reconcile a recent export to keep them.`);
+        return;
+      }
+      showAlert("success", base);
     },
     onFailed: (e) => { setRunJob(null); showAlert("error", e); },
   });
@@ -830,8 +886,7 @@ const ReconcileModule = () => {
     setSD(true); setAlert(null); setLastFile(null);
     try {
       const job = await api.startMasterDownload({
-        type: module, date: mDate === "ALL" ? null : mDate,
-        segment, gho_code: gho,
+        type: module, date: mDate === "ALL" ? null : mDate, segment,
       });
       setDlJob(job.job_id);
     } catch (e) { showAlert("error", e.message); }
@@ -841,7 +896,13 @@ const ReconcileModule = () => {
   useJobPoller({
     jobId: dlJob, recordCount: preview?.count || 0,
     onDone: (result) => {
-      setDlJob(null); setLastFile(result);
+      setDlJob(null);
+      if (result.status === "empty" || !result.record_count) {
+        setLastFile(null);
+        showAlert("warning", result.message || "Nothing matched those filters.");
+        return;
+      }
+      setLastFile(result);
       showAlert("success", `Built ${fmt(result.record_count)} rows across ${result.file_count} file(s).`);
     },
     onFailed: (e) => { setDlJob(null); showAlert("error", e); },
@@ -904,10 +965,7 @@ const ReconcileModule = () => {
             {lastRun.master?.by_segment && (
               <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-3 pt-3 border-t border-indigo-200">
                 <StatChip label="IWPB" value={lastRun.master.by_segment.IWPB} tone="indigo" />
-                <StatChip label="Non-IWPB" value={lastRun.master.by_segment["Non-IWPB"]} tone="slate" />
-                {lastRun.master.by_segment.UNKNOWN > 0 && (
-                  <StatChip label="No GHO code" value={lastRun.master.by_segment.UNKNOWN} tone="rose" />
-                )}
+                <StatChip label="CIB" value={lastRun.master.by_segment["Non-IWPB"]} tone="slate" />
               </div>
             )}
           </div>
@@ -921,8 +979,7 @@ const ReconcileModule = () => {
           module={module} setModule={setModule}
           date={mDate} setDate={setMDate}
           segment={segment} setSegment={setSegment}
-          gho={gho} setGho={setGho}
-          dates={dates} ghoCodes={ghoCodes}
+          dates={dates} segCounts={segCounts}
           loading={loadingMeta} disabled={downloading}
         />
 
@@ -932,11 +989,10 @@ const ReconcileModule = () => {
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 flex flex-col justify-center gap-1.5">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Selection</p>
             <p className="text-sm text-slate-700 font-medium">
-              {module} · {segment === "ALL" ? "Both classifications" : segment}
+              {module} · {segment === "ALL" ? "IWPB and CIB" : SEGMENT_LABEL[segment]}
             </p>
             <p className="text-xs text-slate-400">
               {mDate === "ALL" ? "All dates in the 90-day window" : mDate}
-              {gho !== "ALL" && ` · ${gho}`}
             </p>
           </div>
         </div>
@@ -1045,7 +1101,7 @@ const DefaultsCard = ({ module, def, onSave, saving }) => {
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <Users size={15} className={draft.segment === "IWPB" ? "text-indigo-600" : "text-slate-500"} />
-          <h4 className="font-bold text-slate-800 text-sm">{draft.segment}</h4>
+          <h4 className="font-bold text-slate-800 text-sm">{segLabel(draft.segment)}</h4>
         </div>
         <span className="text-xs text-slate-400">{module}</span>
       </div>
@@ -1112,9 +1168,9 @@ const ATRModule = () => {
   const [module, setModule]   = useState("FRI");
   const [segment, setSegment] = useState("ALL");
   const [mDate, setMDate]     = useState("ALL");
-  const [gho, setGho]         = useState("ALL");
+
   const [dates, setDates]     = useState([]);
-  const [ghoCodes, setGhoCodes] = useState([]);
+  const [segCounts, setSegC]  = useState(null);
   const [loadingMeta, setLM]  = useState(false);
 
   const [defaults, setDefaults] = useState([]);
@@ -1140,10 +1196,10 @@ const ATRModule = () => {
     setLM(true);
     try {
       const [d, g, df] = await Promise.all([
-        api.fetchMasterDates(mod), api.fetchGhoCodes(mod), api.fetchAtrDefaults(mod),
+        api.fetchMasterDates(mod), api.fetchMasterSegments(mod), api.fetchAtrDefaults(mod),
       ]);
       setDates(d.dates || []);
-      setGhoCodes(g.gho_codes || []);
+      setSegC(g);
       setDefaults(df.defaults || []);
     } catch (e) { showAlert("error", `Couldn't load settings: ${e.message}`); }
     finally { setLM(false); }
@@ -1159,12 +1215,12 @@ const ATRModule = () => {
   const refreshPreview = useCallback(async () => {
     try {
       setPreview(await api.fetchAtrPreview({
-        type: module, date: mDate === "ALL" ? "" : mDate, segment, gho_code: gho,
+        type: module, date: mDate === "ALL" ? "" : mDate, segment,
       }));
     } catch { setPreview(null); }
-  }, [module, mDate, segment, gho]);
+  }, [module, mDate, segment]);
 
-  useEffect(() => { loadMeta(module); setMDate("ALL"); setGho("ALL"); }, [module, loadMeta]);
+  useEffect(() => { setMDate("ALL"); setSegment("ALL"); loadMeta(module); }, [module, loadMeta]);
   useEffect(() => { loadRuns(); }, [loadRuns]);
   useEffect(() => { refreshPreview(); }, [refreshPreview]);
 
@@ -1174,7 +1230,7 @@ const ATRModule = () => {
       await api.saveAtrDefaults({ ...draft, type: module });
       await loadMeta(module);
       await refreshPreview();
-      showAlert("success", `${draft.segment} defaults saved.`);
+      showAlert("success", `${segLabel(draft.segment)} defaults saved.`);
     } catch (e) { showAlert("error", e.message); }
     finally { setSaving(null); }
   };
@@ -1184,7 +1240,7 @@ const ATRModule = () => {
     try {
       const job = await api.submitAtr({
         type: module, date: mDate === "ALL" ? null : mDate,
-        segment, gho_code: gho, dry_run: dryRun,
+        segment, dry_run: dryRun,
       });
       setJobId(job.job_id);
     } catch (e) { showAlert("error", e.message); }
@@ -1215,11 +1271,6 @@ const ATRModule = () => {
   });
 
   const running = starting || !!jobId;
-  const ghoOptions = [
-    { value: "ALL", label: "All GHO codes" },
-    ...ghoCodes.filter((g) => segment === "ALL" || g.segment === segment)
-      .map((g) => ({ value: g.gho_code, label: `${g.gho_code} · ${fmt(g.record_count)}` })),
-  ];
   const dateOptions = [
     { value: "ALL", label: "All dates in the window" },
     ...dates.map((d) => ({ value: d.feed_date, label: `${d.feed_date} · ${fmt(d.record_count)}` })),
@@ -1235,20 +1286,15 @@ const ATRModule = () => {
             <Settings2 size={13} /> {showSettings ? "Hide" : "Edit"} defaults
           </button>
         }>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
           <SegmentedControl label="Source" value={module} onChange={setModule} disabled={running}
             options={[{ value: "FRI", label: "FRI" }, { value: "MNRL", label: "MNRL" }]} />
-          <SegmentedControl label="Classification" value={segment} disabled={running}
-            onChange={(v) => { setSegment(v); setGho("ALL"); }}
-            options={[
-              { value: "ALL", label: "Both" },
-              { value: "IWPB", label: "IWPB" },
-              { value: "Non-IWPB", label: "Non-IWPB" },
-            ]} />
           <SearchableSelect label="Data date" value={mDate} onChange={setMDate}
-            options={dateOptions} loading={loadingMeta} disabled={running} />
-          <SearchableSelect label="GHO code" value={gho} onChange={setGho}
-            options={ghoOptions} loading={loadingMeta} disabled={running} />
+            options={dateOptions} loading={loadingMeta} disabled={running}
+            emptyText="Nothing reconciled yet — use the Reconcile tab first" />
+          <SegmentedControl label="Classification" value={segment} disabled={running}
+            onChange={setSegment} options={classificationOptions(segCounts)} />
+          <UnclassifiedNote count={segCounts?.unclassified} module={module} />
         </div>
 
         {showSettings && (
@@ -1277,7 +1323,7 @@ const ATRModule = () => {
           <div className="space-y-2">
             {(preview?.breakdown || []).map((b) => (
               <div key={b.segment} className="flex items-center justify-between text-xs bg-white rounded-lg px-3 py-2 border border-amber-100">
-                <span className="font-semibold text-slate-700">{b.segment}</span>
+                <span className="font-semibold text-slate-700">{segLabel(b.segment)}</span>
                 <span className="text-slate-500">
                   {b.defaults
                     ? `${b.defaults.action_type} · ${b.defaults.action_taken} — ${
@@ -1349,7 +1395,7 @@ const ATRModule = () => {
                   run.module === "FRI" ? "bg-blue-100 text-blue-700" : "bg-teal-100 text-teal-700"
                 }`}>{run.module}</span>
               </td>
-              <td className="px-4 py-3.5 text-xs text-slate-600">{run.segment || "All"}</td>
+              <td className="px-4 py-3.5 text-xs text-slate-600">{run.segment ? segLabel(run.segment) : "Both"}</td>
               <td className="px-4 py-3.5 text-xs font-mono text-slate-500">{run.feed_date || "All"}</td>
               <td className="px-4 py-3.5 text-xs text-slate-600 whitespace-nowrap">
                 {run.action_type} · {run.action_taken}
@@ -1400,7 +1446,7 @@ const ATRModule = () => {
               <div>
                 <h3 className="font-bold text-slate-800">Rejected by C-DOT</h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  {rejects.run.module} · {rejects.run.segment || "All"} · {fmt(rejects.rows.length)} shown
+                  {rejects.run.module} · {rejects.run.segment ? segLabel(rejects.run.segment) : "Both"} · {fmt(rejects.rows.length)} shown
                 </p>
               </div>
               <button onClick={() => setRejects(null)} className="text-slate-400 hover:text-slate-600">

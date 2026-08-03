@@ -11,6 +11,7 @@ from azure_utils import (
     get_matchoff_run,
     get_sas_download_url,
     list_export_metadata,
+    gho_column_available,
     list_gho_codes_from_source,
     list_matchoff_metadata,
     list_source_date_folders,
@@ -38,7 +39,7 @@ MNRL_NORMAL_COLUMNS = [
 MNRL_REACT_COLUMNS = ["date_of_reactivation", "mobile_no", "reactivation_id"]
 
 _VALID_CONTAINERS = {"fri-exports", "mnrl-exports"}
-_VALID_SEGMENTS = {"IWPB", "Non-IWPB", "UNKNOWN", "ALL"}
+_VALID_SEGMENTS = {"IWPB", "Non-IWPB", "ALL"}
 
 
 # ── VALIDATION ───────────────────────────────────────────────────────────────
@@ -83,12 +84,6 @@ def _validate_segment(value: str | None) -> str | None:
         if value.lower() == seg.lower():
             return None if seg == "ALL" else seg
     raise ValueError("Segment must be IWPB, Non-IWPB or All.")
-
-
-def _optional_gho(value: str | None) -> str | None:
-    if not value or value.upper() == "ALL":
-        return None
-    return value.strip()
 
 
 def _fail(exc: Exception, status: int = 500):
@@ -154,15 +149,13 @@ def _do_reconcile(container, date_folder, file_name, mob_col) -> dict:
     )
 
 
-def _do_master_export(module, feed_date, segment, gho_code) -> dict:
-    return export_master(
-        module=module, feed_date=feed_date, segment=segment, gho_code=gho_code
-    )
+def _do_master_export(module, feed_date, segment) -> dict:
+    return export_master(module=module, feed_date=feed_date, segment=segment)
 
 
-def _do_atr_run(module, feed_date, segment, gho_code, batch_size, limit, dry_run) -> dict:
+def _do_atr_run(module, feed_date, segment, batch_size, limit, dry_run) -> dict:
     return atr_service.run_atr(
-        module=module, feed_date=feed_date, segment=segment, gho_code=gho_code,
+        module=module, feed_date=feed_date, segment=segment,
         batch_size=batch_size, limit=limit, dry_run=dry_run,
     )
 
@@ -389,13 +382,31 @@ def route_reconcile_run(run_id):
         return _fail(e)
 
 
-# ── MASTER (GHO filters + download) ──────────────────────────────────────────
+# ── MASTER (classification + download) ───────────────────────────────────────
+@routes.route("/master/segments", methods=["GET"])
+def route_master_segments():
+    """GET /master/segments?type=FRI&date=2026-08-03
+
+    Drives the classification control. Only two classifications exist — IWPB
+    and Non-IWPB (CIB) — so this returns a count for each rather than making
+    the user pick a GHO code from a list of two.
+    """
+    try:
+        module = _validate_module(request.args.get("type", "FRI"))
+        feed_date = _optional_date(request.args.get("date"))
+        return jsonify(ms.segment_counts(module, feed_date))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
 @routes.route("/master/gho-codes", methods=["GET"])
 def route_master_gho_codes():
     """GET /master/gho-codes?type=FRI&source=master|mobilecleanup
 
-    Drives the reconcile tab's classification dropdown. Default source is the
-    master, so counts reflect what a download would actually return.
+    Diagnostics only — the UI uses /master/segments. Useful for confirming what
+    GHO values the source data actually carries.
     """
     try:
         source = request.args.get("source", "master")
@@ -407,6 +418,9 @@ def route_master_gho_codes():
         return jsonify({
             "gho_codes": codes,
             "segments": [ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB],
+            "segment_labels": ms.SEGMENT_LABELS,
+            "non_iwpb_codes": sorted(ms.NON_IWPB_GHO_CODES),
+            "gho_column_available": gho_column_available(),
             "iwpb_codes": sorted(ms.IWPB_GHO_CODES),
         })
     except ValueError as e:
@@ -428,19 +442,17 @@ def route_master_dates():
 
 @routes.route("/master/count", methods=["GET"])
 def route_master_count():
-    """GET /master/count?type=FRI&date=...&segment=IWPB&gho_code=... — live preview."""
+    """GET /master/count?type=FRI&date=...&segment=IWPB — live preview."""
     try:
         module = _validate_module(request.args.get("type", "FRI"))
         feed_date = _optional_date(request.args.get("date"))
         segment = _validate_segment(request.args.get("segment"))
-        gho_code = _optional_gho(request.args.get("gho_code"))
         return jsonify({
             "module": module,
             "date": feed_date,
             "segment": segment or "All",
-            "gho_code": gho_code or "All",
-            "count": ms.count_active(module, feed_date, segment, gho_code),
-            "atr_pending": ms.count_atr_pending(module, feed_date, segment, gho_code),
+            "count": ms.count_active(module, feed_date, segment),
+            "atr_pending": ms.count_atr_pending(module, feed_date, segment),
         })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -450,18 +462,17 @@ def route_master_count():
 
 @routes.route("/master/download", methods=["POST"])
 def route_master_download():
-    """POST /master/download {type, date, segment, gho_code} — background job."""
+    """POST /master/download {type, date, segment} — background job."""
     req = request.get_json(silent=True) or {}
     try:
         module = _validate_module(req.get("type", "FRI"))
         feed_date = _optional_date(req.get("date"))
         segment = _validate_segment(req.get("segment"))
-        gho_code = _optional_gho(req.get("gho_code"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
     try:
-        job_id = start_job(_do_master_export, module, feed_date, segment, gho_code)
+        job_id = start_job(_do_master_export, module, feed_date, segment)
         return jsonify({"job_id": job_id, "status": "pending"}), 202
     except Exception as e:
         return _fail(e)
@@ -531,8 +542,8 @@ def route_atr_defaults_save():
     try:
         module = _validate_module(req.get("type", "FRI"))
         segment = req.get("segment")
-        if segment not in (ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB, ms.SEGMENT_UNKNOWN):
-            raise ValueError("Segment must be IWPB, Non-IWPB or UNKNOWN.")
+        if segment not in (ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB):
+            raise ValueError("Classification must be IWPB or Non-IWPB.")
         saved = atr_service.save_defaults(
             module, segment, req, updated_by=req.get("updated_by")
         )
@@ -550,21 +561,18 @@ def route_atr_preview():
         module = _validate_module(request.args.get("type", "FRI"))
         feed_date = _optional_date(request.args.get("date"))
         segment = _validate_segment(request.args.get("segment"))
-        gho_code = _optional_gho(request.args.get("gho_code"))
-
         breakdown = []
         for seg in ([segment] if segment else [ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB]):
             defaults = atr_service.get_defaults(module, seg)
             breakdown.append({
                 "segment": seg,
-                "pending": ms.count_atr_pending(module, feed_date, seg, gho_code),
+                "pending": ms.count_atr_pending(module, feed_date, seg),
                 "defaults": defaults[0] if defaults else None,
             })
 
         return jsonify({
             "module": module,
             "date": feed_date,
-            "gho_code": gho_code or "All",
             "total_pending": sum(b["pending"] for b in breakdown),
             "breakdown": breakdown,
         })
@@ -576,13 +584,12 @@ def route_atr_preview():
 
 @routes.route("/atr/submit", methods=["POST"])
 def route_atr_submit():
-    """POST /atr/submit {type, date, segment, gho_code, dry_run} — background job."""
+    """POST /atr/submit {type, date, segment, dry_run} — background job."""
     req = request.get_json(silent=True) or {}
     try:
         module = _validate_module(req.get("type", "FRI"))
         feed_date = _optional_date(req.get("date"))
         segment = _validate_segment(req.get("segment"))
-        gho_code = _optional_gho(req.get("gho_code"))
         batch_size = int(req.get("batch_size") or atr_service.ATR_BATCH_SIZE)
         limit = int(req["limit"]) if req.get("limit") else None
         dry_run = bool(req.get("dry_run", False))
@@ -591,7 +598,7 @@ def route_atr_submit():
 
     try:
         job_id = start_job(
-            _do_atr_run, module, feed_date, segment, gho_code, batch_size, limit, dry_run
+            _do_atr_run, module, feed_date, segment, batch_size, limit, dry_run
         )
         return jsonify({"job_id": job_id, "status": "pending"}), 202
     except Exception as e:

@@ -32,8 +32,8 @@ CREATE TABLE IF NOT EXISTS fri_master (
     mobile_no           VARCHAR(20)  NOT NULL,
     cust_id             VARCHAR(100),
     gho_code            VARCHAR(20),           -- from mobilecleanup at reconcile
-    segment             VARCHAR(15)  NOT NULL DEFAULT 'UNKNOWN'
-                        CHECK (segment IN ('IWPB', 'Non-IWPB', 'UNKNOWN')),
+    segment             VARCHAR(15)  NOT NULL DEFAULT 'Non-IWPB'
+                        CHECK (segment IN ('IWPB', 'Non-IWPB')),
 
     -- ── compliance lifecycle ─────────────────────────────────────────────────
     status              VARCHAR(10)  NOT NULL DEFAULT 'active'
@@ -95,8 +95,8 @@ CREATE TABLE IF NOT EXISTS mnrl_master (
     mobile_no               VARCHAR(20)  NOT NULL,
     cust_id                 VARCHAR(100),
     gho_code                VARCHAR(20),
-    segment                 VARCHAR(15)  NOT NULL DEFAULT 'UNKNOWN'
-                            CHECK (segment IN ('IWPB', 'Non-IWPB', 'UNKNOWN')),
+    segment                 VARCHAR(15)  NOT NULL DEFAULT 'Non-IWPB'
+                            CHECK (segment IN ('IWPB', 'Non-IWPB')),
 
     status                  VARCHAR(10)  NOT NULL DEFAULT 'active'
                             CHECK (status IN ('active', 'cleared')),
@@ -192,7 +192,7 @@ CREATE INDEX IF NOT EXISTS idx_dot_events_conflict
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS atr_defaults (
     module                VARCHAR(10)  NOT NULL CHECK (module IN ('FRI', 'MNRL')),
-    segment               VARCHAR(15)  NOT NULL CHECK (segment IN ('IWPB', 'Non-IWPB', 'UNKNOWN')),
+    segment               VARCHAR(15)  NOT NULL CHECK (segment IN ('IWPB', 'Non-IWPB')),
 
     action_type           VARCHAR(5)   NOT NULL CHECK (action_type IN ('BOA', 'BOT')),
     action_taken          VARCHAR(5)   NOT NULL,
@@ -307,6 +307,33 @@ ALTER TABLE matchoff_runs ADD COLUMN IF NOT EXISTS conflicts_ignored   INTEGER D
 
 
 -- =============================================================================
+-- MIGRATION — only does anything if an earlier build created a third segment.
+-- There are exactly two classifications: IWPB, and Non-IWPB (which is CIB).
+-- =============================================================================
+DO $$
+BEGIN
+    -- move any parked rows into the default classification
+    UPDATE fri_master  SET segment = 'Non-IWPB' WHERE segment NOT IN ('IWPB', 'Non-IWPB');
+    UPDATE mnrl_master SET segment = 'Non-IWPB' WHERE segment NOT IN ('IWPB', 'Non-IWPB');
+    DELETE FROM atr_defaults WHERE segment NOT IN ('IWPB', 'Non-IWPB');
+
+    ALTER TABLE fri_master  DROP CONSTRAINT IF EXISTS fri_master_segment_check;
+    ALTER TABLE mnrl_master DROP CONSTRAINT IF EXISTS mnrl_master_segment_check;
+    ALTER TABLE atr_defaults DROP CONSTRAINT IF EXISTS atr_defaults_segment_check;
+
+    ALTER TABLE fri_master
+        ADD CONSTRAINT fri_master_segment_check CHECK (segment IN ('IWPB', 'Non-IWPB'));
+    ALTER TABLE mnrl_master
+        ADD CONSTRAINT mnrl_master_segment_check CHECK (segment IN ('IWPB', 'Non-IWPB'));
+    ALTER TABLE atr_defaults
+        ADD CONSTRAINT atr_defaults_segment_check CHECK (segment IN ('IWPB', 'Non-IWPB'));
+
+    ALTER TABLE fri_master  ALTER COLUMN segment SET DEFAULT 'Non-IWPB';
+    ALTER TABLE mnrl_master ALTER COLUMN segment SET DEFAULT 'Non-IWPB';
+END $$;
+
+
+-- =============================================================================
 -- VIEWS
 -- =============================================================================
 CREATE OR REPLACE VIEW v_fri_active  AS SELECT * FROM fri_master  WHERE status = 'active';
@@ -330,3 +357,56 @@ CREATE OR REPLACE VIEW v_master_conflicts AS
     FROM dot_master_events
     WHERE event = 'conflict_ignored'
     ORDER BY event_date DESC, created_at DESC;
+
+
+-- =============================================================================
+-- v3.1 — CUSTOMER SNAPSHOT ON THE MASTER TABLES
+--
+-- The reconciled download must carry the full customer name/address block, not
+-- just cust_id. These are copied from mobilecleanup at reconcile time rather
+-- than joined at download time: mobilecleanup is TRUNCATEd and reloaded by the
+-- BigQuery pipeline, so a join would return blanks for any download running
+-- during a reload, and would rewrite history whenever an address changed.
+-- =============================================================================
+
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbadid VARCHAR(100);
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbnad1 VARCHAR(255);
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbnad2 VARCHAR(255);
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbnad3 VARCHAR(255);
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbnad4 VARCHAR(255);
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbnad5 VARCHAR(255);
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbteno VARCHAR(50);
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbten2 VARCHAR(50);
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbpscd VARCHAR(20);
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS zbiadd VARCHAR(255);
+
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbadid VARCHAR(100);
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbnad1 VARCHAR(255);
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbnad2 VARCHAR(255);
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbnad3 VARCHAR(255);
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbnad4 VARCHAR(255);
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbnad5 VARCHAR(255);
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbteno VARCHAR(50);
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbten2 VARCHAR(50);
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbpscd VARCHAR(20);
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS zbiadd VARCHAR(255);
+
+-- Rows reconciled BEFORE this migration have no snapshot. Backfill them from
+-- mobilecleanup while that data is still loaded. Safe to re-run.
+UPDATE fri_master m SET
+    zbadid = COALESCE(m.zbadid, c.zbadid), zbnad1 = COALESCE(m.zbnad1, c.zbnad1),
+    zbnad2 = COALESCE(m.zbnad2, c.zbnad2), zbnad3 = COALESCE(m.zbnad3, c.zbnad3),
+    zbnad4 = COALESCE(m.zbnad4, c.zbnad4), zbnad5 = COALESCE(m.zbnad5, c.zbnad5),
+    zbteno = COALESCE(m.zbteno, c.zbteno), zbten2 = COALESCE(m.zbten2, c.zbten2),
+    zbpscd = COALESCE(m.zbpscd, c.zbpscd), zbiadd = COALESCE(m.zbiadd, c.zbiadd)
+FROM mobilecleanup c
+WHERE c.final_mob_num = m.mobile_no AND m.zbnad1 IS NULL;
+
+UPDATE mnrl_master m SET
+    zbadid = COALESCE(m.zbadid, c.zbadid), zbnad1 = COALESCE(m.zbnad1, c.zbnad1),
+    zbnad2 = COALESCE(m.zbnad2, c.zbnad2), zbnad3 = COALESCE(m.zbnad3, c.zbnad3),
+    zbnad4 = COALESCE(m.zbnad4, c.zbnad4), zbnad5 = COALESCE(m.zbnad5, c.zbnad5),
+    zbteno = COALESCE(m.zbteno, c.zbteno), zbten2 = COALESCE(m.zbten2, c.zbten2),
+    zbpscd = COALESCE(m.zbpscd, c.zbpscd), zbiadd = COALESCE(m.zbiadd, c.zbiadd)
+FROM mobilecleanup c
+WHERE c.final_mob_num = m.mobile_no AND m.zbnad1 IS NULL;

@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import io
 import os
+import re
 from typing import Generator, Iterable, Iterator
 import uuid
 
@@ -56,37 +57,29 @@ VALID_SOURCE_CONTAINERS = {
     "mnrl-exports": AZURE_CONTAINER_MNRL,
 }
 
-MOBILECLEANUP_FETCH_COLUMNS: list[str] = [
-    "cust_id",
-    "final_mob_num",
-    "gho_code",
-    "zbadid",
-    "zbnad1",
-    "zbnad2",
-    "zbnad3",
-    "zbnad4",
-    "zbnad5",
-    "zbteno",
-    "zbten2",
-    "zbpscd",
-    "zbiadd",
-]
+# Column -> Excel header. One mapping instead of two parallel lists, which used
+# to drift apart whenever a column was added.
+MOBILECLEANUP_COLUMN_LABELS: dict[str, str] = {
+    "cust_id": "Customer Id",
+    "final_mob_num": "Mobile Phone",
+    "gho_code": "GHO Code",
+    "zbadid": "Address ID",
+    "zbnad1": "Customer name & address",
+    "zbnad2": "Customer name & address",
+    "zbnad3": "Customer name & address",
+    "zbnad4": "Customer name & address",
+    "zbnad5": "Customer name & address",
+    "zbteno": "Telephone No",
+    "zbten2": "Telephone No 2",
+    "zbpscd": "Postal code",
+    "zbiadd": "Internet Address",
+}
 
-MOBILECLEANUP_Headers: list[str] = [
-    "Customer Id",
-    "Mobile Phone",
-    "GHO Code",
-    "Address ID",
-    "Customer name & address",
-    "Customer name & address",
-    "Customer name & address",
-    "Customer name & address",
-    "Customer name & address",
-    "Telephone No",
-    "Telephone No 2",
-    "Postal code",
-    "Internet Address",
-]
+MOBILECLEANUP_FETCH_COLUMNS: list[str] = list(MOBILECLEANUP_COLUMN_LABELS)
+MOBILECLEANUP_Headers: list[str] = list(MOBILECLEANUP_COLUMN_LABELS.values())
+
+# Resolved once per process against the live table
+_active_columns_cache: list[str] | None = None
 
 _pg_pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
@@ -175,6 +168,43 @@ def _module_for_container(container: str) -> str:
     return "FRI" if container == AZURE_CONTAINER_FRI else "MNRL"
 
 
+def _canon_header(name) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_")
+
+
+# Header spellings that all mean "the mobile number"
+_MOB_COL_ALIASES = (
+    "mob_num", "mobile_no", "mobile_number", "mobile", "mob_no",
+    "msisdn", "phone_no", "final_mob_num",
+)
+
+
+def _resolve_mob_col(requested: str, headers: list[str]) -> str:
+    """Find the mobile-number column, whatever the file calls it.
+
+    The UI sends 'mob_num', but export_and_store writes the header as
+    'Mobile No'. Matching on the canonical form means either spelling works, and
+    a file that uses neither gets a message naming its actual columns.
+    """
+    by_canon = {_canon_header(h): h for h in headers}
+
+    if requested in headers:
+        return requested
+
+    wanted = _canon_header(requested)
+    if wanted in by_canon:
+        return by_canon[wanted]
+
+    for alias in _MOB_COL_ALIASES:
+        if alias in by_canon:
+            return by_canon[alias]
+
+    raise ValueError(
+        f"No mobile number column in this file. Looked for '{requested}'. "
+        f"The file has: {', '.join(headers)}"
+    )
+
+
 def _detect_mnrl_data_type(file_name: str, headers: list[str]) -> str:
     """Normal vs Reactivated, from the file name with a header fallback."""
     name = (file_name or "").lower()
@@ -189,13 +219,17 @@ def _detect_mnrl_data_type(file_name: str, headers: list[str]) -> str:
 
 
 # EXCEL BUILDERS
-def _make_header_cells(ws, columns: list) -> list:
+def _make_header_cells(ws, columns: list, labels: dict | None = None) -> list:
+    """Header row. `labels` maps column -> heading; without it a raw column name
+    is title-cased, which turns 'zbnad1' into 'Zbnad1'."""
+    labels = labels or {}
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill("solid", fgColor="1D4ED8")
     header_align = Alignment(horizontal="center")
     cells = []
     for col in columns:
-        cell = WriteOnlyCell(ws, value=str(col).replace("_", " ").title())
+        heading = labels.get(col) or str(col).replace("_", " ").title()
+        cell = WriteOnlyCell(ws, value=heading)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = header_align
@@ -248,6 +282,7 @@ def build_excel_parts_stream(
     base_file_name: str,
     columns: list,
     max_rows: int = EXCEL_MAX_ROWS,
+    labels: dict | None = None,
 ) -> Iterator[tuple[io.BytesIO, str, int, int]]:
     """Consume an iterator of row dicts and yield finished workbook parts.
 
@@ -268,7 +303,7 @@ def build_excel_parts_stream(
         buf = io.BytesIO()
         wb = Workbook(write_only=True)
         ws = wb.create_sheet("Data")
-        ws.append(_make_header_cells(ws, columns))
+        ws.append(_make_header_cells(ws, columns, labels))
         rows_in_part = 0
 
     def _close_part():
@@ -298,8 +333,12 @@ def build_matched_excel(
     headers: list[str],
     mob_col: str,
     matched_map: dict[str, dict],
+    hsbc_columns: list[str] | None = None,
 ) -> tuple[io.BytesIO, int]:
-    output_headers = headers + MOBILECLEANUP_Headers
+    hsbc_cols = hsbc_columns or MOBILECLEANUP_FETCH_COLUMNS
+    output_headers = headers + [
+        MOBILECLEANUP_COLUMN_LABELS.get(c, c.replace("_", " ").title()) for c in hsbc_cols
+    ]
     buf = io.BytesIO()
     wb = Workbook(write_only=True)
     ws = wb.create_sheet("Matched Data")
@@ -314,7 +353,7 @@ def build_matched_excel(
             continue
         data_row = [row.get(h, "") for h in headers]
         col_data = matched_map[mob_val]
-        data_row += [col_data.get(col, "") for col in MOBILECLEANUP_FETCH_COLUMNS]
+        data_row += [col_data.get(col, "") for col in hsbc_cols]
         buffer.append(data_row)
         matched_count += 1
         if len(buffer) >= EXCEL_FLUSH_ROWS:
@@ -436,13 +475,78 @@ def upload_matchoff_output(buf: io.BytesIO, date_folder: str, file_name: str) ->
 
 
 # MOBILECLEANUP RECONCILE
-def _fetch_chunk(mob_chunk: list[str]) -> dict[str, dict]:
+def _resolve_fetch_columns(force: bool = False) -> list[str]:
+    """Which of the wanted columns actually exist on mobilecleanup.
+
+    Without this, adding a column to MOBILECLEANUP_COLUMN_LABELS that the live
+    table doesn't have makes EVERY chunk query fail, which used to look exactly
+    like "nothing matched". A missing optional column now degrades instead.
+    """
+    global _active_columns_cache
+    if _active_columns_cache is not None and not force:
+        return _active_columns_cache
+
+    parts = PG_MATCHOFF_TABLE.split(".")
+    table_name = parts[-1].strip('"')
+    schema_name = parts[-2].strip('"') if len(parts) > 1 else None
+
+    sql = "SELECT column_name FROM information_schema.columns WHERE table_name = %s"
+    params: list = [table_name]
+    if schema_name:
+        sql += " AND table_schema = %s"
+        params.append(schema_name)
+
+    with _pg_cursor() as cur:
+        cur.execute(sql, params)
+        present = {r[0].lower() for r in cur.fetchall()}
+
+    if not present:
+        raise RuntimeError(
+            f"Table '{PG_MATCHOFF_TABLE}' was not found. Check PG_MATCHOFF_TABLE "
+            f"and that the HSBC data has been loaded."
+        )
+
+    if PG_MOB_COLUMN.lower() not in present:
+        raise RuntimeError(
+            f"Column '{PG_MOB_COLUMN}' does not exist on {PG_MATCHOFF_TABLE}. "
+            f"Set PG_MOB_COLUMN to the column holding the cleaned mobile number."
+        )
+
+    wanted = list(dict.fromkeys([PG_MOB_COLUMN] + MOBILECLEANUP_FETCH_COLUMNS))
+    active = [c for c in wanted if c.lower() in present]
+    missing = [c for c in wanted if c.lower() not in present]
+
+    if missing:
+        print(
+            f"[RECONCILE] {PG_MATCHOFF_TABLE} has no column(s): {', '.join(missing)} "
+            f"— continuing without them."
+        )
+        if PG_GHO_COLUMN in missing:
+            print(
+                f"[RECONCILE] ! '{PG_GHO_COLUMN}' is missing, so every reconciled row "
+                f"will fall back to the default classification. Add the column or set "
+                f"PG_GHO_COLUMN to its real name."
+            )
+
+    _active_columns_cache = active
+    return active
+
+
+def gho_column_available() -> bool:
+    try:
+        return PG_GHO_COLUMN in _resolve_fetch_columns()
+    except Exception:
+        return False
+
+
+def _fetch_chunk(mob_chunk: list[str], columns: list[str]) -> dict[str, dict]:
     if not mob_chunk:
         return {}
 
-    all_cols = list(dict.fromkeys([PG_MOB_COLUMN] + MOBILECLEANUP_FETCH_COLUMNS))
-    select_cols = ", ".join(all_cols)
-    sql = f"SELECT {select_cols} FROM {PG_MATCHOFF_TABLE} WHERE {PG_MOB_COLUMN} IN %s"
+    sql = (
+        f"SELECT {', '.join(columns)} FROM {PG_MATCHOFF_TABLE} "
+        f"WHERE {PG_MOB_COLUMN} IN %s"
+    )
 
     result = {}
     conn = _pg_conn()
@@ -466,31 +570,105 @@ def _fetch_chunk(mob_chunk: list[str]) -> dict[str, dict]:
     return result
 
 
+def _mobile_variants(value: str) -> set[str]:
+    """Every form of an Indian mobile number worth looking up.
+
+    Covers the raw value plus the 10-digit and 91-prefixed forms, so the match
+    succeeds whichever convention each side happens to use.
+    """
+    raw = str(value or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return set()
+
+    variants = {raw, digits}
+
+    # Strip international padding down to a bare subscriber number
+    core = digits
+    for prefix in ("0091", "091", "0091", "91", "0"):
+        if core.startswith(prefix) and len(core) - len(prefix) == 10:
+            core = core[len(prefix):]
+            break
+
+    if len(core) == 10:
+        variants.update({core, f"91{core}", f"091{core}", f"0{core}"})
+    elif len(digits) == 12 and digits.startswith("91"):
+        variants.update({digits[2:], digits})
+
+    return {v for v in variants if v}
+
+
 def match_mob_numbers(
     mob_numbers: list,
     chunk_size: int = SQL_CHUNK_SIZE,
     max_workers: int = SQL_MAX_WORKERS,
 ) -> dict[str, dict]:
-    unique_mobs = list({str(m).strip() for m in mob_numbers if m is not None and str(m).strip()})
-    if not unique_mobs:
+    """Reconcile numbers against HSBC data.
+
+    A query failure is raised, never absorbed. Swallowing it here would report a
+    broken lookup as "zero matches", which silently empties the master tables.
+    """
+    originals = [str(m).strip() for m in mob_numbers if m is not None and str(m).strip()]
+    if not originals:
         return {}
 
-    chunks = list(_chunks(unique_mobs, chunk_size))
-    matched: dict[str, dict] = {}
+    # The DOT feeds and mobilecleanup do not always agree on the country prefix:
+    # one side stores 9876543210, the other 919876543210. Matching the literal
+    # string finds only the rows that happen to agree, which reads as a genuine
+    # 0.04% match rate rather than the format mismatch it actually is. So look
+    # up every plausible form of each number and map the hit back to the value
+    # the caller passed in.
+    variants_by_original: dict[str, set[str]] = {}
+    lookup_to_originals: dict[str, set[str]] = {}
+
+    for original in set(originals):
+        variants = _mobile_variants(original)
+        variants_by_original[original] = variants
+        for variant in variants:
+            lookup_to_originals.setdefault(variant, set()).add(original)
+
+    all_variants = list(lookup_to_originals.keys())
+    columns = _resolve_fetch_columns()
+    chunks = list(_chunks(all_variants, chunk_size))
+    raw_hits: dict[str, dict] = {}
+    failures: list[Exception] = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_fetch_chunk, chunk): chunk for chunk in chunks}
+        futures = {pool.submit(_fetch_chunk, chunk, columns): chunk for chunk in chunks}
         for future in as_completed(futures):
             try:
-                matched.update(future.result())
+                raw_hits.update(future.result())
             except Exception as exc:
-                print(f"[RECONCILE] Chunk query failed: {exc}")
+                failures.append(exc)
+
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} of {len(chunks)} lookup batches failed against "
+            f"{PG_MATCHOFF_TABLE}. First error: {failures[0]}"
+        )
+
+    # Re-key hits onto the values the caller supplied
+    matched: dict[str, dict] = {}
+    for hit_value, row in raw_hits.items():
+        for original in lookup_to_originals.get(str(hit_value).strip(), ()):
+            matched.setdefault(original, row)
+
+    exact = sum(1 for k in matched if k in raw_hits)
+    if matched and exact < len(matched):
+        print(
+            f"[RECONCILE] {len(matched) - exact:,} of {len(matched):,} matches needed "
+            f"a prefix adjustment — the feed and {PG_MATCHOFF_TABLE} store numbers "
+            f"in different formats"
+        )
 
     return matched
 
 
 def list_gho_codes_from_source() -> list[dict]:
     """Distinct GHO codes present in mobilecleanup, with row counts."""
+    if not gho_column_available():
+        return []
+
     with _pg_cursor(dict_cursor=True) as cur:
         cur.execute(
             f"""SELECT {PG_GHO_COLUMN} AS gho_code, COUNT(*) AS record_count
@@ -684,7 +862,6 @@ def export_master(
     module: str,
     feed_date: str | None = None,
     segment: str | None = None,
-    gho_code: str | None = None,
 ) -> dict:
     """Stream the filtered master straight into workbook parts and upload each.
 
@@ -695,25 +872,37 @@ def export_master(
     module = module.upper()
     container = _get_container_name(module)
 
-    total = ms.count_active(module, feed_date, segment, gho_code)
+    total = ms.count_active(module, feed_date, segment)
     if total == 0:
-        raise ValueError(
-            "No records match those filters. Reconcile a file for this date first, "
-            "or widen the GHO selection."
-        )
+        # An empty selection is a normal answer, not a failure. Returning a
+        # result lets the UI say "nothing here" instead of showing a red error.
+        return {
+            "status": "empty",
+            "module": module,
+            "feed_date": feed_date,
+            "segment": segment,
+            "record_count": 0,
+            "file_count": 0,
+            "parts": [],
+            "file_name": None,
+            "sas_url": None,
+            "message": (
+                "No reconciled records match those filters yet. Reconcile a file "
+                "for this date, or widen the classification."
+            ),
+        }
 
     columns = ms.EXPORT_COLUMNS[module]
     label_date = feed_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     seg_label = (segment or "all").replace("-", "").lower()
-    gho_label = f"_{gho_code}" if gho_code and gho_code.upper() != "ALL" else ""
-    base_name = f"{module.lower()}_{seg_label}{gho_label}_{label_date}_{total}_records.xlsx"
+    base_name = f"{module.lower()}_{seg_label}_{label_date}_{total}_records.xlsx"
 
-    row_iter = ms.iter_active(module, feed_date, segment, gho_code, columns=columns)
+    row_iter = ms.iter_active(module, feed_date, segment, columns=columns)
 
     parts_meta = []
     exported = 0
     for buf, part_fname, row_count, part_idx in build_excel_parts_stream(
-        row_iter, base_name, columns, EXCEL_MAX_ROWS
+        row_iter, base_name, columns, EXCEL_MAX_ROWS, labels=ms.EXPORT_LABELS
     ):
         blob_name = f"{label_date}/{part_fname}"
         upload_blob(container, blob_name, buf)
@@ -737,7 +926,6 @@ def export_master(
         "module": module,
         "feed_date": feed_date,
         "segment": segment,
-        "gho_code": gho_code,
         "record_count": exported,
         "file_count": len(parts_meta),
         "parts": parts_meta,
@@ -771,11 +959,8 @@ def run_matchoff(
     input_rows, headers = read_excel_from_blob(source_container, date_folder, file_name)
     print(f"[RECONCILE] {len(input_rows):,} rows, columns: {headers}")
 
-    if mob_col not in headers:
-        raise ValueError(
-            f"Column '{mob_col}' not found in '{file_name}'. "
-            f"Available columns: {', '.join(headers)}"
-        )
+    mob_col = _resolve_mob_col(mob_col, headers)
+    print(f"[RECONCILE] Reading mobile numbers from column '{mob_col}'")
 
     data_type = None if is_fri else _detect_mnrl_data_type(file_name, headers)
     # A clear-only feed legitimately matches nothing in HSBC data
@@ -795,11 +980,11 @@ def run_matchoff(
         eligible_rows = input_rows
         excluded_compliant = 0
 
-    if not eligible_rows and not is_clear_feed:
-        raise ValueError(
-            f"Every one of the {len(input_rows):,} rows was excluded. "
-            f"Nothing left to reconcile."
-        )
+    # A file with no eligible rows still has work to do: every row being
+    # compliant means every row should CLEAR its master entry. Falling through
+    # with an empty match set does exactly that — returning early here would
+    # silently skip the clearing, which is the whole point of a compliant file.
+    all_compliant = not eligible_rows and not is_clear_feed
 
     mob_numbers = [row.get(mob_col) for row in eligible_rows]
     unique_count = len({str(m).strip() for m in mob_numbers if m})
@@ -833,12 +1018,6 @@ def run_matchoff(
         print(f"[MASTER] X ingest failed for {file_name}: {exc}")
         raise
 
-    if not matched_map and not is_clear_feed:
-        raise ValueError(
-            "Nothing matched. Check the mobile number column and that the "
-            "mobilecleanup load has finished."
-        )
-
     matched_count = sum(
         1 for row in eligible_rows if str(row.get(mob_col, "")).strip() in matched_map
     )
@@ -850,7 +1029,10 @@ def run_matchoff(
     if MATCHOFF_WRITE_EXCEL:
         base_name = file_name.replace(".xlsx", "")
         output_file_name = f"{base_name}_matched_{matched_count}_records.xlsx"
-        buf, _ = build_matched_excel(eligible_rows, headers, mob_col, matched_map)
+        hsbc_cols = [c for c in _resolve_fetch_columns() if c != PG_MOB_COLUMN]
+        buf, _ = build_matched_excel(
+            eligible_rows, headers, mob_col, matched_map, hsbc_columns=hsbc_cols
+        )
         output_blob_path = upload_matchoff_output(buf, date_folder, output_file_name)
         sas_url = get_sas_download_url(
             AZURE_CONTAINER_MATCHOFF_OUTPUT, output_blob_path, expiry_hours=24
@@ -876,8 +1058,38 @@ def run_matchoff(
         f"run_id={run_id}"
     )
 
+    cleared = master.get("cleared", 0)
+
+    if all_compliant:
+        # Nothing to add, but the compliant rows still cleared their entries.
+        status = "all_compliant"
+        message = (
+            f"Every one of the {len(input_rows):,} rows was already compliant. "
+            f"{cleared:,} matching number(s) were cleared from the master; "
+            f"there was nothing new to add."
+        )
+    elif matched_count == 0 and not is_clear_feed:
+        status = "no_matches"
+        message = (
+            f"None of the {len(eligible_rows):,} numbers belong to an HSBC "
+            f"customer, so nothing was added to the master. The file and the "
+            f"lookup both worked."
+            + (f" {cleared:,} compliant number(s) were still cleared." if cleared else "")
+        )
+    elif is_clear_feed and matched_count == 0:
+        status = "cleared_only"
+        message = (
+            f"Reactivation file processed: {cleared:,} number(s) cleared from "
+            f"the master. Reactivations don't add records, so no match was needed."
+        )
+    else:
+        status = "done"
+        message = None
+
     return {
         "id": run_id,
+        "status": status,
+        "message": message,
         "module": module,
         "data_type": data_type,
         "source_container": source_container,

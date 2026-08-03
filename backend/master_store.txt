@@ -27,11 +27,12 @@ Design rules
 Public API
 ----------
     ingest_fri_reconciled(...) / ingest_mnrl_reconciled(...)
-    iter_active(module, feed_date, segment, gho_code)   -> generator of dicts
-    count_active(module, feed_date, segment, gho_code)  -> int
+    iter_active(module, feed_date, segment)             -> generator of dicts
+    count_active(module, feed_date, segment)            -> int
+    segment_counts(module, feed_date)                   -> live per-class counts
     iter_atr_queue(module, ...)                         -> generator of batches
     mark_atr_result(...) / count_atr_pending(...)
-    list_gho_codes(module) / list_feed_dates(module)
+    list_feed_dates(module) / list_gho_codes(module)  (diagnostics only)
     master_stats(module) / conflicts(...) / lookup(...) / purge_expired()
 """
 
@@ -58,6 +59,11 @@ MOBILECLEANUP_TABLE = os.environ.get("PG_MATCHOFF_TABLE", "mobilecleanup")
 RETENTION_DAYS = int(os.environ.get("MASTER_RETENTION_DAYS", "90"))
 LEDGER_RETENTION_DAYS = int(os.environ.get("LEDGER_RETENTION_DAYS", "14"))
 
+# Rows that arrive already older than the retention window get this long before
+# the purge takes them, so reconciling a back-dated export doesn't look like it
+# silently did nothing.
+PURGE_GRACE_HOURS = int(os.environ.get("PURGE_GRACE_HOURS", "24"))
+
 PAGE_SIZE = int(os.environ.get("MASTER_UPSERT_PAGE", "5000"))
 STREAM_SIZE = int(os.environ.get("MASTER_STREAM_SIZE", "10000"))
 MAX_CONN = int(os.environ.get("MASTER_PG_MAXCONN", "6"))
@@ -65,22 +71,37 @@ MAX_CONN = int(os.environ.get("MASTER_PG_MAXCONN", "6"))
 STORE_PAYLOAD = os.environ.get("MASTER_STORE_PAYLOAD", "1") == "1"
 FRI_COMPLIANT_STATUS = os.environ.get("FRI_COMPLIANT_STATUS", "compliant").strip().lower()
 
-# Which GHO codes count as IWPB. Comma-separated, case-insensitive.
-IWPB_GHO_CODES = {
-    c.strip().upper()
-    for c in os.environ.get("IWPB_GHO_CODES", "IWPB").split(",")
-    if c.strip()
-}
-
 MODULE_FRI = "FRI"
 MODULE_MNRL = "MNRL"
 KIND_ADD = "add"
 KIND_CLEAR = "clear"
 
+# There are exactly two classifications. Non-IWPB is CIB.
 SEGMENT_IWPB = "IWPB"
 SEGMENT_NON_IWPB = "Non-IWPB"
-SEGMENT_UNKNOWN = "UNKNOWN"
-SEGMENTS = (SEGMENT_IWPB, SEGMENT_NON_IWPB, SEGMENT_UNKNOWN)
+SEGMENTS = (SEGMENT_IWPB, SEGMENT_NON_IWPB)
+
+SEGMENT_LABELS = {SEGMENT_IWPB: "IWPB", SEGMENT_NON_IWPB: "Non-IWPB (CIB)"}
+
+# GHO code -> classification. Comma-separated, case-insensitive.
+IWPB_GHO_CODES = {
+    c.strip().upper()
+    for c in os.environ.get("IWPB_GHO_CODES", "IWPB").split(",")
+    if c.strip()
+}
+NON_IWPB_GHO_CODES = {
+    c.strip().upper()
+    for c in os.environ.get("NON_IWPB_GHO_CODES", "CIB,NON-IWPB,NONIWPB").split(",")
+    if c.strip()
+}
+
+# Where a row lands when its GHO code is blank or unrecognised. Since the only
+# two codes are IWPB and CIB, anything that isn't IWPB is CIB.
+DEFAULT_SEGMENT = (
+    SEGMENT_IWPB
+    if os.environ.get("DEFAULT_SEGMENT", SEGMENT_NON_IWPB).upper() == "IWPB"
+    else SEGMENT_NON_IWPB
+)
 
 _TABLES = {MODULE_FRI: FRI_TABLE, MODULE_MNRL: MNRL_TABLE}
 _CLEAR_REASON = {MODULE_FRI: "compliant", MODULE_MNRL: "reactivated"}
@@ -96,20 +117,71 @@ _MODULE_COLS: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
+# ── CUSTOMER COLUMNS ─────────────────────────────────────────────────────────
+# Copied from mobilecleanup at reconcile time rather than joined at download
+# time. mobilecleanup is TRUNCATEd and reloaded by the BigQuery pipeline, so a
+# join would return blanks for any download running during a reload, and would
+# quietly rewrite history when an address changes. The master therefore holds a
+# snapshot of the customer as they were when the number was reported.
+CUSTOMER_COLS: list[str] = [
+    "zbadid", "zbnad1", "zbnad2", "zbnad3", "zbnad4", "zbnad5",
+    "zbteno", "zbten2", "zbpscd", "zbiadd",
+]
+
+# Column widths, matching the mobilecleanup DDL
+CUSTOMER_COL_LIMITS: dict[str, int] = {
+    "zbadid": 100, "zbnad1": 255, "zbnad2": 255, "zbnad3": 255,
+    "zbnad4": 255, "zbnad5": 255, "zbteno": 50, "zbten2": 50,
+    "zbpscd": 20, "zbiadd": 255,
+}
+
 # Column order for the master download
 EXPORT_COLUMNS: dict[str, list[str]] = {
-    MODULE_FRI: [
-        "mobile_no", "cust_id", "gho_code", "segment",
-        "fri", "fri_status", "lsa_id", "tsp_id",
-        "first_reported_on", "last_reported_on", "report_count",
-        "atr_status", "atr_action_taken", "atr_submitted_at",
-    ],
-    MODULE_MNRL: [
-        "mobile_no", "cust_id", "gho_code", "segment",
-        "date_of_disconnection", "disconnection_reason_id", "lsa_id", "tsp_id",
-        "first_reported_on", "last_reported_on", "report_count",
-        "atr_status", "atr_action_taken", "atr_submitted_at",
-    ],
+    MODULE_FRI: (
+        ["mobile_no", "cust_id", "segment"]
+        + CUSTOMER_COLS
+        + ["fri", "fri_status", "lsa_id", "tsp_id",
+           "first_reported_on", "last_reported_on", "report_count",
+           "atr_status", "atr_action_taken", "atr_submitted_at"]
+    ),
+    MODULE_MNRL: (
+        ["mobile_no", "cust_id", "segment"]
+        + CUSTOMER_COLS
+        + ["date_of_disconnection", "disconnection_reason_id", "lsa_id", "tsp_id",
+           "first_reported_on", "last_reported_on", "report_count",
+           "atr_status", "atr_action_taken", "atr_submitted_at"]
+    ),
+}
+
+# Excel header for each export column. Without this, openpyxl title-cases the
+# raw name and you get "Zbnad1". The five address lines are numbered so the
+# workbook has no two columns with the same heading.
+EXPORT_LABELS: dict[str, str] = {
+    "mobile_no": "Mobile Number",
+    "cust_id": "Customer Id",
+    "segment": "Classification",
+    "zbadid": "Address ID",
+    "zbnad1": "Name & Address 1",
+    "zbnad2": "Name & Address 2",
+    "zbnad3": "Name & Address 3",
+    "zbnad4": "Name & Address 4",
+    "zbnad5": "Name & Address 5",
+    "zbteno": "Telephone No",
+    "zbten2": "Telephone No 2",
+    "zbpscd": "Postal Code",
+    "zbiadd": "Internet Address",
+    "fri": "FRI",
+    "fri_status": "FRI Status",
+    "lsa_id": "LSA Id",
+    "tsp_id": "TSP Id",
+    "date_of_disconnection": "Date Of Disconnection",
+    "disconnection_reason_id": "Disconnection Reason",
+    "first_reported_on": "First Reported On",
+    "last_reported_on": "Last Reported On",
+    "report_count": "Times Reported",
+    "atr_status": "ATR Status",
+    "atr_action_taken": "ATR Action Code",
+    "atr_submitted_at": "ATR Sent At",
 }
 
 # Columns the ATR builder needs
@@ -224,11 +296,23 @@ def _payload(record: dict) -> psycopg2.extras.Json | None:
 
 
 def segment_for(gho_code: Any) -> str:
-    """IWPB / Non-IWPB / UNKNOWN, from the GHO code on the mobilecleanup row."""
+    """Classify a row from its GHO code. Always returns IWPB or Non-IWPB.
+
+    A blank or unrecognised code falls back to DEFAULT_SEGMENT rather than
+    creating a third bucket — a row parked in an 'unknown' segment would never
+    be picked up by a classification-scoped ATR run and would sit pending
+    forever. `master_stats()['missing_gho']` counts these so they stay visible.
+    """
     code = _txt(gho_code)
     if not code:
-        return SEGMENT_UNKNOWN
-    return SEGMENT_IWPB if code.upper() in IWPB_GHO_CODES else SEGMENT_NON_IWPB
+        return DEFAULT_SEGMENT
+
+    upper = code.upper()
+    if upper in IWPB_GHO_CODES:
+        return SEGMENT_IWPB
+    if upper in NON_IWPB_GHO_CODES:
+        return SEGMENT_NON_IWPB
+    return DEFAULT_SEGMENT
 
 
 # ── SQL BUILDERS ─────────────────────────────────────────────────────────────
@@ -244,18 +328,27 @@ def _upsert_sql(module: str) -> tuple[str, str]:
     mcols = _MODULE_COLS[module]
 
     insert_cols = (
-        ["mobile_no", "cust_id", "gho_code", "segment", "status",
-         "first_reported_on", "last_reported_on", "report_count"]
+        ["mobile_no", "cust_id", "gho_code", "segment"]
+        + CUSTOMER_COLS
+        + ["status", "first_reported_on", "last_reported_on", "report_count"]
         + [c for c, _ in mcols]
         + ["payload"]
     )
     template = (
-        "(%s, %s, %s, %s, 'active', %s::date, %s::date, 1, "
+        "(%s, %s, %s, %s, "
+        + ", ".join(["%s"] * len(CUSTOMER_COLS))
+        + ", 'active', %s::date, %s::date, 1, "
         + ", ".join(p for _, p in mcols)
         + ", %s)"
     )
     feed_updates = "\n".join(
-        f"    {col} = COALESCE(EXCLUDED.{col}, m.{col})," for col, _ in mcols
+        f"    {col} = COALESCE(EXCLUDED.{col}, m.{col}),"
+        for col, _ in mcols
+    )
+    # Refresh the customer snapshot on every sighting, but never overwrite a
+    # known value with a blank one.
+    customer_updates = "\n".join(
+        f"    {col} = COALESCE(EXCLUDED.{col}, m.{col})," for col in CUSTOMER_COLS
     )
 
     sql = f"""
@@ -279,8 +372,10 @@ ON CONFLICT (mobile_no) DO UPDATE SET
         + CASE WHEN EXCLUDED.last_reported_on > m.last_reported_on THEN 1 ELSE 0 END,
 
     cust_id  = COALESCE(EXCLUDED.cust_id, m.cust_id),
+{customer_updates}
+    -- keep a known code rather than overwriting it with a blank one
     gho_code = COALESCE(EXCLUDED.gho_code, m.gho_code),
-    segment  = CASE WHEN EXCLUDED.segment = 'UNKNOWN' THEN m.segment ELSE EXCLUDED.segment END,
+    segment  = CASE WHEN EXCLUDED.gho_code IS NULL THEN m.segment ELSE EXCLUDED.segment END,
 {feed_updates}
     payload    = COALESCE(EXCLUDED.payload, m.payload),
     updated_at = NOW()
@@ -430,23 +525,62 @@ def _retract(module: str, mobiles: list[str], feed_date: date, source_file) -> d
 
 
 def purge_expired(retention_days: int = RETENTION_DAYS,
-                  ledger_days: int = LEDGER_RETENTION_DAYS) -> dict:
+                  ledger_days: int = LEDGER_RETENTION_DAYS,
+                  grace_hours: int = PURGE_GRACE_HOURS) -> dict:
+    """Drop rows that have fallen out of the rolling window.
+
+    The `grace_hours` guard is load-bearing. The feed date comes from the source
+    file's date folder, so reconciling an export older than the retention window
+    would otherwise delete its own rows the instant they landed — the run logs a
+    healthy insert count and the table comes back empty. Anything written or
+    touched in the last `grace_hours` is protected; it becomes eligible on the
+    next run, by which point the count is visible in the reconcile result.
+    """
     out: dict[str, int] = {}
     with _cursor() as cur:
         for module, table in _TABLES.items():
             cur.execute(
                 f"""DELETE FROM {table}
                     WHERE last_reported_on < (CURRENT_DATE - %s::int)
-                      AND (cleared_on IS NULL OR cleared_on < (CURRENT_DATE - %s::int))""",
-                (retention_days, retention_days),
+                      AND (cleared_on IS NULL OR cleared_on < (CURRENT_DATE - %s::int))
+                      AND updated_at < NOW() - (%s::int * INTERVAL '1 hour')""",
+                (retention_days, retention_days, grace_hours),
             )
             out[f"{module.lower()}_purged"] = cur.rowcount
         cur.execute(
-            f"DELETE FROM {LEDGER_TABLE} WHERE feed_date < (CURRENT_DATE - %s::int)",
-            (ledger_days,),
+            f"""DELETE FROM {LEDGER_TABLE}
+                WHERE feed_date < (CURRENT_DATE - %s::int)
+                  AND seen_at < NOW() - (%s::int * INTERVAL '1 hour')""",
+            (ledger_days, grace_hours),
         )
         out["ledger_purged"] = cur.rowcount
     return out
+
+
+def retention_window_check(feed_date: Any) -> dict:
+    """Is this feed date already outside the rolling window?
+
+    Reconciling such a file still works, but the rows are purge-eligible once
+    the grace period ends. The reconcile result carries this so the UI can say
+    so plainly instead of the data quietly vanishing overnight.
+    """
+    fdate = _to_date(feed_date)
+    if not fdate:
+        return {"outside_window": False, "age_days": None}
+    age = (date.today() - fdate).days
+    return {
+        "outside_window": age > RETENTION_DAYS,
+        "age_days": age,
+        "retention_days": RETENTION_DAYS,
+        "grace_hours": PURGE_GRACE_HOURS,
+    }
+
+
+def _customer_values(hsbc: dict) -> tuple:
+    """The mobilecleanup name/address/phone snapshot, in CUSTOMER_COLS order."""
+    return tuple(
+        _txt(hsbc.get(col), CUSTOMER_COL_LIMITS.get(col)) for col in CUSTOMER_COLS
+    )
 
 
 def _dedupe_rows(rows: Iterable[tuple]) -> list[tuple]:
@@ -525,6 +659,7 @@ def ingest_fri_reconciled(
             _txt(hsbc.get(cust_id_key), 100),
             gho,
             seg,
+            *_customer_values(hsbc),
             fdate, fdate,
             _txt(_pick(record, hmap, "fri"), 50),
             _txt(_pick(record, hmap, "status"), 50),
@@ -555,6 +690,7 @@ def ingest_fri_reconciled(
         "retracted_deleted": retract_stats["deleted"],
         "retracted_uncleared": retract_stats["unclear"],
         "purged": purged,
+        "retention": retention_window_check(fdate),
     }
 
 
@@ -621,6 +757,7 @@ def ingest_mnrl_reconciled(
                 _txt(hsbc.get(cust_id_key), 100),
                 gho,
                 seg,
+                *_customer_values(hsbc),
                 fdate, fdate,
                 _to_date(_pick(record, hmap, "date_of_disconnection")),
                 _txt(_pick(record, hmap, "disconnectionreason_id",
@@ -650,14 +787,19 @@ def ingest_mnrl_reconciled(
         "retracted_deleted": retract_stats["deleted"],
         "retracted_uncleared": retract_stats["unclear"],
         "purged": purged,
+        "retention": retention_window_check(fdate),
     }
 
 
 # ── FILTERED READS ───────────────────────────────────────────────────────────
 def _filter_clause(feed_date: Any = None, segment: str | None = None,
-                   gho_code: str | None = None,
                    include_cleared: bool = False) -> tuple[str, list]:
-    """Shared WHERE for download / ATR / count. Returns (sql_fragment, params)."""
+    """Shared WHERE for download / ATR / count. Returns (sql_fragment, params).
+
+    Segment IS the GHO code, mapped: the code 'IWPB' -> IWPB, anything else
+    (currently CIB) -> Non-IWPB. There is no third axis to filter on, so
+    segment is the only classification predicate.
+    """
     clauses = [] if include_cleared else ["status = 'active'"]
     params: list[Any] = []
 
@@ -670,24 +812,18 @@ def _filter_clause(feed_date: Any = None, segment: str | None = None,
         clauses.append("segment = %s")
         params.append(segment)
 
-    if gho_code and gho_code.upper() not in ("ALL", ""):
-        clauses.append("gho_code = %s")
-        params.append(gho_code)
-
     return (" AND ".join(clauses) or "TRUE"), params
 
 
-def count_active(module: str, feed_date: Any = None, segment: str | None = None,
-                 gho_code: str | None = None) -> int:
+def count_active(module: str, feed_date: Any = None, segment: str | None = None) -> int:
     table = _TABLES[module.upper()]
-    where, params = _filter_clause(feed_date, segment, gho_code)
+    where, params = _filter_clause(feed_date, segment)
     with _cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", params)
         return int(cur.fetchone()[0])
 
 
 def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
-                gho_code: str | None = None,
                 columns: list[str] | None = None) -> Iterator[dict]:
     """Stream master rows for export.
 
@@ -699,7 +835,7 @@ def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
     module = module.upper()
     table = _TABLES[module]
     cols = columns or EXPORT_COLUMNS[module]
-    where, params = _filter_clause(feed_date, segment, gho_code)
+    where, params = _filter_clause(feed_date, segment)
 
     conn = _get_pool().getconn()
     name = f"stream_{module.lower()}_{os.getpid()}_{id(params)}"
@@ -728,11 +864,67 @@ def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
             pass
 
 
-def list_gho_codes(module: str | None = None) -> list[dict]:
-    """GHO codes for the reconcile dropdown, read from mobilecleanup.
+def segment_counts(module: str, feed_date: Any = None) -> dict:
+    """Live counts per classification, for the segmented control.
 
-    Counts come from the master when a module is given, so the dropdown shows
-    how many rows each code would actually return.
+    There are only ever two classifications — IWPB and Non-IWPB (CIB) — so this
+    replaces the old GHO-code dropdown outright: the control shows every
+    possible value along with what it would return.
+
+    `unclassified` counts rows whose mobilecleanup GHO code was blank. They are
+    included in 'both' but belong to neither classification, so a
+    classification-scoped ATR run will never pick them up.
+    """
+    module = module.upper()
+    table = _TABLES[module]
+    where, params = _filter_clause(feed_date)
+
+    with _cursor(dict_cursor=True) as cur:
+        cur.execute(
+            f"""
+            SELECT segment,
+                   COUNT(*)                                        AS total,
+                   COUNT(*) FILTER (WHERE atr_status = 'pending')  AS atr_pending,
+                   COUNT(*) FILTER (WHERE gho_code IS NULL
+                                      OR gho_code = '')            AS no_gho_code
+            FROM {table} WHERE {where}
+            GROUP BY segment
+            """,
+            params,
+        )
+        rows = {r["segment"]: dict(r) for r in cur.fetchall()}
+
+    out = {
+        "module": module,
+        "feed_date": str(_to_date(feed_date)) if feed_date else None,
+        "segments": [],
+        "total": 0,
+        "atr_pending": 0,
+        "unclassified": 0,
+    }
+
+    for seg in SEGMENTS:
+        row = rows.get(seg, {})
+        entry = {
+            "segment": seg,
+            "label": SEGMENT_LABELS.get(seg, seg),
+            "count": int(row.get("total", 0) or 0),
+            "atr_pending": int(row.get("atr_pending", 0) or 0),
+        }
+        out["segments"].append(entry)
+        out["total"] += entry["count"]
+        out["atr_pending"] += entry["atr_pending"]
+
+    out["unclassified"] = sum(int(r.get("no_gho_code", 0) or 0) for r in rows.values())
+    return out
+
+
+def list_gho_codes(module: str | None = None) -> list[dict]:
+    """Raw GHO codes seen on reconciled rows. Diagnostics only.
+
+    The UI no longer offers a GHO filter — with just IWPB and CIB in play, the
+    classification control already covers every value. Kept so an operator can
+    confirm what the source data actually contains.
     """
     out: list[dict] = []
     with _cursor(dict_cursor=True) as cur:
@@ -770,10 +962,9 @@ def list_feed_dates(module: str) -> list[dict]:
 
 
 # ── ATR QUEUE ────────────────────────────────────────────────────────────────
-def count_atr_pending(module: str, feed_date: Any = None, segment: str | None = None,
-                      gho_code: str | None = None) -> int:
+def count_atr_pending(module: str, feed_date: Any = None, segment: str | None = None) -> int:
     table = _TABLES[module.upper()]
-    where, params = _filter_clause(feed_date, segment, gho_code)
+    where, params = _filter_clause(feed_date, segment)
     with _cursor() as cur:
         cur.execute(
             f"SELECT COUNT(*) FROM {table} WHERE {where} AND atr_status = 'pending'",
@@ -783,7 +974,7 @@ def count_atr_pending(module: str, feed_date: Any = None, segment: str | None = 
 
 
 def iter_atr_queue(module: str, feed_date: Any = None, segment: str | None = None,
-                   gho_code: str | None = None, batch_size: int = 1000,
+                   batch_size: int = 1000,
                    limit: int | None = None) -> Iterator[list[dict]]:
     """Yield batches of numbers awaiting ATR.
 
@@ -793,7 +984,7 @@ def iter_atr_queue(module: str, feed_date: Any = None, segment: str | None = Non
     """
     module = module.upper()
     table = _TABLES[module]
-    where, base_params = _filter_clause(feed_date, segment, gho_code)
+    where, base_params = _filter_clause(feed_date, segment)
 
     last_id = 0
     sent = 0
@@ -882,6 +1073,9 @@ def master_stats(module: str) -> dict:
                                           AND status = 'active')         AS iwpb,
                        COUNT(*) FILTER (WHERE segment = 'Non-IWPB'
                                           AND status = 'active')         AS non_iwpb,
+                       COUNT(*) FILTER (WHERE status = 'active'
+                                          AND (gho_code IS NULL
+                                               OR gho_code = ''))        AS missing_gho,
                        COUNT(*) FILTER (WHERE status = 'active'
                                           AND atr_status = 'pending')    AS atr_pending,
                        COUNT(*) FILTER (WHERE atr_status = 'sent')       AS atr_sent,
