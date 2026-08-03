@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import io
 import os
-from typing import Generator
+from typing import Generator, Iterable, Iterator
 import uuid
 
 from azure.core.exceptions import HttpResponseError, ResourceExistsError
@@ -14,9 +14,11 @@ from openpyxl.styles import Alignment, Font, PatternFill
 import psycopg2.extras
 import psycopg2.pool
 
+import master_store as ms
+
 load_dotenv()
 
-# CONFIG (pulled from environment / Azure App Settings)
+# CONFIG
 AZURE_STORAGE_CONNECTION_STRING = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
 AZURE_STORAGE_ACCOUNT_NAME = os.environ["AZURE_STORAGE_ACCOUNT_NAME"]
 AZURE_STORAGE_ACCOUNT_KEY = os.environ["AZURE_STORAGE_ACCOUNT_KEY"]
@@ -29,22 +31,26 @@ PG_DSN = os.environ["AZURE_POSTGRES_DSN"]
 PG_MATCHOFF_TABLE = os.environ.get("PG_MATCHOFF_TABLE", "mobilecleanup")
 PG_MOB_COLUMN = os.environ.get("PG_MOB_COLUMN", "final_mob_num")
 PG_CUSTID_COLUMN = os.environ.get("PG_CUSTID_COLUMN", "cust_id")
+PG_GHO_COLUMN = os.environ.get("PG_GHO_COLUMN", "gho_code")
 
 # Matchoff tuning
 SQL_CHUNK_SIZE = int(os.environ.get("MATCHOFF_SQL_CHUNK", "1000"))
 SQL_MAX_WORKERS = int(os.environ.get("MATCHOFF_SQL_WORKERS", "5"))
 EXCEL_FLUSH_ROWS = int(os.environ.get("MATCHOFF_EXCEL_FLUSH", "5000"))
 
+# Reconcile writes the master store. The old matched-Excel artefact is off by
+# default: for 10 lakh rows it is the slowest part of the run and the download
+# now comes from the master, filtered by date + GHO code.
+MATCHOFF_WRITE_EXCEL = os.environ.get("MATCHOFF_WRITE_EXCEL", "0") == "1"
+
 FRI_STATUS_COLUMN = "Status"
 FRI_EXCLUDE_STATUS = "compliant"
 
-# Excel row limit Excel hard cap is 1,048,576 rows (incl. header).
+# Excel hard cap is 1,048,576 rows including the header
 EXCEL_MAX_ROWS = int(os.environ.get("EXCEL_MAX_ROWS", "1_000_000"))
 
-# Blob chunked-upload threshold - files larger than this use streams
 BLOB_CHUNK_THRESHOLD = 64 * 1024 * 1024  # 64 MB
 
-# Valid source containers
 VALID_SOURCE_CONTAINERS = {
     "fri-exports": AZURE_CONTAINER_FRI,
     "mnrl-exports": AZURE_CONTAINER_MNRL,
@@ -53,6 +59,7 @@ VALID_SOURCE_CONTAINERS = {
 MOBILECLEANUP_FETCH_COLUMNS: list[str] = [
     "cust_id",
     "final_mob_num",
+    "gho_code",
     "zbadid",
     "zbnad1",
     "zbnad2",
@@ -68,6 +75,7 @@ MOBILECLEANUP_FETCH_COLUMNS: list[str] = [
 MOBILECLEANUP_Headers: list[str] = [
     "Customer Id",
     "Mobile Phone",
+    "GHO Code",
     "Address ID",
     "Customer name & address",
     "Customer name & address",
@@ -87,19 +95,12 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pg_pool
     if _pg_pool is None or _pg_pool.closed:
         _pg_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2,
-            maxconn=max(SQL_MAX_WORKERS + 2, 10),
-            dsn=PG_DSN,
+            minconn=2, maxconn=max(SQL_MAX_WORKERS + 2, 10), dsn=PG_DSN
         )
     return _pg_pool
 
 
 def _pg_conn():
-    """Obtain a connection from the pool.
-
-    IMPORTANT: callers must return it via _put_conn() when done. Use the
-    context manager _pg_cursor() for query blocks.
-    """
     return _get_pool().getconn()
 
 
@@ -111,10 +112,7 @@ def _put_conn(conn):
 
 
 class _pg_cursor:
-    """Context manager that borrows a connection from the pool, yields a
-
-    RealDictCursor, and returns the connection on exit.
-    """
+    """Borrows a connection from the pool, yields a cursor, returns it on exit."""
 
     def __init__(self, dict_cursor: bool = False):
         self.dict_cursor = dict_cursor
@@ -145,7 +143,7 @@ class _pg_cursor:
             pass
         if self._conn:
             _put_conn(self._conn)
-        return False  # re-raise exceptions
+        return False
 
 
 # INTERNAL UTILITIES
@@ -160,11 +158,6 @@ def _ensure_container(name: str) -> None:
         raise RuntimeError(f"Failed to ensure container '{name}': {e.message}") from e
 
 
-def _ensure_all_containers() -> None:
-    for name in (AZURE_CONTAINER_FRI, AZURE_CONTAINER_MNRL, AZURE_CONTAINER_MATCHOFF_OUTPUT):
-        _ensure_container(name)
-
-
 def _get_container_name(module: str) -> str:
     return AZURE_CONTAINER_FRI if module.upper() == "FRI" else AZURE_CONTAINER_MNRL
 
@@ -174,9 +167,25 @@ def _blob_service() -> BlobServiceClient:
 
 
 def _chunks(lst: list, n: int) -> Generator:
-    """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i : i + n]
+
+
+def _module_for_container(container: str) -> str:
+    return "FRI" if container == AZURE_CONTAINER_FRI else "MNRL"
+
+
+def _detect_mnrl_data_type(file_name: str, headers: list[str]) -> str:
+    """Normal vs Reactivated, from the file name with a header fallback."""
+    name = (file_name or "").lower()
+    if "reactivat" in name:
+        return "Reactivated"
+    if "normal" in name:
+        return "Normal"
+    canon = {str(h).strip().lower().replace(" ", "_") for h in headers}
+    if "date_of_reactivation" in canon or "reactivation_id" in canon:
+        return "Reactivated"
+    return "Normal"
 
 
 # EXCEL BUILDERS
@@ -186,7 +195,7 @@ def _make_header_cells(ws, columns: list) -> list:
     header_align = Alignment(horizontal="center")
     cells = []
     for col in columns:
-        cell = WriteOnlyCell(ws, value=col.replace("_", " ").title())
+        cell = WriteOnlyCell(ws, value=str(col).replace("_", " ").title())
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = header_align
@@ -199,11 +208,9 @@ def build_excel(records: list, columns: list) -> io.BytesIO:
     wb = Workbook(write_only=True)
     ws = wb.create_sheet("Data")
     ws.append(_make_header_cells(ws, columns))
-
     for chunk in _chunks(records, 5_000):
         for rec in chunk:
             ws.append([rec.get(c, "") for c in columns])
-
     wb.save(buf)
     buf.seek(0)
     return buf
@@ -215,30 +222,75 @@ def build_excel_parts(
     columns: list,
     max_rows: int = EXCEL_MAX_ROWS,
 ) -> list[tuple[io.BytesIO, str, int]]:
-    total_parts = -(-len(records) // max_rows)  # ceiling division
+    total_parts = -(-len(records) // max_rows)
     results: list[tuple[io.BytesIO, str, int]] = []
 
     for part_idx, chunk in enumerate(_chunks(records, max_rows), start=1):
-        if total_parts == 1:
-            fname = base_file_name
-        else:
-            stem = base_file_name.replace(".xlsx", "")
-            fname = f"{stem}_part{part_idx}.xlsx"
-
+        fname = base_file_name if total_parts == 1 else (
+            f"{base_file_name.replace('.xlsx', '')}_part{part_idx}.xlsx"
+        )
         buf = io.BytesIO()
         wb = Workbook(write_only=True)
         ws = wb.create_sheet("Data")
         ws.append(_make_header_cells(ws, columns))
-
         for row_chunk in _chunks(chunk, 5_000):
             for rec in row_chunk:
                 ws.append([rec.get(c, "") for c in columns])
-
         wb.save(buf)
         buf.seek(0)
         results.append((buf, fname, len(chunk)))
 
     return results
+
+
+def build_excel_parts_stream(
+    row_iter: Iterable[dict],
+    base_file_name: str,
+    columns: list,
+    max_rows: int = EXCEL_MAX_ROWS,
+) -> Iterator[tuple[io.BytesIO, str, int, int]]:
+    """Consume an iterator of row dicts and yield finished workbook parts.
+
+    Generator, not a list: each part is uploaded and released before the next is
+    built, so peak memory is one workbook rather than the whole result set. This
+    is what makes a 10 lakh row download survivable.
+
+    Yields (buffer, file_name, row_count, part_index).
+    """
+    stem = base_file_name.replace(".xlsx", "")
+    part_idx = 0
+    wb = ws = buf = None
+    rows_in_part = 0
+
+    def _open_part():
+        nonlocal wb, ws, buf, rows_in_part, part_idx
+        part_idx += 1
+        buf = io.BytesIO()
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet("Data")
+        ws.append(_make_header_cells(ws, columns))
+        rows_in_part = 0
+
+    def _close_part():
+        wb.save(buf)
+        buf.seek(0)
+        return buf, rows_in_part
+
+    for row in row_iter:
+        if ws is None:
+            _open_part()
+        ws.append([row.get(c, "") for c in columns])
+        rows_in_part += 1
+
+        if rows_in_part >= max_rows - 1:  # -1 leaves room for the header
+            done_buf, count = _close_part()
+            yield done_buf, f"{stem}_part{part_idx}.xlsx", count, part_idx
+            wb = ws = buf = None
+
+    if ws is not None:
+        done_buf, count = _close_part()
+        fname = base_file_name if part_idx == 1 else f"{stem}_part{part_idx}.xlsx"
+        yield done_buf, fname, count, part_idx
 
 
 def build_matched_excel(
@@ -260,14 +312,11 @@ def build_matched_excel(
         mob_val = str(row.get(mob_col, "")).strip()
         if mob_val not in matched_map:
             continue
-
         data_row = [row.get(h, "") for h in headers]
         col_data = matched_map[mob_val]
         data_row += [col_data.get(col, "") for col in MOBILECLEANUP_FETCH_COLUMNS]
-
         buffer.append(data_row)
         matched_count += 1
-
         if len(buffer) >= EXCEL_FLUSH_ROWS:
             for r in buffer:
                 ws.append(r)
@@ -281,7 +330,7 @@ def build_matched_excel(
     return buf, matched_count
 
 
-# AZURE BLOB CORE OPERATIONS
+# AZURE BLOB CORE
 def upload_blob(container: str, blob_name: str, data: bytes | io.BytesIO) -> str:
     _ensure_container(container)
     blob_client = _blob_service().get_blob_client(container=container, blob=blob_name)
@@ -312,28 +361,28 @@ def get_sas_download_url(container: str, blob_name: str, expiry_hours: int = 1) 
         permission=BlobSasPermissions(read=True),
         expiry=datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
     )
-    return f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{container}/{blob_name}?{sas_token}"
+    return (
+        f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net/"
+        f"{container}/{blob_name}?{sas_token}"
+    )
 
 
-# BLOB BROWSER HELPERS
+# BLOB BROWSER
 def list_source_date_folders(container: str) -> list[str]:
     if container not in VALID_SOURCE_CONTAINERS.values():
         raise ValueError(f"Container '{container}' is not a permitted source.")
-
     cc = _blob_service().get_container_client(container)
     seen = set()
     for blob in cc.list_blobs():
         parts = blob.name.split("/")
         if len(parts) >= 2 and parts[0]:
             seen.add(parts[0])
-
     return sorted(seen, reverse=True)
 
 
 def list_source_files(container: str, date_folder: str) -> list[str]:
     if container not in VALID_SOURCE_CONTAINERS.values():
         raise ValueError(f"Container '{container}' is not a permitted source.")
-
     prefix = f"{date_folder}/"
     cc = _blob_service().get_container_client(container)
     files = []
@@ -341,11 +390,9 @@ def list_source_files(container: str, date_folder: str) -> list[str]:
         fname = blob.name[len(prefix) :]
         if fname and fname.endswith(".xlsx") and "/" not in fname:
             files.append(fname)
-
     return sorted(files)
 
 
-# BLOB READ source Excel files
 def read_excel_from_blob(container: str, date_folder: str, file_name: str) -> tuple[list[dict], list[str]]:
     if container not in VALID_SOURCE_CONTAINERS.values():
         raise ValueError(f"Container '{container}' is not a permitted source.")
@@ -380,7 +427,6 @@ def read_excel_from_blob(container: str, date_folder: str, file_name: str) -> tu
     return rows, headers
 
 
-# BLOB UPLOAD matchoff output
 def upload_matchoff_output(buf: io.BytesIO, date_folder: str, file_name: str) -> str:
     _ensure_container(AZURE_CONTAINER_MATCHOFF_OUTPUT)
     blob_path = f"{date_folder}/{file_name}"
@@ -389,7 +435,7 @@ def upload_matchoff_output(buf: io.BytesIO, date_folder: str, file_name: str) ->
     return blob_path
 
 
-# MOBILECLEANUP chunked parallel matching
+# MOBILECLEANUP RECONCILE
 def _fetch_chunk(mob_chunk: list[str]) -> dict[str, dict]:
     if not mob_chunk:
         return {}
@@ -406,8 +452,10 @@ def _fetch_chunk(mob_chunk: list[str]) -> dict[str, dict]:
             col_names = [desc[0] for desc in cur.description]
             for row in cur.fetchall():
                 mob_val = str(row[0]).strip()
-                col_data = {col_names[i]: (str(val).strip() if val is not None else "") for i, val in enumerate(row)}
-                result[mob_val] = col_data
+                result[mob_val] = {
+                    col_names[i]: (str(val).strip() if val is not None else "")
+                    for i, val in enumerate(row)
+                }
         conn.commit()
     except Exception:
         conn.rollback()
@@ -436,12 +484,33 @@ def match_mob_numbers(
             try:
                 matched.update(future.result())
             except Exception as exc:
-                print(f"[MATCHOFF] Chunk query failed: {exc}")
+                print(f"[RECONCILE] Chunk query failed: {exc}")
 
     return matched
 
 
-# POSTGRESQL export_files CRUD
+def list_gho_codes_from_source() -> list[dict]:
+    """Distinct GHO codes present in mobilecleanup, with row counts."""
+    with _pg_cursor(dict_cursor=True) as cur:
+        cur.execute(
+            f"""SELECT {PG_GHO_COLUMN} AS gho_code, COUNT(*) AS record_count
+                FROM {PG_MATCHOFF_TABLE}
+                WHERE {PG_GHO_COLUMN} IS NOT NULL AND {PG_GHO_COLUMN} <> ''
+                GROUP BY {PG_GHO_COLUMN} ORDER BY {PG_GHO_COLUMN}"""
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "gho_code": r["gho_code"],
+            "record_count": r["record_count"],
+            "segment": ms.segment_for(r["gho_code"]),
+        }
+        for r in rows
+    ]
+
+
+# METADATA CRUD
 def save_export_metadata(
     module: str,
     file_name: str,
@@ -450,7 +519,6 @@ def save_export_metadata(
     export_date: str,
     data_type: str = None,
 ) -> str:
-    """Insert export metadata row. Returns the new UUID string."""
     row_id = str(uuid.uuid4())
     container = _get_container_name(module)
     with _pg_cursor() as cur:
@@ -460,7 +528,8 @@ def save_export_metadata(
             (id, module, file_name, blob_name, container, record_count, export_date, data_type, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """,
-            (row_id, module.upper(), file_name, blob_name, container, record_count, export_date, data_type),
+            (row_id, module.upper(), file_name, blob_name, container,
+             record_count, export_date, data_type),
         )
     return row_id
 
@@ -470,9 +539,7 @@ def list_export_metadata(module: str) -> list:
         cur.execute(
             """
             SELECT id, file_name, blob_name, container, record_count, export_date, data_type, created_at
-            FROM export_files
-            WHERE module = %s
-            ORDER BY created_at DESC
+            FROM export_files WHERE module = %s ORDER BY created_at DESC
             """,
             (module.upper(),),
         )
@@ -484,72 +551,69 @@ def list_export_metadata(module: str) -> list:
         d["created_at"] = d["created_at"].isoformat()
         d["export_date"] = str(d["export_date"])
         result.append(d)
-
     return result
 
 
 def get_export_metadata_row(file_id: str, module: str) -> dict:
-    """Single export row by UUID + module. Raises ValueError if not found."""
     with _pg_cursor(dict_cursor=True) as cur:
         cur.execute(
             "SELECT * FROM export_files WHERE id = %s AND module = %s",
             (file_id, module.upper()),
         )
         row = cur.fetchone()
-
     if not row:
         raise ValueError(f"No export record found: id={file_id}, module={module}")
     return dict(row)
 
 
-# POSTGRESQL - matchoff_runs CRUD
 def save_matchoff_metadata(
     source_container: str,
     source_date_folder: str,
     source_file_name: str,
-    output_blob_path: str,
+    output_blob_path: str | None,
     input_row_count: int,
     matched_count: int,
     mob_col: str,
     run_date: str,
+    module: str | None = None,
+    data_type: str | None = None,
+    master: dict | None = None,
 ) -> str:
     row_id = str(uuid.uuid4())
+    master = master or {}
     with _pg_cursor() as cur:
         cur.execute(
             """
             INSERT INTO matchoff_runs (
                 id, source_container, source_date_folder, source_file_name,
                 output_blob_path, output_container, input_row_count,
-                matched_count, mob_column, run_date, created_at
+                matched_count, mob_column, run_date, module, data_type,
+                master_inserted, master_updated, master_cleared, conflicts_ignored,
+                created_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """,
             (
-                row_id,
-                source_container,
-                source_date_folder,
-                source_file_name,
-                output_blob_path,
-                AZURE_CONTAINER_MATCHOFF_OUTPUT,
-                input_row_count,
-                matched_count,
-                mob_col,
-                run_date,
+                row_id, source_container, source_date_folder, source_file_name,
+                output_blob_path, AZURE_CONTAINER_MATCHOFF_OUTPUT, input_row_count,
+                matched_count, mob_col, run_date, module, data_type,
+                master.get("master_inserted", 0), master.get("master_updated", 0),
+                master.get("cleared", 0), master.get("conflicts_ignored", 0),
             ),
         )
     return row_id
 
 
 def list_matchoff_metadata() -> list:
-    """All matchoff runs, newest first."""
     with _pg_cursor(dict_cursor=True) as cur:
         cur.execute(
             """
             SELECT id, source_container, source_date_folder, source_file_name,
                    output_blob_path, output_container, input_row_count,
-                   matched_count, mob_column, run_date, created_at
-            FROM matchoff_runs
-            ORDER BY created_at DESC
+                   matched_count, mob_column, run_date, module, data_type,
+                   master_inserted, master_updated, master_cleared,
+                   conflicts_ignored, created_at
+            FROM matchoff_runs ORDER BY created_at DESC LIMIT 200
             """
         )
         rows = cur.fetchall()
@@ -560,21 +624,19 @@ def list_matchoff_metadata() -> list:
         d["created_at"] = d["created_at"].isoformat()
         d["run_date"] = str(d["run_date"])
         result.append(d)
-
     return result
 
 
 def get_matchoff_run(run_id: str) -> dict:
-    """Single matchoff row by UUID. Raises ValueError if not found."""
     with _pg_cursor(dict_cursor=True) as cur:
         cur.execute("SELECT * FROM matchoff_runs WHERE id = %s", (run_id,))
         row = cur.fetchone()
-
     if not row:
         raise ValueError(f"Matchoff run not found: {run_id}")
     return dict(row)
 
 
+# EXPORT (raw feed -> blob) — used by the FRI / MNRL download tabs
 def export_and_store(
     module: str,
     records: list,
@@ -587,33 +649,21 @@ def export_and_store(
     total = len(records)
 
     parts_raw = build_excel_parts(
-        records=records,
-        columns=columns,
-        base_file_name=file_name,
-        max_rows=EXCEL_MAX_ROWS,
+        records=records, columns=columns,
+        base_file_name=file_name, max_rows=EXCEL_MAX_ROWS,
     )
 
     parts_meta = []
     for buf, part_fname, row_count in parts_raw:
         blob_name = f"{export_date}/{part_fname}"
         upload_blob(container, blob_name, buf)
-
         row_id = save_export_metadata(
-            module=module,
-            file_name=part_fname,
-            blob_name=blob_name,
-            record_count=row_count,
-            export_date=export_date,
-            data_type=data_type,
+            module=module, file_name=part_fname, blob_name=blob_name,
+            record_count=row_count, export_date=export_date, data_type=data_type,
         )
-
         parts_meta.append({
-            "id": row_id,
-            "file_name": part_fname,
-            "record_count": row_count,
-            "export_date": export_date,
-            "module": module.upper(),
-            "data_type": data_type,
+            "id": row_id, "file_name": part_fname, "record_count": row_count,
+            "export_date": export_date, "module": module.upper(), "data_type": data_type,
         })
         print(f"[EXPORT] Uploaded {module} part {blob_name} ({row_count:,} rows)")
 
@@ -629,82 +679,184 @@ def export_and_store(
     }
 
 
+# EXPORT (master -> blob) — the reconcile tab's download
+def export_master(
+    module: str,
+    feed_date: str | None = None,
+    segment: str | None = None,
+    gho_code: str | None = None,
+) -> dict:
+    """Stream the filtered master straight into workbook parts and upload each.
+
+    Nothing is materialised: rows arrive from a server-side cursor, go into a
+    write-only worksheet, and each finished part is uploaded and dropped before
+    the next begins.
+    """
+    module = module.upper()
+    container = _get_container_name(module)
+
+    total = ms.count_active(module, feed_date, segment, gho_code)
+    if total == 0:
+        raise ValueError(
+            "No records match those filters. Reconcile a file for this date first, "
+            "or widen the GHO selection."
+        )
+
+    columns = ms.EXPORT_COLUMNS[module]
+    label_date = feed_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    seg_label = (segment or "all").replace("-", "").lower()
+    gho_label = f"_{gho_code}" if gho_code and gho_code.upper() != "ALL" else ""
+    base_name = f"{module.lower()}_{seg_label}{gho_label}_{label_date}_{total}_records.xlsx"
+
+    row_iter = ms.iter_active(module, feed_date, segment, gho_code, columns=columns)
+
+    parts_meta = []
+    exported = 0
+    for buf, part_fname, row_count, part_idx in build_excel_parts_stream(
+        row_iter, base_name, columns, EXCEL_MAX_ROWS
+    ):
+        blob_name = f"{label_date}/{part_fname}"
+        upload_blob(container, blob_name, buf)
+        buf.close()
+
+        row_id = save_export_metadata(
+            module=module, file_name=part_fname, blob_name=blob_name,
+            record_count=row_count, export_date=label_date,
+            data_type=(segment or "All segments"),
+        )
+        parts_meta.append({
+            "id": row_id, "file_name": part_fname, "record_count": row_count,
+            "blob_name": blob_name,
+        })
+        exported += row_count
+        print(f"[MASTER EXPORT] part {part_idx} -> {blob_name} ({row_count:,} rows)")
+
+    sas_url = get_sas_download_url(container, parts_meta[0]["blob_name"], expiry_hours=24)
+
+    return {
+        "module": module,
+        "feed_date": feed_date,
+        "segment": segment,
+        "gho_code": gho_code,
+        "record_count": exported,
+        "file_count": len(parts_meta),
+        "parts": parts_meta,
+        "file_name": parts_meta[0]["file_name"],
+        "sas_url": sas_url,
+        "export_date": label_date,
+    }
+
+
+# RECONCILE
 def run_matchoff(
     source_container: str,
     date_folder: str,
     file_name: str,
     mob_col: str = "mob_num",
 ) -> dict:
-    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    is_fri = source_container == AZURE_CONTAINER_FRI
+    """Reconcile a source feed against HSBC data and write the master store.
 
-    # 1. Read source Excel
-    print(f"[MATCHOFF] Reading {source_container}/{date_folder}/{file_name}")
+    This is the ONLY writer of fri_master / mnrl_master: a number earns a row
+    once it has matched mobilecleanup, and the match is also where cust_id and
+    gho_code (hence IWPB / Non-IWPB) come from.
+
+    No Excel is produced unless MATCHOFF_WRITE_EXCEL=1. Downloads come from
+    export_master(), filtered by date and GHO code.
+    """
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    module = _module_for_container(source_container)
+    is_fri = module == "FRI"
+
+    print(f"[RECONCILE] Reading {source_container}/{date_folder}/{file_name}")
     input_rows, headers = read_excel_from_blob(source_container, date_folder, file_name)
-    print(f"[MATCHOFF] {len(input_rows):,} rows, columns: {headers}")
+    print(f"[RECONCILE] {len(input_rows):,} rows, columns: {headers}")
 
     if mob_col not in headers:
         raise ValueError(
-            f"Column '{mob_col}' not found in '{file_name}'. Available columns: {', '.join(headers)}"
+            f"Column '{mob_col}' not found in '{file_name}'. "
+            f"Available columns: {', '.join(headers)}"
         )
 
-    if is_fri:
-        if FRI_STATUS_COLUMN not in headers:
-            eligible_rows = input_rows
-            excluded_compliant_count = 0
-        else:
-            eligible_rows = [
-                row for row in input_rows
-                if str(row.get(FRI_STATUS_COLUMN, "")).strip() != FRI_EXCLUDE_STATUS
-            ]
-            excluded_compliant_count = len(input_rows) - len(eligible_rows)
-            print(
-                f"[MATCHOFF] FRI EXCLUSION: {excluded_compliant_count} '{FRI_EXCLUDE_STATUS}' "
-                f"rows removed, {len(eligible_rows)} eligible rows remain"
-            )
+    data_type = None if is_fri else _detect_mnrl_data_type(file_name, headers)
+    # A clear-only feed legitimately matches nothing in HSBC data
+    is_clear_feed = data_type == "Reactivated"
+
+    if is_fri and FRI_STATUS_COLUMN in headers:
+        eligible_rows = [
+            row for row in input_rows
+            if str(row.get(FRI_STATUS_COLUMN, "")).strip() != FRI_EXCLUDE_STATUS
+        ]
+        excluded_compliant = len(input_rows) - len(eligible_rows)
+        print(
+            f"[RECONCILE] {excluded_compliant:,} compliant rows held back from the "
+            f"match, {len(eligible_rows):,} to reconcile"
+        )
     else:
         eligible_rows = input_rows
-        excluded_compliant_count = 0
+        excluded_compliant = 0
 
-    if not eligible_rows:
+    if not eligible_rows and not is_clear_feed:
         raise ValueError(
-            f"All {len(input_rows)} rows were excluded. No eligible records remain for match-off."
+            f"Every one of the {len(input_rows):,} rows was excluded. "
+            f"Nothing left to reconcile."
         )
 
-    # 2. Extract + deduplicate mob numbers
     mob_numbers = [row.get(mob_col) for row in eligible_rows]
     unique_count = len({str(m).strip() for m in mob_numbers if m})
-    print(f"[MATCHOFF] {unique_count:,} unique mob numbers to match")
+    print(f"[RECONCILE] Matching {unique_count:,} unique numbers against mobilecleanup")
 
-    # 3. Chunked parallel match
-    print(f"[MATCHOFF] Querying mobilecleanup: chunks={SQL_CHUNK_SIZE}, workers={SQL_MAX_WORKERS}")
     matched_map = match_mob_numbers(mob_numbers)
-    print(f"[MATCHOFF] {len(matched_map):,} unique numbers matched")
+    print(f"[RECONCILE] {len(matched_map):,} matched")
 
-    if not matched_map:
+    # Master store gets ALL rows — including compliant ones — so it can spot a
+    # number contradicted within the same feed date.
+    try:
+        if is_fri:
+            master = ms.ingest_fri_reconciled(
+                feed_date=date_folder, rows=input_rows, matched_map=matched_map,
+                source_file=file_name, cust_id_key=PG_CUSTID_COLUMN,
+                gho_key=PG_GHO_COLUMN,
+            )
+        else:
+            master = ms.ingest_mnrl_reconciled(
+                feed_date=date_folder, data_type=data_type, rows=input_rows,
+                matched_map=matched_map, source_file=file_name,
+                cust_id_key=PG_CUSTID_COLUMN, gho_key=PG_GHO_COLUMN,
+            )
+        print(
+            f"[MASTER][{module}] inserted={master['master_inserted']:,} "
+            f"updated={master['master_updated']:,} cleared={master['cleared']:,} "
+            f"conflicts={master['conflicts_ignored']:,} "
+            f"segments={master['by_segment']}"
+        )
+    except Exception as exc:
+        print(f"[MASTER] X ingest failed for {file_name}: {exc}")
+        raise
+
+    if not matched_map and not is_clear_feed:
         raise ValueError(
-            "Zero matches found. Verify mob_col name and that Phase 2 data has been loaded into mobilecleanup."
+            "Nothing matched. Check the mobile number column and that the "
+            "mobilecleanup load has finished."
         )
 
-    base_name = file_name.replace(".xlsx", "")
-    matched_count_est = sum(
+    matched_count = sum(
         1 for row in eligible_rows if str(row.get(mob_col, "")).strip() in matched_map
     )
-    output_file_name = f"{base_name}_matched_{matched_count_est}_records.xlsx"
-    print(f"[MATCHOFF] Building output Excel: {output_file_name}")
 
-    buf, matched_count = build_matched_excel(
-        input_rows=eligible_rows,
-        headers=headers,
-        mob_col=mob_col,
-        matched_map=matched_map,
-    )
+    output_blob_path = None
+    output_file_name = None
+    sas_url = None
 
-    # 5. Upload
-    output_blob_path = upload_matchoff_output(buf, date_folder, output_file_name)
-    print(f"[MATCHOFF] Uploaded matchoff-output/{output_blob_path}")
+    if MATCHOFF_WRITE_EXCEL:
+        base_name = file_name.replace(".xlsx", "")
+        output_file_name = f"{base_name}_matched_{matched_count}_records.xlsx"
+        buf, _ = build_matched_excel(eligible_rows, headers, mob_col, matched_map)
+        output_blob_path = upload_matchoff_output(buf, date_folder, output_file_name)
+        sas_url = get_sas_download_url(
+            AZURE_CONTAINER_MATCHOFF_OUTPUT, output_blob_path, expiry_hours=24
+        )
+        print(f"[RECONCILE] Wrote matchoff-output/{output_blob_path}")
 
-    # 6. Metadata
     run_id = save_matchoff_metadata(
         source_container=source_container,
         source_date_folder=date_folder,
@@ -714,34 +866,29 @@ def run_matchoff(
         matched_count=matched_count,
         mob_col=mob_col,
         run_date=run_date,
+        module=module,
+        data_type=data_type,
+        master=master,
     )
-
-    # 7. 24-hour SAS URL
-    sas_url = get_sas_download_url(
-        container=AZURE_CONTAINER_MATCHOFF_OUTPUT,
-        blob_name=output_blob_path,
-        expiry_hours=24,
-    )
-
-    eligible_row_count = len(input_rows) - excluded_compliant_count
 
     print(
-        f"[MATCHOFF] Done. input = {len(input_rows)}, "
-        f"excluded_compliant={excluded_compliant_count}, "
-        f"eligible={eligible_row_count}, "
-        f"matched_count={matched_count:,}, run_id={run_id}"
+        f"[RECONCILE] Done. input={len(input_rows):,} matched={matched_count:,} "
+        f"run_id={run_id}"
     )
 
     return {
         "id": run_id,
+        "module": module,
+        "data_type": data_type,
         "source_container": source_container,
         "date_folder": date_folder,
         "source_file": file_name,
-        "output_file": output_file_name,
         "input_row_count": len(input_rows),
-        "excluded_compliant_count": excluded_compliant_count,
-        "eligible_row_count": eligible_row_count,
+        "excluded_compliant_count": excluded_compliant,
+        "eligible_row_count": len(eligible_rows),
         "matched_count": matched_count,
+        "output_file": output_file_name,
         "sas_url": sas_url,
         "run_date": run_date,
+        "master": master,
     }

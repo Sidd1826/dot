@@ -1,0 +1,633 @@
+"""
+atr.py
+======
+
+Action Taken Report submission to C-DOT.
+
+Flow
+----
+    master rows (reconciled, atr_status='pending')
+        -> apply atr_defaults for (module, segment)
+        -> build atr_data records per the C-DOT spec
+        -> encrypt {client_id, atr_data} with the ATR RSA public key
+        -> POST in batches
+        -> write outcome back to the master row + atr_runs / atr_rejects
+
+Volume handling
+---------------
+Numbers are pulled in keyset-paginated batches and never held as one list, so a
+10 lakh run costs one batch of memory. Batch size adapts downward on HTTP 413.
+
+FRI and MNRL differ only by URL, client_id, encryption key id and auth source —
+everything else is shared. MNRL values are placeholders until C-DOT publishes
+that endpoint.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+import json
+import os
+import re
+import time
+from typing import Any
+import uuid
+
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+import requests
+from requests.adapters import HTTPAdapter
+import urllib3
+from urllib3.util.retry import Retry
+
+from crypto_utils import encrypt_data
+import master_store as ms
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ── CONFIG ───────────────────────────────────────────────────────────────────
+PG_DSN = os.environ["AZURE_POSTGRES_DSN"]
+
+ATR_URL = {
+    "FRI": os.getenv(
+        "FRI_ATR_URL",
+        "https://fritestgateway.sancharsaathi.gov.in/friatr/v2/atr",
+    ),
+    # PLACEHOLDER — replace when C-DOT publishes the MNRL ATR endpoint
+    "MNRL": os.getenv("MNRL_ATR_URL", "https://REPLACE-ME.example.gov.in/mnrlatr/v2/atr"),
+}
+
+# crypto_utils.encrypt_data resolves the env var f"{key_id}_PUBLIC_KEY".
+# C-DOT issues a SEPARATE RSA key for ATR, so this is not the fetch key.
+ATR_KEY_ID = {
+    "FRI": os.getenv("FRI_ATR_KEY_ID", "FRI_ATR"),
+    "MNRL": os.getenv("MNRL_ATR_KEY_ID", "MNRL_ATR"),
+}
+
+ATR_CLIENT_ID = {
+    "FRI": os.getenv("FRI_CLIENT_ID"),
+    "MNRL": os.getenv("MNRL_CLIENT_ID") or os.getenv("BankId"),
+}
+
+ATR_BATCH_SIZE = int(os.getenv("ATR_BATCH_SIZE", "1000"))
+ATR_MIN_BATCH_SIZE = int(os.getenv("ATR_MIN_BATCH_SIZE", "100"))
+ATR_MAX_RETRIES = int(os.getenv("ATR_MAX_RETRIES", "3"))
+ATR_TIMEOUT = int(os.getenv("ATR_TIMEOUT", "90"))
+ATR_VERIFY_SSL = os.getenv("ATR_VERIFY_SSL", "0") == "1"
+ATR_THROTTLE_MS = int(os.getenv("ATR_THROTTLE_MS", "0"))  # pause between batches
+
+MAX_INVESTIGATION = 500
+MAX_REMARKS = 100
+
+VALID_ACTION_TYPES = {"BOA", "BOT"}
+BOA_ACTION_CODES = {"1", "2", "3", "7", "8", "9", "10"}
+BOT_ACTION_CODES = {"5", "6"}
+
+
+# ── DB ───────────────────────────────────────────────────────────────────────
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None or _pool.closed:
+        _pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=4, dsn=PG_DSN)
+    return _pool
+
+
+class _cursor:
+    def __init__(self, dict_cursor: bool = False):
+        self.dict_cursor = dict_cursor
+        self._conn = None
+        self._cur = None
+
+    def __enter__(self):
+        self._conn = _get_pool().getconn()
+        factory = psycopg2.extras.RealDictCursor if self.dict_cursor else None
+        self._cur = self._conn.cursor(cursor_factory=factory) if factory else self._conn.cursor()
+        return self._cur
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self._conn.rollback() if exc_type else self._conn.commit()
+        except Exception:
+            pass
+        try:
+            if self._cur:
+                self._cur.close()
+        except Exception:
+            pass
+        try:
+            _get_pool().putconn(self._conn)
+        except Exception:
+            pass
+        return False
+
+
+# ── HTTP SESSION ─────────────────────────────────────────────────────────────
+_session: requests.Session | None = None
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is not None:
+        return _session
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    _session = session
+    return _session
+
+
+def _token(module: str, force_refresh: bool = False) -> str:
+    """ATR reuses the module's existing gateway token."""
+    if module == "FRI":
+        from FRI import fri_auth
+        return fri_auth(key_id="FRI", force_refresh=force_refresh)
+    from MNRL import mnrl_auth
+    return mnrl_auth(key_id="DIU", force_refresh=force_refresh)
+
+
+# ── DEFAULTS ─────────────────────────────────────────────────────────────────
+def get_defaults(module: str, segment: str | None = None) -> list[dict]:
+    """ATR defaults for a module, optionally one segment."""
+    sql = "SELECT * FROM atr_defaults WHERE module = %s"
+    params: list[Any] = [module.upper()]
+    if segment:
+        sql += " AND segment = %s"
+        params.append(segment)
+    sql += " ORDER BY segment"
+
+    with _cursor(dict_cursor=True) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    for row in rows:
+        row["updated_at"] = row["updated_at"].isoformat() if row.get("updated_at") else None
+        for key in ("total_money_saved",):
+            if row.get(key) is not None:
+                row[key] = float(row[key])
+    return rows
+
+
+def save_defaults(module: str, segment: str, payload: dict, updated_by: str | None = None) -> dict:
+    """Upsert one (module, segment) default set. Validates against the spec."""
+    module = module.upper()
+    action_type = str(payload.get("action_type", "")).strip().upper()
+    action_taken = str(payload.get("action_taken", "")).strip()
+
+    if action_type not in VALID_ACTION_TYPES:
+        raise ValueError("action_type must be BOA or BOT")
+
+    allowed = BOA_ACTION_CODES if action_type == "BOA" else BOT_ACTION_CODES
+    if action_taken not in allowed:
+        raise ValueError(
+            f"action_taken '{action_taken}' is not valid for {action_type}. "
+            f"Allowed: {', '.join(sorted(allowed, key=int))}"
+        )
+
+    grievance = str(payload.get("grievance_received", "No")).strip().title()
+    if grievance not in ("Yes", "No"):
+        raise ValueError("grievance_received must be Yes or No")
+
+    money = payload.get("total_money_saved")
+    declined = payload.get("transaction_declined")
+    if action_type == "BOT" and (money is None or declined is None):
+        raise ValueError("BOT requires total_money_saved and transaction_declined")
+
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO atr_defaults (
+                module, segment, action_type, action_taken, investigation_details,
+                grievance_received, remarks, total_money_saved, transaction_declined,
+                is_active, updated_by, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (module, segment) DO UPDATE SET
+                action_type           = EXCLUDED.action_type,
+                action_taken          = EXCLUDED.action_taken,
+                investigation_details = EXCLUDED.investigation_details,
+                grievance_received    = EXCLUDED.grievance_received,
+                remarks               = EXCLUDED.remarks,
+                total_money_saved     = EXCLUDED.total_money_saved,
+                transaction_declined  = EXCLUDED.transaction_declined,
+                is_active             = EXCLUDED.is_active,
+                updated_by            = EXCLUDED.updated_by,
+                updated_at            = NOW()
+            """,
+            (
+                module, segment, action_type, action_taken,
+                (payload.get("investigation_details") or None),
+                grievance,
+                (payload.get("remarks") or None),
+                money, declined,
+                bool(payload.get("is_active", True)),
+                updated_by,
+            ),
+        )
+    return get_defaults(module, segment)[0]
+
+
+# ── RECORD BUILDING ──────────────────────────────────────────────────────────
+def _atr_mobile(value: Any) -> str | None:
+    """C-DOT accepts 10 digits, or 91 + 10 digits. Anything else is rejected."""
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) == 10:
+        return digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return digits
+    if len(digits) == 13 and digits.startswith("091"):
+        return digits[1:]
+    return None
+
+
+def build_record(row: dict, defaults: dict, date_of_action: str) -> dict:
+    """One atr_data entry. Raises ValueError if the row can't be represented."""
+    mobile = _atr_mobile(row.get("mobile_no"))
+    if not mobile:
+        raise ValueError(f"Invalid mobile_no format: {row.get('mobile_no')!r}")
+
+    record = {
+        "mobile_no": mobile,
+        "action_type": defaults["action_type"],
+        "action_taken": str(defaults["action_taken"]),
+        "date_of_action": date_of_action,
+        "grievance_received": defaults.get("grievance_received") or "No",
+    }
+
+    investigation = defaults.get("investigation_details")
+    if investigation:
+        record["investigation_details"] = str(investigation)[:MAX_INVESTIGATION]
+
+    remarks = defaults.get("remarks")
+    if remarks:
+        record["remarks"] = str(remarks)[:MAX_REMARKS]
+
+    upi = row.get("upi_id") or defaults.get("upi_id")
+    if upi:
+        record["upi_id"] = str(upi)
+
+    if defaults["action_type"] == "BOT":
+        record["total_money_saved"] = str(defaults.get("total_money_saved") or "0")
+        record["transaction_declined"] = str(defaults.get("transaction_declined") or "0")
+
+    return record
+
+
+# ── TRANSPORT ────────────────────────────────────────────────────────────────
+class PayloadTooLarge(Exception):
+    """HTTP 413 — caller should halve the batch and retry."""
+
+
+def submit_batch(module: str, records: list[dict]) -> dict:
+    """POST one encrypted batch. Returns a normalised result.
+
+        {"outcome": "ok"|"partial"|"failed",
+         "errors": {mobile_no: message}, "request_id": str|None,
+         "http_status": int, "message": str}
+    """
+    module = module.upper()
+    url = ATR_URL[module]
+    client_id = ATR_CLIENT_ID[module]
+    if not client_id:
+        raise ValueError(f"{module} client_id is not configured")
+
+    payload = {"client_id": str(client_id), "atr_data": records}
+    encrypted = encrypt_data(payload, ATR_KEY_ID[module])
+    session = _get_session()
+
+    for attempt in range(1, ATR_MAX_RETRIES + 1):
+        token = _token(module, force_refresh=(attempt > 1))
+        resp = session.post(
+            url,
+            json=encrypted,
+            headers={"Content-Type": "application/json", "Authorization": token},
+            timeout=ATR_TIMEOUT,
+            verify=ATR_VERIFY_SSL,
+        )
+
+        if resp.status_code == 413:
+            raise PayloadTooLarge(f"{len(records)} records rejected as too large")
+
+        if resp.status_code == 401 and attempt < ATR_MAX_RETRIES:
+            time.sleep(1)
+            continue
+
+        if resp.status_code == 429 and attempt < ATR_MAX_RETRIES:
+            wait = int(resp.headers.get("Retry-After", 10))
+            print(f"[ATR] Rate limited, waiting {wait}s")
+            time.sleep(wait)
+            continue
+
+        try:
+            body = resp.json() if resp.text else {}
+        except ValueError:
+            body = {"message": (resp.text or "")[:300]}
+
+        code = str(body.get("response_code") or resp.status_code)
+        errors = {str(k): str(v) for k, v in (body.get("errorIn") or {}).items()}
+        request_id = body.get("requestId")
+        message = str(body.get("message") or "")
+
+        if resp.status_code == 200 and code == "200":
+            return {"outcome": "ok", "errors": {}, "request_id": request_id,
+                    "http_status": 200, "message": message or "Success"}
+
+        if resp.status_code == 200 and code == "422":
+            # partial success — errorIn names the rejected numbers
+            return {"outcome": "partial", "errors": errors, "request_id": request_id,
+                    "http_status": 200, "message": message or "Partial success"}
+
+        if resp.status_code in (500, 502, 503) and attempt < ATR_MAX_RETRIES:
+            time.sleep(min(2 ** attempt, 20))
+            continue
+
+        return {"outcome": "failed", "errors": errors, "request_id": request_id,
+                "http_status": resp.status_code,
+                "message": message or f"HTTP {resp.status_code}"}
+
+    return {"outcome": "failed", "errors": {}, "request_id": None,
+            "http_status": 0, "message": f"Exhausted {ATR_MAX_RETRIES} attempts"}
+
+
+# ── RUN LOGGING ──────────────────────────────────────────────────────────────
+def _create_run(module, segment, feed_date, gho_code, defaults, total, batch_size, dry_run) -> str:
+    run_id = str(uuid.uuid4())
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO atr_runs (
+                id, module, segment, feed_date, gho_code, action_type, action_taken,
+                total_selected, batch_size, status, dry_run, started_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'running', %s, NOW())
+            """,
+            (
+                run_id, module.upper(), segment, ms._to_date(feed_date), gho_code,
+                (defaults or {}).get("action_type"), (defaults or {}).get("action_taken"),
+                total, batch_size, dry_run,
+            ),
+        )
+    return run_id
+
+
+def _finish_run(run_id, status, sent, rejected, skipped, batches, request_ids, error=None) -> None:
+    with _cursor() as cur:
+        cur.execute(
+            """
+            UPDATE atr_runs
+            SET status = %s, total_sent = %s, total_rejected = %s, total_skipped = %s,
+                batches_sent = %s, request_ids = %s::jsonb, error = %s, finished_at = NOW()
+            WHERE id = %s
+            """,
+            (status, sent, rejected, skipped, batches,
+             json.dumps(request_ids), error, run_id),
+        )
+
+
+def _log_rejects(run_id, module, rows: list[tuple]) -> None:
+    """rows = [(mobile_no, cust_id, batch_no, error_message), ...]"""
+    if not rows:
+        return
+    with _cursor() as cur:
+        psycopg2.extras.execute_values(
+            cur,
+            """INSERT INTO atr_rejects (run_id, module, mobile_no, cust_id, batch_no, error_message)
+               VALUES %s""",
+            [(run_id, module.upper(), *r) for r in rows],
+            page_size=1000,
+        )
+
+
+def list_runs(module: str | None = None, limit: int = 50) -> list[dict]:
+    sql = "SELECT * FROM atr_runs"
+    params: list[Any] = []
+    if module:
+        sql += " WHERE module = %s"
+        params.append(module.upper())
+    sql += " ORDER BY started_at DESC LIMIT %s"
+    params.append(limit)
+
+    with _cursor(dict_cursor=True) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    for row in rows:
+        row["id"] = str(row["id"])
+        row["feed_date"] = str(row["feed_date"]) if row.get("feed_date") else None
+        row["started_at"] = row["started_at"].isoformat() if row.get("started_at") else None
+        row["finished_at"] = row["finished_at"].isoformat() if row.get("finished_at") else None
+    return rows
+
+
+def list_rejects(run_id: str, limit: int = 1000) -> list[dict]:
+    with _cursor(dict_cursor=True) as cur:
+        cur.execute(
+            """SELECT mobile_no, cust_id, batch_no, error_message, created_at
+               FROM atr_rejects WHERE run_id = %s ORDER BY id LIMIT %s""",
+            (run_id, limit),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    for row in rows:
+        row["created_at"] = row["created_at"].isoformat()
+    return rows
+
+
+# ── MAIN ENTRY POINT ─────────────────────────────────────────────────────────
+def run_atr(
+    module: str,
+    feed_date: Any = None,
+    segment: str | None = None,
+    gho_code: str | None = None,
+    batch_size: int = ATR_BATCH_SIZE,
+    limit: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Submit ATRs for every pending, reconciled number matching the filters.
+
+    A run is scoped to ONE segment because action codes differ per segment.
+    Calling with segment=None loops the segments that actually have work.
+    """
+    module = module.upper()
+
+    # No segment given -> run each segment that has pending rows, in turn
+    if not segment or segment.upper() == "ALL":
+        results = []
+        for seg in (ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB):
+            if ms.count_atr_pending(module, feed_date, seg, gho_code):
+                results.append(run_atr(module, feed_date, seg, gho_code,
+                                       batch_size, limit, dry_run))
+        if not results:
+            return {"status": "skipped", "reason": "no_pending_records",
+                    "module": module, "runs": []}
+        return {
+            "status": "done",
+            "module": module,
+            "runs": results,
+            "total_sent": sum(r.get("sent", 0) for r in results),
+            "total_rejected": sum(r.get("rejected", 0) for r in results),
+        }
+
+    defaults_list = get_defaults(module, segment)
+    if not defaults_list:
+        raise ValueError(f"No ATR defaults configured for {module} / {segment}")
+    defaults = defaults_list[0]
+    if not defaults.get("is_active", True):
+        raise ValueError(f"ATR defaults for {module} / {segment} are switched off")
+
+    total = ms.count_atr_pending(module, feed_date, segment, gho_code)
+    if total == 0:
+        return {"status": "skipped", "reason": "no_pending_records",
+                "module": module, "segment": segment, "sent": 0, "rejected": 0}
+    if limit:
+        total = min(total, limit)
+
+    run_id = _create_run(module, segment, feed_date, gho_code, defaults,
+                         total, batch_size, dry_run)
+
+    date_of_action = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sent = rejected = skipped = batches = 0
+    request_ids: list[str] = []
+    current_batch = batch_size
+    fatal_error: str | None = None
+
+    print(
+        f"[ATR] {module}/{segment} run={run_id} pending={total:,} "
+        f"action={defaults['action_type']}/{defaults['action_taken']} dry_run={dry_run}"
+    )
+
+    try:
+        for rows in ms.iter_atr_queue(module, feed_date, segment, gho_code,
+                                      batch_size=current_batch, limit=limit):
+            batches += 1
+            by_mobile: dict[str, dict] = {}
+            records: list[dict] = []
+            skip_map: dict[int, str] = {}
+
+            for row in rows:
+                try:
+                    record = build_record(row, defaults, date_of_action)
+                except ValueError as exc:
+                    skip_map[row["id"]] = str(exc)
+                    continue
+                records.append(record)
+                by_mobile[record["mobile_no"]] = row
+
+            if skip_map:
+                skipped += len(skip_map)
+                ms.mark_atr_result(
+                    module, run_id, defaults["action_type"], defaults["action_taken"],
+                    skipped=skip_map,
+                )
+                _log_rejects(run_id, module, [
+                    (ms._norm_mobile(r["mobile_no"]), r.get("cust_id"), batches, err)
+                    for r in rows if (err := skip_map.get(r["id"]))
+                ])
+
+            if not records:
+                continue
+
+            if dry_run:
+                sent += len(records)
+                print(f"[ATR] batch {batches}: {len(records):,} records (dry run, not sent)")
+                continue
+
+            # ── send, halving the batch if C-DOT says it's too large ──────────
+            chunks = [records]
+            while chunks:
+                chunk = chunks.pop(0)
+                try:
+                    result = submit_batch(module, chunk)
+                except PayloadTooLarge:
+                    if len(chunk) <= ATR_MIN_BATCH_SIZE:
+                        raise
+                    mid = len(chunk) // 2
+                    print(f"[ATR] 413 on {len(chunk)} records — splitting to {mid}")
+                    chunks = [chunk[:mid], chunk[mid:]] + chunks
+                    continue
+
+                if result["request_id"]:
+                    request_ids.append(str(result["request_id"]))
+
+                chunk_mobiles = [r["mobile_no"] for r in chunk]
+
+                if result["outcome"] == "failed":
+                    fatal_error = result["message"]
+                    reject_map = {by_mobile[m]["id"]: result["message"]
+                                  for m in chunk_mobiles if m in by_mobile}
+                    rejected += len(reject_map)
+                    ms.mark_atr_result(
+                        module, run_id, defaults["action_type"], defaults["action_taken"],
+                        rejected=reject_map,
+                    )
+                    _log_rejects(run_id, module, [
+                        (m, by_mobile[m].get("cust_id"), batches, result["message"])
+                        for m in chunk_mobiles if m in by_mobile
+                    ])
+                    continue
+
+                errors = result["errors"]
+                ok_mobiles = [m for m in chunk_mobiles if m not in errors]
+                bad_mobiles = [m for m in chunk_mobiles if m in errors]
+
+                sent_ids = [by_mobile[m]["id"] for m in ok_mobiles if m in by_mobile]
+                reject_map = {by_mobile[m]["id"]: errors[m]
+                              for m in bad_mobiles if m in by_mobile}
+
+                ms.mark_atr_result(
+                    module, run_id, defaults["action_type"], defaults["action_taken"],
+                    sent_ids=sent_ids, rejected=reject_map,
+                )
+                if reject_map:
+                    _log_rejects(run_id, module, [
+                        (m, by_mobile[m].get("cust_id"), batches, errors[m])
+                        for m in bad_mobiles if m in by_mobile
+                    ])
+
+                sent += len(sent_ids)
+                rejected += len(reject_map)
+                print(
+                    f"[ATR] batch {batches}: sent={len(sent_ids):,} "
+                    f"rejected={len(reject_map):,} ({result['outcome']})"
+                )
+
+            if ATR_THROTTLE_MS:
+                time.sleep(ATR_THROTTLE_MS / 1000)
+
+    except Exception as exc:
+        _finish_run(run_id, "failed", sent, rejected, skipped, batches,
+                    request_ids, str(exc))
+        print(f"[ATR] X run {run_id} failed: {exc}")
+        raise
+
+    status = "done" if rejected == 0 and not fatal_error else "partial"
+    _finish_run(run_id, status, sent, rejected, skipped, batches,
+                request_ids, fatal_error)
+
+    summary = {
+        "status": status,
+        "run_id": run_id,
+        "module": module,
+        "segment": segment,
+        "feed_date": str(ms._to_date(feed_date)) if feed_date else None,
+        "gho_code": gho_code,
+        "action_type": defaults["action_type"],
+        "action_taken": defaults["action_taken"],
+        "selected": total,
+        "sent": sent,
+        "rejected": rejected,
+        "skipped": skipped,
+        "batches": batches,
+        "dry_run": dry_run,
+    }
+    print(f"[ATR] Done: {summary}")
+    return summary

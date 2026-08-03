@@ -66,6 +66,11 @@ GHO_CODE_COL = "GHO_code"                           # ZGGHCL mapped to business 
 # on the customer side is then skipped and dedup falls back to IP_SRCE_KEY.
 CUST_BATCH_DT_COL = "BATCH_DT"
 
+# ZBTEN3 is both DISTINCT_KEY_COL and a member of NEW_COLS. Emitting it twice
+# gives the CTE two identically-named columns, which makes any later reference
+# ("Column name ZBTEN3 is ambiguous") fail. dict.fromkeys dedupes in order.
+ADDR_SELECT_COLS = list(dict.fromkeys([CUST_ID_COL, DISTINCT_KEY_COL] + NEW_COLS))
+
 # TODO: fill in the remaining ZGGHCL -> business code mappings
 GHO_CODE_MAP = {
     "PRS": "IWPB",
@@ -301,7 +306,7 @@ def _latest_batch_dt(table: str) -> str:
 
 def _addr_cte() -> str:
     """SSADDRP: PARTI_MONTH + latest BATCH_DT + P1, one row per ZBTEN3."""
-    cols = ", ".join([CUST_ID_COL, DISTINCT_KEY_COL] + NEW_COLS)
+    cols = ", ".join(ADDR_SELECT_COLS)
     return (
         f"addr AS ("
         f"  SELECT {cols}"
@@ -345,10 +350,10 @@ def _build_count_query() -> str:
 
 
 def _build_batch_query(offset: int, batch_size: int) -> str:
-    new_cols_sql = ", ".join(f"a.{c}" for c in NEW_COLS)
+    addr_cols_sql = ", ".join(f"a.{c}" for c in ADDR_SELECT_COLS)
     return (
         f"WITH {_addr_cte()}, {_cust_cte()} "
-        f"SELECT a.{CUST_ID_COL}, a.{DISTINCT_KEY_COL}, {new_cols_sql}, c.{ZGGHCL_COL} "
+        f"SELECT {addr_cols_sql}, c.{ZGGHCL_COL} "
         f"FROM addr a "
         f"LEFT JOIN cust c ON a.{CUST_ID_COL} = c.{CUST_ID_COL} "
         # addr is deduped on ZBTEN3, so this ordering is unique and stable -

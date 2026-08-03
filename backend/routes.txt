@@ -1,23 +1,26 @@
 from datetime import datetime
-import io
 import traceback
 
+from flask import Blueprint, jsonify, request
+
+import atr as atr_service
 from azure_utils import (
-    AZURE_CONTAINER_MATCHOFF_OUTPUT,
     export_and_store,
+    export_master,
     get_export_metadata_row,
     get_matchoff_run,
     get_sas_download_url,
     list_export_metadata,
+    list_gho_codes_from_source,
     list_matchoff_metadata,
     list_source_date_folders,
     list_source_files,
     run_matchoff,
 )
 from crypto_utils import decrypt_data, encrypt_data
-from flask import Blueprint, jsonify, request, send_file
-from FRI import fetch_and_decrypt_all, fri_auth, fri_count, fri_data
-from jobs import clean_old_jobs, get_job, start_job
+from FRI import fetch_and_decrypt_all, fri_auth, fri_count
+from jobs import get_job, start_job
+import master_store as ms
 from MNRL import (
     mnrl_auth,
     mnrl_count,
@@ -30,455 +33,280 @@ routes = Blueprint("routes", __name__)
 
 FRI_COLUMNS = ["fri", "lsa_id", "mobile_no", "status", "tsp_id"]
 MNRL_NORMAL_COLUMNS = [
-    "date_of_disconnection",
-    "disconnectionreason_id",
-    "lsa_id",
-    "mobile_no",
-    "tsp_id",
+    "date_of_disconnection", "disconnectionreason_id", "lsa_id", "mobile_no", "tsp_id",
 ]
 MNRL_REACT_COLUMNS = ["date_of_reactivation", "mobile_no", "reactivation_id"]
 
 _VALID_CONTAINERS = {"fri-exports", "mnrl-exports"}
+_VALID_SEGMENTS = {"IWPB", "Non-IWPB", "UNKNOWN", "ALL"}
 
 
-# VALIDATION HELPERS
+# ── VALIDATION ───────────────────────────────────────────────────────────────
 def _validate_date(value: str) -> str:
-    """Parses YYYY-MM-DD and returns the normalised string."""
     if not value:
-        raise ValueError("date is required")
+        raise ValueError("Pick a date first.")
     try:
         return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
     except ValueError:
-        raise ValueError("Invalid date format. Expected YYYY-MM-DD")
+        raise ValueError("Dates use the format YYYY-MM-DD.")
+
+
+def _optional_date(value: str | None) -> str | None:
+    if not value or str(value).upper() == "ALL":
+        return None
+    return _validate_date(value)
 
 
 def _validate_module(value: str) -> str:
-    allowed = ("FRI", "MNRL")
-    if not value or value.upper() not in allowed:
-        raise ValueError(f"type must be one of: {', '.join(allowed)}")
+    if not value or value.upper() not in ("FRI", "MNRL"):
+        raise ValueError("Module must be FRI or MNRL.")
     return value.upper()
 
 
 def _validate_data_type(value: str) -> str:
-    allowed = ("Normal", "Reactivated")
-    if not value or value not in allowed:
-        raise ValueError(f"data_type must be one of: {', '.join(allowed)}")
+    if value not in ("Normal", "Reactivated"):
+        raise ValueError("Data type must be Normal or Reactivated.")
     return value
 
 
 def _validate_container(value: str) -> str:
     if not value or value not in _VALID_CONTAINERS:
-        raise ValueError(f"container must be one of: {', '.join(_VALID_CONTAINERS)}")
+        raise ValueError(f"Container must be one of: {', '.join(_VALID_CONTAINERS)}")
     return value
 
 
-# BACKGROUND EXPORT HELPERS
+def _validate_segment(value: str | None) -> str | None:
+    """Returns None for 'all', which means every segment."""
+    if not value or value.upper() == "ALL":
+        return None
+    for seg in _VALID_SEGMENTS:
+        if value.lower() == seg.lower():
+            return None if seg == "ALL" else seg
+    raise ValueError("Segment must be IWPB, Non-IWPB or All.")
+
+
+def _optional_gho(value: str | None) -> str | None:
+    if not value or value.upper() == "ALL":
+        return None
+    return value.strip()
+
+
+def _fail(exc: Exception, status: int = 500):
+    print(traceback.format_exc())
+    return jsonify({"error": str(exc)}), status
+
+
+# ── BACKGROUND WORK ──────────────────────────────────────────────────────────
 def _do_fri_export(date: str, client_id, batch_size: int) -> dict:
     total = fri_count(key_id="FRI", count_date=date).get("count", 0)
     if total == 0:
-        raise ValueError("No records found for this date")
+        raise ValueError("No records published for that date.")
 
     records = fetch_and_decrypt_all(
-        key_id="FRI",
-        total_count=total,
-        date=date,
-        client_id=client_id,
-        BATCH_SIZE=batch_size,
+        key_id="FRI", total_count=total, date=date,
+        client_id=client_id, BATCH_SIZE=batch_size,
     )
     if not records:
-        raise ValueError("No data retrieved")
+        raise ValueError("The download returned no rows.")
 
     return export_and_store(
-        module="FRI",
-        records=records,
-        columns=FRI_COLUMNS,
+        module="FRI", records=records, columns=FRI_COLUMNS,
         file_name=f"fri_data_{date}_{len(records)}_records.xlsx",
         export_date=date,
     )
 
 
-def _do_mnrl_export(
-    date: str,
-    data_type: str,
-    bank_id,
-    batch_size: int,
-    max_workers: int,
-) -> dict:
+def _do_mnrl_export(date, data_type, bank_id, batch_size, max_workers) -> dict:
     if data_type == "Normal":
         total = mnrl_count(key_id="DIU", count_date=date).get("count", 0)
         if total == 0:
-            raise ValueError("No records found for this date")
-
+            raise ValueError("No records published for that date.")
         records = mnrl_data(
-            key_id="DIU",
-            date=date,
-            total_count=total,
-            BATCH_SIZE=batch_size,
-            Bank_Id=bank_id,
-            max_workers=max_workers,
+            key_id="DIU", date=date, total_count=total, BATCH_SIZE=batch_size,
+            Bank_Id=bank_id, max_workers=max_workers,
         )
         columns = MNRL_NORMAL_COLUMNS
         file_name = f"mnrl_normal_{date}_{len(records)}_records.xlsx"
-    else:  # Reactivated
+    else:
         total = mnrl_count_reactivated(key_id="DIU", count_date=date).get("count", 0)
         if total == 0:
-            raise ValueError("No reactivated records found for this date")
-
+            raise ValueError("No reactivated records published for that date.")
         records = mnrl_data_reactivated_excel(
-            key_id="DIU",
-            total_count=total,
-            date=date,
-            BATCH_SIZE=batch_size,
-            Bank_Id=bank_id,
-            max_workers=max_workers,
+            key_id="DIU", total_count=total, date=date, BATCH_SIZE=batch_size,
+            Bank_Id=bank_id, max_workers=max_workers,
         )
         columns = MNRL_REACT_COLUMNS
         file_name = f"mnrl_reactivated_{date}_{len(records)}_records.xlsx"
 
     if not records:
-        raise ValueError("No data retrieved")
+        raise ValueError("The download returned no rows.")
 
     return export_and_store(
-        module="MNRL",
-        records=records,
-        columns=columns,
-        file_name=file_name,
-        export_date=date,
-        data_type=data_type,
+        module="MNRL", records=records, columns=columns, file_name=file_name,
+        export_date=date, data_type=data_type,
     )
 
 
-def _do_matchoff(
-    source_container: str,
-    date_folder: str,
-    file_name: str,
-    mob_col: str,
-) -> dict:
-    """Thin wrapper all logic in azure_utils."""
+def _do_reconcile(container, date_folder, file_name, mob_col) -> dict:
     return run_matchoff(
-        source_container=source_container,
-        date_folder=date_folder,
-        file_name=file_name,
-        mob_col=mob_col,
+        source_container=container, date_folder=date_folder,
+        file_name=file_name, mob_col=mob_col,
     )
 
 
-# ROUTES
+def _do_master_export(module, feed_date, segment, gho_code) -> dict:
+    return export_master(
+        module=module, feed_date=feed_date, segment=segment, gho_code=gho_code
+    )
+
+
+def _do_atr_run(module, feed_date, segment, gho_code, batch_size, limit, dry_run) -> dict:
+    return atr_service.run_atr(
+        module=module, feed_date=feed_date, segment=segment, gho_code=gho_code,
+        batch_size=batch_size, limit=limit, dry_run=dry_run,
+    )
+
+
+# ── HEALTH / CRYPTO ──────────────────────────────────────────────────────────
 @routes.route("/health", methods=["GET"])
 def health():
     return {"status": "API is working"}, 200
 
 
-# Encrypt / Decrypt
 @routes.route("/encrypt", methods=["POST"])
 def encrypt():
     try:
         key_id = request.headers.get("X-PUBLIC-KEY-ID")
         if not key_id:
             return {"error": "X-PUBLIC-KEY-ID header required"}, 400
-        result = encrypt_data(request.json, key_id)
-        return jsonify(result), 200
+        return jsonify(encrypt_data(request.json, key_id)), 200
     except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
+        return _fail(e)
 
 
 @routes.route("/decrypt", methods=["POST"])
 def decrypt():
     try:
-        result = decrypt_data(request.json)
-        return jsonify(result), 200
+        return jsonify(decrypt_data(request.json)), 200
     except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
+        return _fail(e)
 
 
-# FRI
+# ── FRI ──────────────────────────────────────────────────────────────────────
 @routes.route("/fri/auth", methods=["POST"])
 def auth():
     try:
         return {"token": fri_auth(key_id="FRI")}, 200
     except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
+        return _fail(e)
 
 
 @routes.route("/fri/count", methods=["POST"])
 def route_fri_count():
     req = request.get_json(silent=True) or {}
-    date = req.get("date")
     try:
-        valid_date = _validate_date(date)
-        result = fri_count(key_id="FRI", count_date=valid_date)
+        result = fri_count(key_id="FRI", count_date=_validate_date(req.get("date")))
         return jsonify({"count": result.get("count", 0)})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-
-@routes.route("/fri/data/test", methods=["POST"])
-def data_test():
-    try:
-        req = request.json or {}
-        for field in ("date", "offset", "count", "client_id"):
-            if req.get(field) is None:
-                return {"error": f"{field} is required"}, 400
-        response = fri_data(
-            key_id="FRI",
-            date=req["date"],
-            offset=req["offset"],
-            count=req["count"],
-            client_id=req["client_id"],
-        )
-        return response, 200
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
-
-
-@routes.route("/fri/data", methods=["POST"])
-def data():
-    try:
-        req = request.json or {}
-        date = _validate_date(req.get("date"))
-        count_res = fri_count(key_id="FRI", count_date=date)
-        total_count = count_res.get("count", 0)
-        if total_count == 0:
-            return {"error": "No records found for this date", "count": 0}, 404
-
-        response = fetch_and_decrypt_all(
-            key_id="FRI",
-            total_count=total_count,
-            date=date,
-            client_id=req.get("client_id"),
-            BATCH_SIZE=req.get("batch_size", 3000),
-        )
-        return {"data": response, "total_records": len(response)}, 200
-    except ValueError as e:
-        return {"error": str(e)}, 400
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
-
-
-@routes.route("/fri/data/excel", methods=["POST"])
-def data_excel():
-    try:
-        req = request.json or {}
-        date = _validate_date(req.get("date"))
-        count_res = fri_count(key_id="FRI", count_date=date)
-        total_count = count_res.get("count", 0)
-        if total_count == 0:
-            return {"error": "No records found for this date", "count": 0}, 404
-
-        response = fetch_and_decrypt_all(
-            key_id="FRI",
-            total_count=total_count,
-            date=date,
-            client_id=req.get("client_id"),
-            BATCH_SIZE=req.get("batch_size", 3000),
-        )
-
-        if not response:
-            return {"error": "No data retrieved", "count": 0}, 404
-
-        output = io.BytesIO()
-        # save_to_excel(response, output, FRI_COLUMNS)
-        output.seek(0)
-        filename = f"fri_data_{date}_{len(response)}_records.xlsx"
-        return send_file(
-            output,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            as_attachment=True,
-            download_name=filename,
-        )
-    except ValueError as e:
-        return {"error": str(e)}, 400
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
+        return _fail(e)
 
 
 @routes.route("/fri/export-and-save", methods=["POST"])
 def route_fri_export():
-    """Start a background FRI export. Returns job_id immediately (202)."""
     req = request.get_json(silent=True) or {}
     try:
         date = _validate_date(req.get("date"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-
     try:
-        job_id = start_job(
-            _do_fri_export,
-            date,
-            req.get("client_id"),
-            req.get("batch_size", 3000),
-        )
+        job_id = start_job(_do_fri_export, date, req.get("client_id"),
+                           req.get("batch_size", 3000))
         return jsonify({"job_id": job_id, "status": "pending"}), 202
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
 
 
-# MNRL
+# ── MNRL ─────────────────────────────────────────────────────────────────────
 @routes.route("/mnrl/auth", methods=["POST"])
 def auth_mnrl():
     try:
         return {"token": mnrl_auth(key_id="DIU")}, 200
     except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
+        return _fail(e)
 
 
 @routes.route("/mnrl/count", methods=["POST"])
 def route_mnrl_count():
     req = request.get_json(silent=True) or {}
-    date = req.get("date")
     try:
-        valid_date = _validate_date(date)
-        result = mnrl_count(key_id="DIU", count_date=valid_date)
+        result = mnrl_count(key_id="DIU", count_date=_validate_date(req.get("date")))
         return jsonify({"count": result.get("count", 0)})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
 
 
 @routes.route("/mnrl/count/reactivated", methods=["POST"])
 def route_mnrl_count_reactivated():
     req = request.get_json(silent=True) or {}
-    date = req.get("date")
     try:
-        valid_date = _validate_date(date)
-        result = mnrl_count_reactivated(key_id="DIU", count_date=valid_date)
+        result = mnrl_count_reactivated(key_id="DIU", count_date=_validate_date(req.get("date")))
         return jsonify({"count": result.get("count", 0)})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-
-@routes.route("/mnrl/data", methods=["POST"])
-def data_mnrl():
-    try:
-        req = request.json or {}
-        date = _validate_date(req.get("date"))
-        count_res = mnrl_count(key_id="DIU", count_date=date)
-        total_count = count_res.get("count", 0)
-        if total_count == 0:
-            return {"error": "No records found for this date", "count": 0}, 404
-
-        response = mnrl_data(
-            key_id="DIU",
-            date=date,
-            total_count=total_count,
-            Bank_Id=req.get("BankId"),
-            BATCH_SIZE=req.get("batch_size", 3000),
-            max_workers=req.get("max_workers", 5),
-        )
-        return {"data": response, "total_records": len(response)}, 200
-    except ValueError as e:
-        return {"error": str(e)}, 400
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
-
-
-@routes.route("/mnrl/data/reactivated", methods=["POST"])
-def data_mnrl_reactivated():
-    try:
-        req = request.json or {}
-        date = _validate_date(req.get("date"))
-        count_res = mnrl_count_reactivated(key_id="DIU", count_date=date)
-        total_count = count_res.get("count", 0)
-        if total_count == 0:
-            return {"error": "No records found for this date", "count": 0}, 404
-
-        response = mnrl_data_reactivated_excel(
-            key_id="DIU",
-            total_count=total_count,
-            date=date,
-            BATCH_SIZE=req.get("batch_size", 3000),
-            Bank_Id=req.get("BankId"),
-            max_workers=req.get("max_workers", 5),
-        )
-        return {"data": response, "total_records": len(response)}, 200
-    except ValueError as e:
-        return {"error": str(e)}, 400
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
+        return _fail(e)
 
 
 @routes.route("/mnrl/export-and-save", methods=["POST"])
 def route_mnrl_export():
-    """Start a background MNRL export. Returns job_id immediately (202)."""
     req = request.get_json(silent=True) or {}
-    date = req.get("date")
-    data_type = req.get("data_type", "Normal")
-
     try:
-        valid_date = _validate_date(date)
-        valid_data_type = _validate_data_type(data_type)
+        date = _validate_date(req.get("date"))
+        data_type = _validate_data_type(req.get("data_type", "Normal"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-
     try:
         job_id = start_job(
-            _do_mnrl_export,
-            valid_date,
-            valid_data_type,
-            req.get("BankId"),
-            req.get("batch_size", 3000),
-            req.get("max_workers", 5),
+            _do_mnrl_export, date, data_type, req.get("BankId"),
+            req.get("batch_size", 3000), req.get("max_workers", 5),
         )
         return jsonify({"job_id": job_id, "status": "pending"}), 202
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
 
 
-# Job status (shared by all export modules)
+# ── SHARED JOB STATUS ────────────────────────────────────────────────────────
 @routes.route("/export/status/<job_id>", methods=["GET"])
 def route_export_status(job_id):
-    """GET /export/status/<job_id>"""
     job = get_job(job_id)
     if not job:
-        return jsonify({"error": "Job not found"}), 404
+        return jsonify({"error": "That job no longer exists."}), 404
 
     response = {"job_id": job_id, "status": job["status"]}
     if job["status"] == "done":
         response["result"] = job["result"]
     elif job["status"] == "failed":
-        last_line = (job.get("error") or "Unknown error").strip().splitlines()[-1]
-        response["error"] = last_line
-        print(f"[JOB FAILED] {job_id}:\n{job.get('error')}")
-
+        response["error"] = (job.get("error") or "Unknown error").strip().splitlines()[-1]
     return jsonify(response), 200
 
 
-# Archive / Download
+# ── ARCHIVE ──────────────────────────────────────────────────────────────────
 @routes.route("/files/list", methods=["GET"])
 def route_files_list():
-    """GET /files/list?type=FRI"""
     try:
-        module = _validate_module(request.args.get("type", "FRI"))
-        return jsonify(list_export_metadata(module))
+        return jsonify(list_export_metadata(_validate_module(request.args.get("type", "FRI"))))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
 
 
 @routes.route("/files/download-url/<file_id>", methods=["GET"])
 def route_files_download_url(file_id):
-    """GET /files/download-url/<uuid>?type=FRI"""
     try:
         module = _validate_module(request.args.get("type", "FRI"))
         row = get_export_metadata_row(file_id, module)
@@ -487,92 +315,345 @@ def route_files_download_url(file_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
 
 
-# Matchoff
-@routes.route("/matchoff/folders", methods=["GET"])
-def route_matchoff_folders():
-    """GET /matchoff/folders?container=mnrl-exports"""
-    container = request.args.get("container", "").strip()
+# ── RECONCILE ────────────────────────────────────────────────────────────────
+@routes.route("/reconcile/folders", methods=["GET"])
+def route_reconcile_folders():
+    """GET /reconcile/folders?container=mnrl-exports"""
     try:
-        valid_container = _validate_container(container)
-        folders = list_source_date_folders(valid_container)
-        return jsonify({"folders": folders})
+        container = _validate_container(request.args.get("container", "").strip())
+        return jsonify({"folders": list_source_date_folders(container)})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
 
 
-@routes.route("/matchoff/files", methods=["GET"])
-def route_matchoff_files():
-    """GET /matchoff/files?container=mnrl-exports&date=2025-03-10"""
-    container = request.args.get("container", "").strip()
-    date = request.args.get("date", "").strip()
+@routes.route("/reconcile/files", methods=["GET"])
+def route_reconcile_files():
+    """GET /reconcile/files?container=mnrl-exports&date=2026-08-03"""
     try:
-        valid_container = _validate_container(container)
+        container = _validate_container(request.args.get("container", "").strip())
+        date = request.args.get("date", "").strip()
         if not date:
-            raise ValueError("date query param is required")
-        files = list_source_files(valid_container, date)
-        return jsonify({"files": files})
+            raise ValueError("Pick a date first.")
+        return jsonify({"files": list_source_files(container, date)})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
 
 
-@routes.route("/matchoff/start", methods=["POST"])
-def route_matchoff_start():
-    """POST /matchoff/start"""
+@routes.route("/reconcile/start", methods=["POST"])
+def route_reconcile_start():
+    """POST /reconcile/start — reconcile a file into the master tables."""
     req = request.get_json(silent=True) or {}
-    container = req.get("container", "").strip()
-    date = req.get("date", "").strip()
-    file_name = req.get("file_name", "").strip()
-    mob_col = req.get("mob_col", "mob_num").strip() or "mob_num"
-
     try:
-        valid_container = _validate_container(container)
+        container = _validate_container(req.get("container", "").strip())
+        date = req.get("date", "").strip()
+        file_name = req.get("file_name", "").strip()
+        mob_col = req.get("mob_col", "mob_num").strip() or "mob_num"
         if not date:
-            raise ValueError("date is required")
+            raise ValueError("Pick a date first.")
         if not file_name:
-            raise ValueError("file_name is required")
+            raise ValueError("Pick a file to reconcile.")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
     try:
-        job_id = start_job(_do_matchoff, valid_container, date, file_name, mob_col)
+        job_id = start_job(_do_reconcile, container, date, file_name, mob_col)
         return jsonify({"job_id": job_id, "status": "pending"}), 202
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
 
 
-@routes.route("/matchoff/history", methods=["GET"])
-def route_matchoff_history():
-    """GET /matchoff/history"""
+@routes.route("/reconcile/history", methods=["GET"])
+def route_reconcile_history():
     try:
         return jsonify(list_matchoff_metadata())
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
 
 
-@routes.route("/matchoff/download-url/<run_id>", methods=["GET"])
-def route_matchoff_download_url(run_id):
-    """GET /matchoff/download-url/<uuid> - 24-hour SAS URL."""
+@routes.route("/reconcile/run/<run_id>", methods=["GET"])
+def route_reconcile_run(run_id):
     try:
         run = get_matchoff_run(run_id)
-        url = get_sas_download_url(
-            run["output_container"], run["output_blob_path"], expiry_hours=24
-        )
-        file_name = run["output_blob_path"].rsplit("/", 1)[-1]
-        return jsonify({"url": url, "file_name": file_name})
+        run["id"] = str(run["id"])
+        return jsonify(run)
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return _fail(e)
+
+
+# ── MASTER (GHO filters + download) ──────────────────────────────────────────
+@routes.route("/master/gho-codes", methods=["GET"])
+def route_master_gho_codes():
+    """GET /master/gho-codes?type=FRI&source=master|mobilecleanup
+
+    Drives the reconcile tab's classification dropdown. Default source is the
+    master, so counts reflect what a download would actually return.
+    """
+    try:
+        source = request.args.get("source", "master")
+        module = request.args.get("type")
+        if source == "mobilecleanup":
+            codes = list_gho_codes_from_source()
+        else:
+            codes = ms.list_gho_codes(_validate_module(module) if module else None)
+        return jsonify({
+            "gho_codes": codes,
+            "segments": [ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB],
+            "iwpb_codes": sorted(ms.IWPB_GHO_CODES),
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/master/dates", methods=["GET"])
+def route_master_dates():
+    """GET /master/dates?type=FRI — dates available to download."""
+    try:
+        return jsonify({"dates": ms.list_feed_dates(_validate_module(request.args.get("type", "FRI")))})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/master/count", methods=["GET"])
+def route_master_count():
+    """GET /master/count?type=FRI&date=...&segment=IWPB&gho_code=... — live preview."""
+    try:
+        module = _validate_module(request.args.get("type", "FRI"))
+        feed_date = _optional_date(request.args.get("date"))
+        segment = _validate_segment(request.args.get("segment"))
+        gho_code = _optional_gho(request.args.get("gho_code"))
+        return jsonify({
+            "module": module,
+            "date": feed_date,
+            "segment": segment or "All",
+            "gho_code": gho_code or "All",
+            "count": ms.count_active(module, feed_date, segment, gho_code),
+            "atr_pending": ms.count_atr_pending(module, feed_date, segment, gho_code),
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/master/download", methods=["POST"])
+def route_master_download():
+    """POST /master/download {type, date, segment, gho_code} — background job."""
+    req = request.get_json(silent=True) or {}
+    try:
+        module = _validate_module(req.get("type", "FRI"))
+        feed_date = _optional_date(req.get("date"))
+        segment = _validate_segment(req.get("segment"))
+        gho_code = _optional_gho(req.get("gho_code"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    try:
+        job_id = start_job(_do_master_export, module, feed_date, segment, gho_code)
+        return jsonify({"job_id": job_id, "status": "pending"}), 202
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/master/stats", methods=["GET"])
+def route_master_stats():
+    try:
+        return jsonify(ms.master_stats(_validate_module(request.args.get("type", "FRI"))))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/master/conflicts", methods=["GET"])
+def route_master_conflicts():
+    """Numbers ignored for appearing on both sides of one feed date."""
+    try:
+        module = _validate_module(request.args.get("type", "FRI"))
+        return jsonify({"conflicts": ms.conflicts(module, request.args.get("date"))})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/master/lookup/<mobile_no>", methods=["GET"])
+def route_master_lookup(mobile_no):
+    try:
+        return jsonify(ms.lookup(mobile_no))
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/master/purge", methods=["POST"])
+def route_master_purge():
+    """Manual trigger; purge also runs after every reconcile."""
+    try:
+        return jsonify(ms.purge_expired())
+    except Exception as e:
+        return _fail(e)
+
+
+# ── ATR ──────────────────────────────────────────────────────────────────────
+@routes.route("/atr/defaults", methods=["GET"])
+def route_atr_defaults():
+    """GET /atr/defaults?type=FRI — the values sent for each segment."""
+    try:
+        module = _validate_module(request.args.get("type", "FRI"))
+        return jsonify({
+            "module": module,
+            "defaults": atr_service.get_defaults(module),
+            "boa_codes": sorted(atr_service.BOA_ACTION_CODES, key=int),
+            "bot_codes": sorted(atr_service.BOT_ACTION_CODES, key=int),
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/defaults", methods=["PUT"])
+def route_atr_defaults_save():
+    """PUT /atr/defaults {type, segment, action_type, action_taken, ...}"""
+    req = request.get_json(silent=True) or {}
+    try:
+        module = _validate_module(req.get("type", "FRI"))
+        segment = req.get("segment")
+        if segment not in (ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB, ms.SEGMENT_UNKNOWN):
+            raise ValueError("Segment must be IWPB, Non-IWPB or UNKNOWN.")
+        saved = atr_service.save_defaults(
+            module, segment, req, updated_by=req.get("updated_by")
+        )
+        return jsonify({"saved": saved})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/preview", methods=["GET"])
+def route_atr_preview():
+    """GET /atr/preview?type=FRI&date=...&segment=IWPB — what a run would send."""
+    try:
+        module = _validate_module(request.args.get("type", "FRI"))
+        feed_date = _optional_date(request.args.get("date"))
+        segment = _validate_segment(request.args.get("segment"))
+        gho_code = _optional_gho(request.args.get("gho_code"))
+
+        breakdown = []
+        for seg in ([segment] if segment else [ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB]):
+            defaults = atr_service.get_defaults(module, seg)
+            breakdown.append({
+                "segment": seg,
+                "pending": ms.count_atr_pending(module, feed_date, seg, gho_code),
+                "defaults": defaults[0] if defaults else None,
+            })
+
+        return jsonify({
+            "module": module,
+            "date": feed_date,
+            "gho_code": gho_code or "All",
+            "total_pending": sum(b["pending"] for b in breakdown),
+            "breakdown": breakdown,
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/submit", methods=["POST"])
+def route_atr_submit():
+    """POST /atr/submit {type, date, segment, gho_code, dry_run} — background job."""
+    req = request.get_json(silent=True) or {}
+    try:
+        module = _validate_module(req.get("type", "FRI"))
+        feed_date = _optional_date(req.get("date"))
+        segment = _validate_segment(req.get("segment"))
+        gho_code = _optional_gho(req.get("gho_code"))
+        batch_size = int(req.get("batch_size") or atr_service.ATR_BATCH_SIZE)
+        limit = int(req["limit"]) if req.get("limit") else None
+        dry_run = bool(req.get("dry_run", False))
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    try:
+        job_id = start_job(
+            _do_atr_run, module, feed_date, segment, gho_code, batch_size, limit, dry_run
+        )
+        return jsonify({"job_id": job_id, "status": "pending"}), 202
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/runs", methods=["GET"])
+def route_atr_runs():
+    try:
+        module = request.args.get("type")
+        return jsonify({
+            "runs": atr_service.list_runs(
+                _validate_module(module) if module else None,
+                int(request.args.get("limit", 50)),
+            )
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/runs/<run_id>/rejects", methods=["GET"])
+def route_atr_rejects(run_id):
+    try:
+        return jsonify({"run_id": run_id, "rejects": atr_service.list_rejects(run_id)})
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/retry", methods=["POST"])
+def route_atr_retry():
+    """POST /atr/retry {type, date, segment} — put failures back in the queue."""
+    req = request.get_json(silent=True) or {}
+    try:
+        module = _validate_module(req.get("type", "FRI"))
+        feed_date = _optional_date(req.get("date"))
+        segment = _validate_segment(req.get("segment"))
+        requeued = ms.reset_atr_status(module, feed_date, segment, only_failed=True)
+        return jsonify({"requeued": requeued})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+# ── BACKWARD COMPATIBILITY (old matchoff paths) ──────────────────────────────
+@routes.route("/matchoff/folders", methods=["GET"])
+def route_matchoff_folders_legacy():
+    return route_reconcile_folders()
+
+
+@routes.route("/matchoff/files", methods=["GET"])
+def route_matchoff_files_legacy():
+    return route_reconcile_files()
+
+
+@routes.route("/matchoff/start", methods=["POST"])
+def route_matchoff_start_legacy():
+    return route_reconcile_start()
+
+
+@routes.route("/matchoff/history", methods=["GET"])
+def route_matchoff_history_legacy():
+    return route_reconcile_history()

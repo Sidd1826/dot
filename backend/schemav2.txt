@@ -1,0 +1,332 @@
+-- =============================================================================
+-- DOT INTELLIGENCE PLATFORM — SCHEMA v3
+--
+-- Adds to v2:
+--   * gho_code + segment on both master tables (captured at reconcile)
+--   * ATR lifecycle columns on both master tables (per-number state)
+--   * atr_defaults  — per (module, segment) ATR payload defaults, editable
+--   * atr_runs      — one row per ATR submission run
+--   * atr_rejects   — only rejected numbers; accepted state lives on the master
+--   * matchoff_runs.output_blob_path relaxed (reconcile no longer writes Excel)
+--
+-- Run against the same database as schema.sql.
+-- =============================================================================
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+
+-- =============================================================================
+-- mobilecleanup — GHO code (already implemented upstream; guard for safety)
+-- =============================================================================
+ALTER TABLE mobilecleanup ADD COLUMN IF NOT EXISTS gho_code VARCHAR(20);
+CREATE INDEX IF NOT EXISTS idx_mobilecleanup_gho ON mobilecleanup (gho_code);
+
+
+-- =============================================================================
+-- TABLE: fri_master
+-- One row per mobile_no. Populated ONLY by the reconcile stage.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS fri_master (
+    id                  BIGSERIAL PRIMARY KEY,
+
+    mobile_no           VARCHAR(20)  NOT NULL,
+    cust_id             VARCHAR(100),
+    gho_code            VARCHAR(20),           -- from mobilecleanup at reconcile
+    segment             VARCHAR(15)  NOT NULL DEFAULT 'UNKNOWN'
+                        CHECK (segment IN ('IWPB', 'Non-IWPB', 'UNKNOWN')),
+
+    -- ── compliance lifecycle ─────────────────────────────────────────────────
+    status              VARCHAR(10)  NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'cleared')),
+    clear_reason        VARCHAR(15)  CHECK (clear_reason IN ('compliant')),
+    cleared_on          DATE,
+    cleared_at          TIMESTAMPTZ,
+
+    -- ── rolling window ───────────────────────────────────────────────────────
+    first_reported_on   DATE         NOT NULL,
+    last_reported_on    DATE         NOT NULL,
+    report_count        INTEGER      NOT NULL DEFAULT 1 CHECK (report_count >= 1),
+
+    -- ── ATR lifecycle (per-number log lives here, not in a side table) ───────
+    atr_status          VARCHAR(12)  NOT NULL DEFAULT 'pending'
+                        CHECK (atr_status IN ('pending', 'sent', 'rejected', 'skipped')),
+    atr_run_id          UUID,
+    atr_action_type     VARCHAR(5),            -- BOA / BOT
+    atr_action_taken    VARCHAR(5),
+    atr_submitted_at    TIMESTAMPTZ,
+    atr_error           TEXT,
+
+    -- ── feed payload ─────────────────────────────────────────────────────────
+    fri                 VARCHAR(50),
+    fri_status          VARCHAR(50),
+    lsa_id              VARCHAR(20),
+    tsp_id              VARCHAR(20),
+
+    payload             JSONB,
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_fri_master_mobile UNIQUE (mobile_no),
+    CONSTRAINT chk_fri_master_clear CHECK (
+        (status = 'active'  AND clear_reason IS NULL     AND cleared_on IS NULL)
+     OR (status = 'cleared' AND clear_reason IS NOT NULL AND cleared_on IS NOT NULL)
+    ),
+    CONSTRAINT chk_fri_master_window CHECK (last_reported_on >= first_reported_on)
+);
+
+-- the download query: date + segment, active only
+CREATE INDEX IF NOT EXISTS idx_fri_master_download
+    ON fri_master (last_reported_on DESC, segment) WHERE status = 'active';
+-- the ATR queue: keyset-paginated by id
+CREATE INDEX IF NOT EXISTS idx_fri_master_atr_queue
+    ON fri_master (segment, last_reported_on, id) WHERE status = 'active' AND atr_status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_fri_master_gho      ON fri_master (gho_code);
+CREATE INDEX IF NOT EXISTS idx_fri_master_cleared  ON fri_master (cleared_on DESC) WHERE status = 'cleared';
+CREATE INDEX IF NOT EXISTS idx_fri_master_purge    ON fri_master (last_reported_on);
+CREATE INDEX IF NOT EXISTS idx_fri_master_run      ON fri_master (atr_run_id);
+
+
+-- =============================================================================
+-- TABLE: mnrl_master
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS mnrl_master (
+    id                      BIGSERIAL PRIMARY KEY,
+
+    mobile_no               VARCHAR(20)  NOT NULL,
+    cust_id                 VARCHAR(100),
+    gho_code                VARCHAR(20),
+    segment                 VARCHAR(15)  NOT NULL DEFAULT 'UNKNOWN'
+                            CHECK (segment IN ('IWPB', 'Non-IWPB', 'UNKNOWN')),
+
+    status                  VARCHAR(10)  NOT NULL DEFAULT 'active'
+                            CHECK (status IN ('active', 'cleared')),
+    clear_reason            VARCHAR(15)  CHECK (clear_reason IN ('reactivated')),
+    cleared_on              DATE,
+    cleared_at              TIMESTAMPTZ,
+    reactivation_id         VARCHAR(50),
+
+    first_reported_on       DATE         NOT NULL,
+    last_reported_on        DATE         NOT NULL,
+    report_count            INTEGER      NOT NULL DEFAULT 1 CHECK (report_count >= 1),
+
+    atr_status              VARCHAR(12)  NOT NULL DEFAULT 'pending'
+                            CHECK (atr_status IN ('pending', 'sent', 'rejected', 'skipped')),
+    atr_run_id              UUID,
+    atr_action_type         VARCHAR(5),
+    atr_action_taken        VARCHAR(5),
+    atr_submitted_at        TIMESTAMPTZ,
+    atr_error               TEXT,
+
+    date_of_disconnection   DATE,
+    disconnection_reason_id VARCHAR(20),
+    lsa_id                  VARCHAR(20),
+    tsp_id                  VARCHAR(20),
+
+    payload                 JSONB,
+    created_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_mnrl_master_mobile UNIQUE (mobile_no),
+    CONSTRAINT chk_mnrl_master_clear CHECK (
+        (status = 'active'  AND clear_reason IS NULL     AND cleared_on IS NULL)
+     OR (status = 'cleared' AND clear_reason IS NOT NULL AND cleared_on IS NOT NULL)
+    ),
+    CONSTRAINT chk_mnrl_master_window CHECK (last_reported_on >= first_reported_on)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mnrl_master_download
+    ON mnrl_master (last_reported_on DESC, segment) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_mnrl_master_atr_queue
+    ON mnrl_master (segment, last_reported_on, id) WHERE status = 'active' AND atr_status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_mnrl_master_gho     ON mnrl_master (gho_code);
+CREATE INDEX IF NOT EXISTS idx_mnrl_master_cleared ON mnrl_master (cleared_on DESC) WHERE status = 'cleared';
+CREATE INDEX IF NOT EXISTS idx_mnrl_master_purge   ON mnrl_master (last_reported_on);
+CREATE INDEX IF NOT EXISTS idx_mnrl_master_run     ON mnrl_master (atr_run_id);
+
+
+-- =============================================================================
+-- TABLE: dot_feed_ledger
+-- Records what each feed said, per date, so a number appearing on BOTH the add
+-- side and the clear side of one date can be detected across separate jobs.
+--   feed_kind 'add'   = FRI non-compliant | MNRL Normal
+--   feed_kind 'clear' = FRI compliant     | MNRL Reactivated
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS dot_feed_ledger (
+    module      VARCHAR(10) NOT NULL CHECK (module IN ('FRI', 'MNRL')),
+    feed_date   DATE        NOT NULL,
+    feed_kind   VARCHAR(10) NOT NULL CHECK (feed_kind IN ('add', 'clear')),
+    mobile_no   VARCHAR(20) NOT NULL,
+    source_file TEXT,
+    seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (module, feed_date, feed_kind, mobile_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feed_ledger_conflict ON dot_feed_ledger (module, feed_date, mobile_no);
+CREATE INDEX IF NOT EXISTS idx_feed_ledger_purge    ON dot_feed_ledger (feed_date);
+
+
+-- =============================================================================
+-- TABLE: dot_master_events — state changes only, never routine sightings
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS dot_master_events (
+    id          BIGSERIAL PRIMARY KEY,
+    module      VARCHAR(10) NOT NULL CHECK (module IN ('FRI', 'MNRL')),
+    mobile_no   VARCHAR(20) NOT NULL,
+    event       VARCHAR(20) NOT NULL CHECK (event IN (
+                    'compliant', 'reactivated', 'conflict_ignored', 'retracted'
+                )),
+    event_date  DATE        NOT NULL,
+    source_file TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dot_events_mobile  ON dot_master_events (module, mobile_no, event_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dot_events_conflict
+    ON dot_master_events (module, event_date DESC) WHERE event = 'conflict_ignored';
+
+
+-- =============================================================================
+-- TABLE: atr_defaults
+-- The ATR payload values applied to every number in a (module, segment).
+-- Editable from the ATR tab — no redeploy to change an action code.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS atr_defaults (
+    module                VARCHAR(10)  NOT NULL CHECK (module IN ('FRI', 'MNRL')),
+    segment               VARCHAR(15)  NOT NULL CHECK (segment IN ('IWPB', 'Non-IWPB', 'UNKNOWN')),
+
+    action_type           VARCHAR(5)   NOT NULL CHECK (action_type IN ('BOA', 'BOT')),
+    action_taken          VARCHAR(5)   NOT NULL,
+    investigation_details VARCHAR(500),
+    grievance_received    VARCHAR(3)   NOT NULL DEFAULT 'No' CHECK (grievance_received IN ('Yes', 'No')),
+    remarks               VARCHAR(100),
+
+    -- BOT only; ignored when action_type = 'BOA'
+    total_money_saved     NUMERIC(18, 2),
+    transaction_declined  INTEGER,
+
+    is_active             BOOLEAN      NOT NULL DEFAULT TRUE,
+    updated_by            VARCHAR(100),
+    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (module, segment),
+
+    -- BOT mandates both amount fields per the C-DOT spec
+    CONSTRAINT chk_atr_bot_fields CHECK (
+        action_type <> 'BOT'
+        OR (total_money_saved IS NOT NULL AND transaction_declined IS NOT NULL)
+    )
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SEED — action codes below are PLACEHOLDERS.
+-- Confirm each one with compliance before the first production run.
+--   BOA: 1 Account Freeze | 2 Credit & Debit Restriction | 3 Not Found/Suspicious
+--        after EDD | 7 Service Denied | 8 Debit Restriction | 9 Rejected at
+--        onboarding | 10 Blacklisted
+--   BOT: 5 Transaction Declined | 6 User Blacklisted
+-- ─────────────────────────────────────────────────────────────────────────────
+INSERT INTO atr_defaults
+    (module, segment, action_type, action_taken, investigation_details, grievance_received, remarks)
+VALUES
+    ('FRI',  'IWPB',     'BOA', '2', 'Credit and debit restriction applied after internal review', 'No', 'Auto-submitted by DOT platform'),
+    ('FRI',  'Non-IWPB', 'BOA', '8', 'Debit restriction applied after internal review',            'No', 'Auto-submitted by DOT platform'),
+    ('MNRL', 'IWPB',     'BOA', '2', 'Credit and debit restriction applied after internal review', 'No', 'Auto-submitted by DOT platform'),
+    ('MNRL', 'Non-IWPB', 'BOA', '8', 'Debit restriction applied after internal review',            'No', 'Auto-submitted by DOT platform')
+ON CONFLICT (module, segment) DO NOTHING;
+
+
+-- =============================================================================
+-- TABLE: atr_runs — one row per submission run
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS atr_runs (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    module            VARCHAR(10) NOT NULL CHECK (module IN ('FRI', 'MNRL')),
+    segment           VARCHAR(15),                 -- NULL = all segments
+    feed_date         DATE,                        -- NULL = all dates in window
+    gho_code          VARCHAR(20),
+
+    action_type       VARCHAR(5),
+    action_taken      VARCHAR(5),
+
+    total_selected    INTEGER NOT NULL DEFAULT 0,
+    total_sent        INTEGER NOT NULL DEFAULT 0,
+    total_rejected    INTEGER NOT NULL DEFAULT 0,
+    total_skipped     INTEGER NOT NULL DEFAULT 0,  -- invalid mobile etc.
+    batches_sent      INTEGER NOT NULL DEFAULT 0,
+    batch_size        INTEGER NOT NULL DEFAULT 0,
+
+    status            VARCHAR(12) NOT NULL DEFAULT 'running'
+                      CHECK (status IN ('running', 'done', 'partial', 'failed')),
+    dry_run           BOOLEAN NOT NULL DEFAULT FALSE,
+    request_ids       JSONB,                       -- requestIds returned by C-DOT
+    error             TEXT,
+
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at       TIMESTAMPTZ,
+
+    CONSTRAINT chk_atr_run_counts CHECK (
+        total_sent + total_rejected + total_skipped <= total_selected
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_atr_runs_created ON atr_runs (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_atr_runs_module  ON atr_runs (module, started_at DESC);
+
+
+-- =============================================================================
+-- TABLE: atr_rejects
+-- ONLY rejected numbers. Accepted state is on the master row (atr_status='sent'),
+-- so a million-row success doesn't get written twice.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS atr_rejects (
+    id            BIGSERIAL PRIMARY KEY,
+    run_id        UUID        NOT NULL REFERENCES atr_runs (id) ON DELETE CASCADE,
+    module        VARCHAR(10) NOT NULL,
+    mobile_no     VARCHAR(20) NOT NULL,
+    cust_id       VARCHAR(100),
+    batch_no      INTEGER,
+    error_message TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_atr_rejects_run    ON atr_rejects (run_id);
+CREATE INDEX IF NOT EXISTS idx_atr_rejects_mobile ON atr_rejects (module, mobile_no);
+
+
+-- =============================================================================
+-- matchoff_runs — reconcile no longer writes an Excel, so the output path and
+-- container become optional. New columns record what went into the master.
+-- =============================================================================
+ALTER TABLE matchoff_runs ALTER COLUMN output_blob_path DROP NOT NULL;
+ALTER TABLE matchoff_runs ADD COLUMN IF NOT EXISTS module              VARCHAR(10);
+ALTER TABLE matchoff_runs ADD COLUMN IF NOT EXISTS data_type           VARCHAR(20);
+ALTER TABLE matchoff_runs ADD COLUMN IF NOT EXISTS master_inserted     INTEGER DEFAULT 0;
+ALTER TABLE matchoff_runs ADD COLUMN IF NOT EXISTS master_updated      INTEGER DEFAULT 0;
+ALTER TABLE matchoff_runs ADD COLUMN IF NOT EXISTS master_cleared      INTEGER DEFAULT 0;
+ALTER TABLE matchoff_runs ADD COLUMN IF NOT EXISTS conflicts_ignored   INTEGER DEFAULT 0;
+
+
+-- =============================================================================
+-- VIEWS
+-- =============================================================================
+CREATE OR REPLACE VIEW v_fri_active  AS SELECT * FROM fri_master  WHERE status = 'active';
+CREATE OR REPLACE VIEW v_mnrl_active AS SELECT * FROM mnrl_master WHERE status = 'active';
+
+-- what the ATR tab shows before you press send
+CREATE OR REPLACE VIEW v_atr_queue AS
+    SELECT 'FRI' AS module, segment, gho_code, last_reported_on AS feed_date,
+           COUNT(*) AS pending
+    FROM fri_master
+    WHERE status = 'active' AND atr_status = 'pending'
+    GROUP BY segment, gho_code, last_reported_on
+    UNION ALL
+    SELECT 'MNRL', segment, gho_code, last_reported_on, COUNT(*)
+    FROM mnrl_master
+    WHERE status = 'active' AND atr_status = 'pending'
+    GROUP BY segment, gho_code, last_reported_on;
+
+CREATE OR REPLACE VIEW v_master_conflicts AS
+    SELECT module, mobile_no, event_date, source_file, created_at
+    FROM dot_master_events
+    WHERE event = 'conflict_ignored'
+    ORDER BY event_date DESC, created_at DESC;

@@ -3,7 +3,8 @@ import {
   Database, FileSpreadsheet, Download, RefreshCw,
   CheckCircle, AlertCircle, X, Calendar, Loader2,
   Cloud, HardDrive, Shield, Upload, BarChart3, Clock,
-  GitMerge, ChevronDown, ArrowRight, Search,
+  GitMerge, ChevronDown, ArrowRight, Search, Send,
+  Settings2, Users, Filter, ListChecks, RotateCcw, TestTube2,
 } from "lucide-react";
 
 // ─────────────────────────────────────────────
@@ -16,45 +17,32 @@ const BASE_URL =
 
 const PAGE_SIZE = 10;
 
-// ─────────────────────────────────────────────
-// RECORD-COUNT-BASED DYNAMIC POLLING CONFIG
-//
-// Instead of a fixed time threshold, the slow-phase duration is
-// derived from the actual record count known before the export starts.
-//
-//   FAST_POLL_MS    — poll interval once in fast phase (3 s)
-//   SLOW_POLL_MS    — poll interval during patient phase (20 s)
-//   MS_PER_RECORD   — rough estimate: server ms per record (tune this)
-//   FAST_THRESHOLD  — counts at or below this skip slow phase entirely
-//
-// Examples with defaults (MS_PER_RECORD = 1.2):
-//    10 000 records →  12 s estimated → FAST from start  (< 30 k)
-//    50 000 records →  60 s estimated → slow 60 s, then fast
-//   1 00 000 records → 120 s estimated → slow 120 s, then fast
-//   5 00 000 records → 600 s estimated → slow 600 s, then fast
-// ─────────────────────────────────────────────
 const POLL = {
   FAST_POLL_MS:   3_000,
   SLOW_POLL_MS:  20_000,
-  MS_PER_RECORD:    1.2,   // ← tune to match your server throughput
-  FAST_THRESHOLD: 30_000,  // ← records below this always use fast mode
+  MS_PER_RECORD:    1.2,
+  FAST_THRESHOLD: 30_000,
 };
 
-/** Returns how long (ms) to stay in slow-poll mode for a given count. */
 function slowPhaseDuration(count) {
   if (!count || count <= POLL.FAST_THRESHOLD) return 0;
   return Math.round(count * POLL.MS_PER_RECORD);
 }
 
 // ─────────────────────────────────────────────
-// API SERVICE
+// API
 // ─────────────────────────────────────────────
+const qs = (obj) =>
+  Object.entries(obj)
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+    .join("&");
+
 const api = {
-  async post(path, body) {
+  async request(path, options = {}) {
     const res = await fetch(`${BASE_URL}${path}`, {
-      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      ...options,
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -62,16 +50,11 @@ const api = {
     }
     return res.json();
   },
+  get(path)        { return api.request(path); },
+  post(path, body) { return api.request(path, { method: "POST", body: JSON.stringify(body) }); },
+  put(path, body)  { return api.request(path, { method: "PUT",  body: JSON.stringify(body) }); },
 
-  async get(path) {
-    const res = await fetch(`${BASE_URL}${path}`);
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || `Request failed: ${res.status}`);
-    }
-    return res.json();
-  },
-
+  // Downloads
   fetchFRICount:             (date)            => api.post("/fri/count", { date }),
   fetchMNRLCount:            (date)            => api.post("/mnrl/count", { date }),
   fetchMNRLCountReactivated: (date)            => api.post("/mnrl/count/reactivated", { date }),
@@ -79,34 +62,39 @@ const api = {
   startMNRLExport:           (date, data_type) => api.post("/mnrl/export-and-save", { date, data_type }),
   pollJobStatus:             (jobId)           => api.get(`/export/status/${jobId}`),
   listFiles:                 (type)            => api.get(`/files/list?type=${type}`),
-  getDownloadUrl:            (fileId, type)    => api.get(`/files/download-url/${fileId}?type=${type}`),
-  fetchMatchoffFolders:      (c)               => api.get(`/matchoff/folders?container=${c}`),
-  fetchMatchoffFiles:        (c, d)            => api.get(`/matchoff/files?container=${c}&date=${d}`),
-  // mob_col is always fixed to "mob_num" — removed from user input
-  startMatchoff:             (c, d, f)         => api.post("/matchoff/start", { container: c, date: d, file_name: f, mob_col: "mob_num" }),
-  listMatchoffHistory:       ()                => api.get("/matchoff/history"),
-  getMatchoffDownloadUrl:    (id)              => api.get(`/matchoff/download-url/${id}`),
+  getDownloadUrl:            (id, type)        => api.get(`/files/download-url/${id}?type=${type}`),
+
+  // Reconcile
+  fetchReconcileFolders: (c)       => api.get(`/reconcile/folders?container=${c}`),
+  fetchReconcileFiles:   (c, d)    => api.get(`/reconcile/files?${qs({ container: c, date: d })}`),
+  startReconcile:        (c, d, f) => api.post("/reconcile/start", { container: c, date: d, file_name: f, mob_col: "mob_num" }),
+  listReconcileHistory:  ()        => api.get("/reconcile/history"),
+
+  // Master
+  fetchGhoCodes:     (type)  => api.get(`/master/gho-codes?${qs({ type })}`),
+  fetchMasterDates:  (type)  => api.get(`/master/dates?type=${type}`),
+  fetchMasterCount:  (p)     => api.get(`/master/count?${qs(p)}`),
+  fetchMasterStats:  (type)  => api.get(`/master/stats?type=${type}`),
+  startMasterDownload: (p)   => api.post("/master/download", p),
+
+  // ATR
+  fetchAtrDefaults: (type)   => api.get(`/atr/defaults?type=${type}`),
+  saveAtrDefaults:  (body)   => api.put("/atr/defaults", body),
+  fetchAtrPreview:  (p)      => api.get(`/atr/preview?${qs(p)}`),
+  submitAtr:        (p)      => api.post("/atr/submit", p),
+  fetchAtrRuns:     (type)   => api.get(`/atr/runs?${qs({ type })}`),
+  fetchAtrRejects:  (runId)  => api.get(`/atr/runs/${runId}/rejects`),
+  retryAtr:         (p)      => api.post("/atr/retry", p),
 };
 
 // ─────────────────────────────────────────────
-// DYNAMIC POLLING HOOK — record-count-aware
-//
-// Accepts `recordCount` (known before the job starts) and uses
-// slowPhaseDuration() to decide how long to poll slowly before
-// switching to fast polling.
-//
-//   recordCount ≤ FAST_THRESHOLD  →  poll every 3 s from the start
-//   recordCount > FAST_THRESHOLD  →  poll every 20 s for the estimated
-//                                    processing time, then every 3 s
-//
-// Uses setTimeout (not setInterval) so the interval changes freely
-// between ticks with no stale-closure issues.
+// JOB POLLER
 // ─────────────────────────────────────────────
 function useJobPoller({ jobId, recordCount = 0, onDone, onFailed }) {
-  const timerRef      = useRef(null);
-  const startedAt     = useRef(null);
-  const isFast        = useRef(false);
-  const slowPhaseMs   = useRef(0);  // computed once when job starts
+  const timerRef    = useRef(null);
+  const startedAt   = useRef(null);
+  const isFast      = useRef(false);
+  const slowPhaseMs = useRef(0);
 
   useEffect(() => {
     if (!jobId) return;
@@ -115,24 +103,12 @@ function useJobPoller({ jobId, recordCount = 0, onDone, onFailed }) {
     isFast.current      = false;
     slowPhaseMs.current = slowPhaseDuration(recordCount);
 
-    // Log the strategy so it's visible in DevTools (no-op in prod)
-    if (slowPhaseMs.current === 0) {
-      console.info(`[Poller] ${recordCount.toLocaleString()} records → fast mode throughout (3 s)`);
-    } else {
-      console.info(
-        `[Poller] ${recordCount.toLocaleString()} records → slow (20 s) for ${Math.round(slowPhaseMs.current / 1000)} s, then fast (3 s)`
-      );
-    }
-
     const stop = () => { if (timerRef.current) clearTimeout(timerRef.current); };
 
     const scheduleNext = () => {
       const elapsed = Date.now() - startedAt.current;
       const goFast  = slowPhaseMs.current === 0 || elapsed >= slowPhaseMs.current;
-      if (goFast && !isFast.current) {
-        isFast.current = true;
-        console.info("[Poller] → switched to fast mode (3 s) after", Math.round(elapsed / 1000), "s");
-      }
+      if (goFast) isFast.current = true;
       timerRef.current = setTimeout(tick, goFast ? POLL.FAST_POLL_MS : POLL.SLOW_POLL_MS);
     };
 
@@ -140,12 +116,12 @@ function useJobPoller({ jobId, recordCount = 0, onDone, onFailed }) {
       try {
         const data = await api.pollJobStatus(jobId);
         if      (data.status === "done")   { stop(); onDone(data.result); }
-        else if (data.status === "failed") { stop(); onFailed(data.error || "Export failed"); }
+        else if (data.status === "failed") { stop(); onFailed(data.error || "The job failed."); }
         else                               { scheduleNext(); }
       } catch (e) { stop(); onFailed(e.message); }
     };
 
-    tick(); // immediate first check — catches tiny jobs instantly
+    tick();
     return stop;
   }, [jobId]); // eslint-disable-line
 }
@@ -155,12 +131,11 @@ function useJobPoller({ jobId, recordCount = 0, onDone, onFailed }) {
 // ─────────────────────────────────────────────
 const fmt = (n) => (n != null ? Number(n).toLocaleString("en-IN") : "—");
 const fmtDate = (d) =>
-  new Date(d).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+  d ? new Date(d).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "—";
 const fmtDateTime = (d) =>
-  new Date(d).toLocaleString("en-IN", {
-    day: "numeric", month: "short", year: "numeric",
-    hour: "2-digit", minute: "2-digit",
-  });
+  d ? new Date(d).toLocaleString("en-IN", {
+    day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
+  }) : "—";
 const today = () => new Date().toISOString().split("T")[0];
 const triggerBlobDownload = (url, filename) => {
   const a = document.createElement("a");
@@ -184,24 +159,29 @@ const Alert = ({ type, message, onClose }) => {
       <p className="flex-1 text-sm font-medium" style={{ color: cfg.text }}>{message}</p>
       {onClose && (
         <button onClick={onClose} style={{ color: cfg.text, opacity: 0.6 }}
-          className="hover:opacity-100 transition-opacity">
-          <X size={16} />
-        </button>
+          className="hover:opacity-100 transition-opacity"><X size={16} /></button>
       )}
     </div>
   );
 };
 
-const ExportProgress = ({ label }) => (
-  <div className="flex items-center gap-3 px-4 py-3 bg-blue-50 border-l-4 border-blue-500 rounded-lg mt-3">
-    <Loader2 size={18} className="animate-spin text-blue-600 shrink-0" />
-    <div className="flex-1">
-      <p className="text-sm font-semibold text-blue-800">{label}</p>
-      <p className="text-xs text-blue-500 mt-0.5">Processing in background · checking every 3s…</p>
+const RunningBanner = ({ title, subtitle, tone = "blue" }) => {
+  const c = {
+    blue:   { bg: "bg-blue-50",   bar: "border-blue-500",   text: "text-blue-800",   sub: "text-blue-500" },
+    indigo: { bg: "bg-indigo-50", bar: "border-indigo-500", text: "text-indigo-800", sub: "text-indigo-400" },
+    amber:  { bg: "bg-amber-50",  bar: "border-amber-500",  text: "text-amber-800",  sub: "text-amber-500" },
+  }[tone];
+  return (
+    <div className={`flex items-center gap-3 px-4 py-3 ${c.bg} border-l-4 ${c.bar} rounded-lg mt-3`}>
+      <Loader2 size={18} className={`animate-spin ${c.text} shrink-0`} />
+      <div className="flex-1">
+        <p className={`text-sm font-semibold ${c.text}`}>{title}</p>
+        <p className={`text-xs ${c.sub} mt-0.5`}>{subtitle}</p>
+      </div>
+      <Clock size={15} className={c.sub} />
     </div>
-    <Clock size={15} className="text-blue-400" />
-  </div>
-);
+  );
+};
 
 const DatePicker = ({ value, onChange, label }) => (
   <div className="flex flex-col gap-1.5">
@@ -217,81 +197,126 @@ const DatePicker = ({ value, onChange, label }) => (
   </div>
 );
 
-const CountBadge = ({ label, count, color = "blue" }) => {
+const CountBadge = ({ label, count, color = "blue", sub = "records" }) => {
   const colors = {
     blue:   { from: "#2563eb", to: "#4f46e5" },
     teal:   { from: "#0d9488", to: "#0891b2" },
     violet: { from: "#7c3aed", to: "#6d28d9" },
+    slate:  { from: "#475569", to: "#334155" },
+    amber:  { from: "#d97706", to: "#b45309" },
   }[color];
   return (
     <div className="rounded-xl p-4 text-white flex flex-col justify-between"
       style={{ background: `linear-gradient(135deg, ${colors.from}, ${colors.to})` }}>
       <p className="text-xs font-semibold uppercase tracking-widest opacity-80">{label}</p>
       <p className="text-3xl font-bold mt-1 tabular-nums">
-        {count === null ? <span className="opacity-40 text-2xl">—</span> : fmt(count)}
+        {count === null || count === undefined ? <span className="opacity-40 text-2xl">—</span> : fmt(count)}
       </p>
-      <p className="text-xs opacity-60 mt-1">records</p>
+      <p className="text-xs opacity-60 mt-1">{sub}</p>
     </div>
   );
 };
 
-const ExportBtn = ({ onClick, loading, disabled, label }) => (
+const PrimaryBtn = ({ onClick, loading, disabled, label, Icon = Upload, gradient }) => (
   <button onClick={onClick} disabled={disabled || loading}
     className="w-full flex items-center justify-center gap-2.5 px-5 py-3.5 rounded-xl
       font-semibold text-sm transition-all shadow-md hover:shadow-lg
       disabled:opacity-50 disabled:cursor-not-allowed"
     style={{
-      background: disabled || loading ? "#94a3b8" : "linear-gradient(135deg, #2563eb, #4f46e5)",
+      background: disabled || loading ? "#94a3b8" : (gradient || "linear-gradient(135deg, #2563eb, #4f46e5)"),
       color: "white",
     }}>
-    {loading
-      ? <><Loader2 size={16} className="animate-spin" /> Starting export…</>
-      : <><Upload size={16} /> {label}</>}
+    {loading ? <><Loader2 size={16} className="animate-spin" /> Working…</> : <><Icon size={16} /> {label}</>}
   </button>
 );
 
-// ─────────────────────────────────────────────
-// SEARCHABLE DROPDOWN
-// Shows a search box when > 6 options; scrollable list capped at 220px.
-// ─────────────────────────────────────────────
+const StatChip = ({ label, value, tone = "slate" }) => {
+  const tones = {
+    slate:  "bg-slate-100 text-slate-600",
+    blue:   "bg-blue-100 text-blue-700",
+    green:  "bg-green-100 text-green-700",
+    amber:  "bg-amber-100 text-amber-700",
+    rose:   "bg-rose-100 text-rose-700",
+    indigo: "bg-indigo-100 text-indigo-700",
+  }[tone];
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-slate-400">{label}</span>
+      <span className={`px-2 py-0.5 rounded-full text-xs font-semibold tabular-nums ${tones}`}>
+        {fmt(value)}
+      </span>
+    </div>
+  );
+};
+
+const SectionCard = ({ icon: Icon, iconBg, title, subtitle, children, action }) => (
+  <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+    <div className="flex items-start justify-between mb-6">
+      <div className="flex items-center gap-3">
+        <div className={`w-10 h-10 rounded-xl ${iconBg} flex items-center justify-center shrink-0`}>
+          <Icon size={18} className="text-white" />
+        </div>
+        <div>
+          <h2 className="text-lg font-bold text-slate-800">{title}</h2>
+          {subtitle && <p className="text-xs text-slate-400 mt-0.5">{subtitle}</p>}
+        </div>
+      </div>
+      {action}
+    </div>
+    {children}
+  </div>
+);
+
+// Segmented control — better than a dropdown for 2–3 mutually exclusive choices
+const SegmentedControl = ({ label, value, onChange, options, disabled }) => (
+  <div className="flex flex-col gap-1.5">
+    {label && (
+      <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">{label}</label>
+    )}
+    <div className="flex bg-slate-100 rounded-xl p-1 gap-1">
+      {options.map((o) => {
+        const active = o.value === value;
+        return (
+          <button key={o.value} type="button" disabled={disabled}
+            onClick={() => onChange(o.value)}
+            className={`flex-1 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all
+              disabled:opacity-50 disabled:cursor-not-allowed ${
+              active ? "bg-white shadow-sm text-slate-800" : "text-slate-500 hover:text-slate-700"
+            }`}>
+            {o.label}
+            {o.count !== undefined && (
+              <span className={`ml-1.5 text-xs tabular-nums ${active ? "text-slate-400" : "text-slate-400"}`}>
+                {fmt(o.count)}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  </div>
+);
+
 const SearchableSelect = ({ label, value, onChange, options, placeholder, disabled, loading }) => {
   const [open, setOpen]   = useState(false);
   const [query, setQuery] = useState("");
   const wrapRef           = useRef(null);
   const inputRef          = useRef(null);
 
-  // Normalise to { value, label }
-  const normalised = options.map((o) =>
+  const normalised = (options || []).map((o) =>
     typeof o === "string" ? { value: o, label: o } : { value: o.value ?? o, label: o.label ?? o.value ?? o }
   );
-
   const filtered = query
-    ? normalised.filter((o) => o.label.toLowerCase().includes(query.toLowerCase()))
+    ? normalised.filter((o) => String(o.label).toLowerCase().includes(query.toLowerCase()))
     : normalised;
-
   const selectedLabel = normalised.find((o) => o.value === value)?.label ?? "";
 
-  // Close on outside click
   useEffect(() => {
     const h = (e) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target)) {
-        setOpen(false); setQuery("");
-      }
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) { setOpen(false); setQuery(""); }
     };
     document.addEventListener("mousedown", h);
     return () => document.removeEventListener("mousedown", h);
   }, []);
-
-  const handleOpen = () => {
-    if (disabled || loading) return;
-    setOpen((o) => !o);
-    setQuery("");
-    setTimeout(() => inputRef.current?.focus(), 60);
-  };
-
-  const handleSelect = (val) => {
-    onChange(val); setOpen(false); setQuery("");
-  };
 
   const showSearch = normalised.length > 6;
 
@@ -300,44 +325,29 @@ const SearchableSelect = ({ label, value, onChange, options, placeholder, disabl
       {label && (
         <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">{label}</label>
       )}
-
-      {/* Trigger button */}
-      <button
-        type="button"
-        onClick={handleOpen}
-        disabled={disabled || loading}
+      <button type="button" disabled={disabled || loading}
+        onClick={() => { if (disabled || loading) return; setOpen((o) => !o); setQuery(""); setTimeout(() => inputRef.current?.focus(), 60); }}
         className="w-full flex items-center justify-between gap-2 px-4 py-3 rounded-xl
           border border-slate-200 bg-white text-sm font-medium shadow-sm transition-all
           focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent
-          disabled:opacity-50 disabled:cursor-not-allowed hover:border-slate-300"
-      >
+          disabled:opacity-50 disabled:cursor-not-allowed hover:border-slate-300">
         <span className={selectedLabel ? "text-slate-800 truncate" : "text-slate-400"}>
           {loading ? "Loading…" : (selectedLabel || placeholder || "Select…")}
         </span>
         {loading
           ? <Loader2 size={14} className="animate-spin text-slate-400 shrink-0" />
-          : <ChevronDown size={14} className={`text-slate-400 shrink-0 transition-transform duration-200 ${open ? "rotate-180" : ""}`} />
-        }
+          : <ChevronDown size={14} className={`text-slate-400 shrink-0 transition-transform duration-200 ${open ? "rotate-180" : ""}`} />}
       </button>
 
-      {/* Dropdown panel */}
       {open && (
-        <div
-          className="absolute left-0 right-0 top-full mt-1.5 bg-white rounded-xl border border-slate-200 shadow-xl overflow-hidden z-50"
-          style={{ minWidth: 200 }}
-        >
-          {/* Search input — only when > 6 options */}
+        <div className="absolute left-0 right-0 top-full mt-1.5 bg-white rounded-xl border border-slate-200 shadow-xl overflow-hidden z-50"
+          style={{ minWidth: 200 }}>
           {showSearch && (
             <div className="flex items-center gap-2 px-3 py-2.5 border-b border-slate-100 bg-slate-50">
               <Search size={13} className="text-slate-400 shrink-0" />
-              <input
-                ref={inputRef}
-                type="text"
-                value={query}
+              <input ref={inputRef} type="text" value={query} placeholder="Search…"
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search…"
-                className="flex-1 text-sm text-slate-700 bg-transparent outline-none placeholder:text-slate-400"
-              />
+                className="flex-1 text-sm text-slate-700 bg-transparent outline-none placeholder:text-slate-400" />
               {query && (
                 <button onClick={() => setQuery("")} className="text-slate-400 hover:text-slate-600 shrink-0">
                   <X size={12} />
@@ -345,172 +355,48 @@ const SearchableSelect = ({ label, value, onChange, options, placeholder, disabl
               )}
             </div>
           )}
-
-          {/* Option list */}
           <ul className="overflow-y-auto" style={{ maxHeight: 220 }}>
             {filtered.length === 0 ? (
-              <li className="px-4 py-3 text-sm text-slate-400 text-center">No results found</li>
-            ) : (
-              filtered.map((o) => (
-                <li key={o.value}>
-                  <button
-                    type="button"
-                    onClick={() => handleSelect(o.value)}
-                    className={`w-full text-left px-4 py-2.5 text-sm transition-colors
-                      ${o.value === value
-                        ? "bg-blue-50 text-blue-700 font-semibold"
-                        : "text-slate-700 hover:bg-slate-50"}`}
-                  >
-                    {o.label}
-                  </button>
-                </li>
-              ))
-            )}
+              <li className="px-4 py-3 text-sm text-slate-400 text-center">Nothing matches that search</li>
+            ) : filtered.map((o) => (
+              <li key={o.value}>
+                <button type="button" onClick={() => { onChange(o.value); setOpen(false); setQuery(""); }}
+                  className={`w-full text-left px-4 py-2.5 text-sm transition-colors ${
+                    o.value === value ? "bg-blue-50 text-blue-700 font-semibold" : "text-slate-700 hover:bg-slate-50"
+                  }`}>
+                  {o.label}
+                </button>
+              </li>
+            ))}
           </ul>
-
-          {/* Footer: result count when actively filtering */}
-          {showSearch && query && (
-            <div className="px-4 py-1.5 bg-slate-50 border-t border-slate-100 text-xs text-slate-400">
-              {filtered.length} of {normalised.length} shown
-            </div>
-          )}
         </div>
       )}
     </div>
   );
 };
 
-// ─────────────────────────────────────────────
-// PAGINATED FILES TABLE  (10 rows + Load More)
-// ─────────────────────────────────────────────
-const FilesTable = ({ files, loading, onDownload, showDataType = false }) => {
+const Paginated = ({ items, renderRow, columns, emptyTitle, emptyHint, loading, accent = "blue" }) => {
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
-
-  useEffect(() => { setVisibleCount(PAGE_SIZE); }, [files]);
-
-  if (loading) return (
-    <div className="flex flex-col items-center py-16 gap-3">
-      <Loader2 size={28} className="animate-spin text-blue-400" />
-      <p className="text-sm text-slate-400">Loading archive…</p>
-    </div>
-  );
-  if (!files.length) return (
-    <div className="flex flex-col items-center py-16 gap-3">
-      <div className="w-14 h-14 rounded-2xl bg-slate-100 flex items-center justify-center">
-        <Cloud size={24} className="text-slate-400" />
-      </div>
-      <p className="text-slate-600 font-medium text-sm">No files yet</p>
-      <p className="text-slate-400 text-xs">Export data to create the first archive entry</p>
-    </div>
-  );
-
-  const sorted  = [...files].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  const visible = sorted.slice(0, visibleCount);
-  const hasMore = visibleCount < sorted.length;
-
-  return (
-    <>
-      <div className="overflow-x-auto rounded-xl border border-slate-200">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="bg-slate-50 border-b border-slate-200">
-              {["File Name", "Export Date", showDataType && "Data Type", "Records", "Uploaded At", ""]
-                .filter(Boolean)
-                .map((h) => (
-                  <th key={h} className="px-5 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">
-                    {h}
-                  </th>
-                ))}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100">
-            {visible.map((file) => (
-              <tr key={file.id} className="hover:bg-blue-50/40 transition-colors">
-                <td className="px-5 py-3.5">
-                  <div className="flex items-center gap-2">
-                    <FileSpreadsheet size={15} className="text-green-600 shrink-0" />
-                    <span className="text-slate-700 font-medium truncate max-w-[200px]">{file.file_name}</span>
-                  </div>
-                </td>
-                <td className="px-5 py-3.5 text-slate-500 whitespace-nowrap">{fmtDate(file.export_date)}</td>
-                {showDataType && (
-                  <td className="px-5 py-3.5">
-                    <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
-                      file.data_type === "Reactivated"
-                        ? "bg-violet-100 text-violet-700"
-                        : "bg-teal-100 text-teal-700"
-                    }`}>
-                      {file.data_type === "Reactivated" ? "Reactivated" : "Normal"}
-                    </span>
-                  </td>
-                )}
-                <td className="px-5 py-3.5">
-                  <span className="px-2.5 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-semibold tabular-nums">
-                    {fmt(file.record_count)}
-                  </span>
-                </td>
-                <td className="px-5 py-3.5 text-slate-400 text-xs whitespace-nowrap">{fmtDateTime(file.created_at)}</td>
-                <td className="px-5 py-3.5">
-                  <button onClick={() => onDownload(file)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-600
-                      bg-blue-50 hover:bg-blue-600 hover:text-white rounded-lg transition-all">
-                    <Download size={13} /> Download
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {/* Pagination footer */}
-      <div className="flex items-center justify-between mt-3 px-1">
-        <p className="text-xs text-slate-400">
-          Showing <span className="font-semibold text-slate-600">{visible.length}</span> of{" "}
-          <span className="font-semibold text-slate-600">{sorted.length}</span> files
-        </p>
-        {hasMore && (
-          <button
-            onClick={() => setVisibleCount((c) => c + PAGE_SIZE)}
-            className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-blue-600
-              bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-all">
-            Load more
-            <span className="ml-0.5 px-1.5 py-0.5 bg-blue-200 text-blue-700 rounded-full text-xs">
-              {sorted.length - visibleCount} left
-            </span>
-          </button>
-        )}
-      </div>
-    </>
-  );
-};
-
-// ─────────────────────────────────────────────
-// PAGINATED HISTORY TABLE  (10 rows + Load More)
-// ─────────────────────────────────────────────
-const HistoryTable = ({ runs, loading, onDownload }) => {
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
-
-  useEffect(() => { setVisibleCount(PAGE_SIZE); }, [runs]);
+  useEffect(() => { setVisibleCount(PAGE_SIZE); }, [items]);
 
   if (loading) return (
     <div className="flex flex-col items-center py-14 gap-3">
-      <Loader2 size={26} className="animate-spin text-indigo-400" />
-      <p className="text-sm text-slate-400">Loading history…</p>
+      <Loader2 size={26} className="animate-spin text-slate-300" />
+      <p className="text-sm text-slate-400">Loading…</p>
     </div>
   );
-  if (!runs.length) return (
+  if (!items.length) return (
     <div className="flex flex-col items-center py-14 gap-3">
       <div className="w-12 h-12 rounded-xl bg-slate-100 flex items-center justify-center">
         <Cloud size={22} className="text-slate-400" />
       </div>
-      <p className="text-slate-500 text-sm font-medium">No matchoff runs yet</p>
+      <p className="text-slate-600 font-medium text-sm">{emptyTitle}</p>
+      {emptyHint && <p className="text-slate-400 text-xs">{emptyHint}</p>}
     </div>
   );
 
-  const sorted  = [...runs].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  const visible = sorted.slice(0, visibleCount);
-  const hasMore = visibleCount < sorted.length;
+  const visible = items.slice(0, visibleCount);
+  const hasMore = visibleCount < items.length;
 
   return (
     <>
@@ -518,89 +404,28 @@ const HistoryTable = ({ runs, loading, onDownload }) => {
         <table className="w-full text-sm">
           <thead>
             <tr className="bg-slate-50 border-b border-slate-200">
-              {["Source", "Date", "File", "Input rows", "Matched", "Match %", "Run at", ""].map((h) => (
+              {columns.filter(Boolean).map((h) => (
                 <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">
                   {h}
                 </th>
               ))}
             </tr>
           </thead>
-          <tbody className="divide-y divide-slate-100">
-            {visible.map((run) => {
-              const pct = run.input_row_count > 0
-                ? Math.round((run.matched_count / run.input_row_count) * 100) : 0;
-              return (
-                <tr key={run.id} className="hover:bg-indigo-50/30 transition-colors">
-                  <td className="px-4 py-3.5">
-                    <span className={`px-2.5 py-1 rounded-full text-xs font-semibold whitespace-nowrap ${
-                      run.source_container === "fri-exports"
-                        ? "bg-blue-100 text-blue-700"
-                        : "bg-teal-100 text-teal-700"
-                    }`}>
-                      {run.source_container === "fri-exports" ? "FRI" : "MNRL"}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3.5 text-slate-500 whitespace-nowrap text-xs font-mono">
-                    {run.source_date_folder}
-                  </td>
-                  <td className="px-4 py-3.5">
-                    <div className="flex items-center gap-1.5">
-                      <FileSpreadsheet size={13} className="text-green-600 shrink-0" />
-                      <span className="text-slate-700 truncate max-w-[160px] text-xs" title={run.source_file_name}>
-                        {run.source_file_name}
-                      </span>
-                    </div>
-                  </td>
-                  <td className="px-4 py-3.5">
-                    <span className="px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full text-xs font-semibold tabular-nums">
-                      {fmt(run.input_row_count)}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3.5">
-                    <span className="px-2 py-0.5 bg-indigo-100 text-indigo-700 rounded-full text-xs font-semibold tabular-nums">
-                      {fmt(run.matched_count)}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3.5">
-                    <div className="flex items-center gap-2">
-                      <div className="w-14 h-1.5 bg-slate-200 rounded-full overflow-hidden">
-                        <div className="h-1.5 bg-indigo-500 rounded-full" style={{ width: `${pct}%` }} />
-                      </div>
-                      <span className="text-xs text-slate-500 tabular-nums">{pct}%</span>
-                    </div>
-                  </td>
-                  <td className="px-4 py-3.5 text-slate-400 text-xs whitespace-nowrap">
-                    {fmtDateTime(run.created_at)}
-                  </td>
-                  <td className="px-4 py-3.5">
-                    <button onClick={() => onDownload(run)}
-                      className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold
-                        text-indigo-600 bg-indigo-50 hover:bg-indigo-600 hover:text-white
-                        rounded-lg transition-all whitespace-nowrap">
-                      <Download size={12} /> Download
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
+          <tbody className="divide-y divide-slate-100">{visible.map(renderRow)}</tbody>
         </table>
       </div>
-
-      {/* Pagination footer */}
       <div className="flex items-center justify-between mt-3 px-1">
         <p className="text-xs text-slate-400">
           Showing <span className="font-semibold text-slate-600">{visible.length}</span> of{" "}
-          <span className="font-semibold text-slate-600">{sorted.length}</span> runs
+          <span className="font-semibold text-slate-600">{items.length}</span>
         </p>
         {hasMore && (
-          <button
-            onClick={() => setVisibleCount((c) => c + PAGE_SIZE)}
-            className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-indigo-600
-              bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg transition-all">
+          <button onClick={() => setVisibleCount((c) => c + PAGE_SIZE)}
+            className={`flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-${accent}-600
+              bg-${accent}-50 hover:bg-${accent}-100 border border-${accent}-200 rounded-lg transition-all`}>
             Load more
-            <span className="ml-0.5 px-1.5 py-0.5 bg-indigo-200 text-indigo-700 rounded-full text-xs">
-              {sorted.length - visibleCount} left
+            <span className={`ml-0.5 px-1.5 py-0.5 bg-${accent}-200 text-${accent}-700 rounded-full text-xs`}>
+              {items.length - visibleCount} left
             </span>
           </button>
         )}
@@ -610,17 +435,60 @@ const HistoryTable = ({ runs, loading, onDownload }) => {
 };
 
 // ─────────────────────────────────────────────
-// FRI MODULE
+// TAB 1 & 2 — DOWNLOAD (FRI / MNRL)
 // ─────────────────────────────────────────────
+const FilesTable = ({ files, loading, onDownload, showDataType = false }) => (
+  <Paginated
+    items={[...files].sort((a, b) => new Date(b.created_at) - new Date(a.created_at))}
+    loading={loading}
+    emptyTitle="No files yet"
+    emptyHint="Download a day's data to create the first entry"
+    columns={["File name", "Data date", showDataType && "Type", "Records", "Saved at", ""]}
+    renderRow={(file) => (
+      <tr key={file.id} className="hover:bg-blue-50/40 transition-colors">
+        <td className="px-4 py-3.5">
+          <div className="flex items-center gap-2">
+            <FileSpreadsheet size={15} className="text-green-600 shrink-0" />
+            <span className="text-slate-700 font-medium truncate max-w-[220px]" title={file.file_name}>
+              {file.file_name}
+            </span>
+          </div>
+        </td>
+        <td className="px-4 py-3.5 text-slate-500 whitespace-nowrap">{fmtDate(file.export_date)}</td>
+        {showDataType && (
+          <td className="px-4 py-3.5">
+            <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
+              file.data_type === "Reactivated" ? "bg-violet-100 text-violet-700" : "bg-teal-100 text-teal-700"
+            }`}>{file.data_type || "Normal"}</span>
+          </td>
+        )}
+        <td className="px-4 py-3.5">
+          <span className="px-2.5 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-semibold tabular-nums">
+            {fmt(file.record_count)}
+          </span>
+        </td>
+        <td className="px-4 py-3.5 text-slate-400 text-xs whitespace-nowrap">{fmtDateTime(file.created_at)}</td>
+        <td className="px-4 py-3.5">
+          <button onClick={() => onDownload(file)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-600
+              bg-blue-50 hover:bg-blue-600 hover:text-white rounded-lg transition-all">
+            <Download size={13} /> Download
+          </button>
+        </td>
+      </tr>
+    )}
+  />
+);
+
 const FRIModule = () => {
-  const [date, setDate]             = useState(today());
-  const [count, setCount]           = useState(null);
-  const [recordCount, setRecordCount] = useState(0); // used by poller
-  const [files, setFiles]           = useState([]);
-  const [loadingFiles, setLF]       = useState(true);
-  const [starting, setStarting]     = useState(false);
-  const [jobId, setJobId]           = useState(null);
-  const [alert, setAlert]           = useState(null);
+  const [date, setDate]         = useState(today());
+  const [count, setCount]       = useState(null);
+  const [recordCount, setRC]    = useState(0);
+  const [files, setFiles]       = useState([]);
+  const [loadingFiles, setLF]   = useState(true);
+  const [starting, setStarting] = useState(false);
+  const [jobId, setJobId]       = useState(null);
+  const [alert, setAlert]       = useState(null);
 
   const showAlert = (type, message) => {
     setAlert({ type, message });
@@ -630,23 +498,22 @@ const FRIModule = () => {
   const loadFiles = useCallback(async () => {
     setLF(true);
     try { setFiles(await api.listFiles("FRI")); }
-    catch (e) { showAlert("error", "Failed to load archive: " + e.message); }
+    catch (e) { showAlert("error", `Couldn't load the archive: ${e.message}`); }
     finally { setLF(false); }
   }, []);
 
   const handleDateChange = async (d) => {
     setDate(d); setCount(null);
-    try { const r = await api.fetchFRICount(d); setCount(r.count); }
-    catch { /* silent */ }
+    try { const r = await api.fetchFRICount(d); setCount(r.count); } catch { /* silent */ }
   };
 
-  const handleExport = async () => {
+  const handleDownload = async () => {
     setStarting(true); setAlert(null);
     try {
       const r = await api.fetchFRICount(date);
       setCount(r.count);
-      if (r.count === 0) { showAlert("warning", "No records for selected date."); return; }
-      setRecordCount(r.count);           // ← tell poller how many records
+      if (r.count === 0) { showAlert("warning", "Nothing published for that date."); return; }
+      setRC(r.count);
       const job = await api.startFRIExport(date);
       setJobId(job.job_id);
     } catch (e) { showAlert("error", e.message); }
@@ -654,91 +521,69 @@ const FRIModule = () => {
   };
 
   useJobPoller({
-    jobId,
-    recordCount,                         // ← drives slow/fast phase duration
+    jobId, recordCount,
     onDone: async (result) => {
       setJobId(null); await loadFiles();
-      showAlert("success", `✓ Exported ${fmt(result.record_count)} records → saved to Azure Blob`);
+      showAlert("success", `Downloaded ${fmt(result.record_count)} records. Reconcile them next.`);
     },
     onFailed: (err) => { setJobId(null); showAlert("error", err); },
   });
 
-  const handleDownload = async (file) => {
-    try {
-      const { url, file_name } = await api.getDownloadUrl(file.id, "FRI");
-      triggerBlobDownload(url, file_name);
-    } catch (e) { showAlert("error", "Download failed: " + e.message); }
-  };
-
   useEffect(() => { loadFiles(); }, [loadFiles]);
   useEffect(() => { handleDateChange(date); }, []); // eslint-disable-line
 
-  const isExporting = starting || !!jobId;
-
   return (
     <div className="space-y-6">
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-        <div className="flex items-center gap-3 mb-6">
-          <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center">
-            <Database size={18} className="text-white" />
-          </div>
-          <div>
-            <h2 className="text-lg font-bold text-slate-800">FRI Data Export</h2>
-            <p className="text-xs text-slate-400">Azure Blob · PostgreSQL metadata · Background processing</p>
-          </div>
-        </div>
-
+      <SectionCard icon={Database} iconBg="bg-blue-600" title="FRI data"
+        subtitle="Pull a day's Financial Fraud Risk Indicator list and store it">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
-          <DatePicker value={date} onChange={handleDateChange} label="Select Export Date" />
-          <CountBadge label="FRI Records" count={count} color="blue" />
+          <DatePicker value={date} onChange={handleDateChange} label="Data date" />
+          <CountBadge label="Available" count={count} color="blue" />
           <div className="rounded-xl border border-slate-200 p-4 flex flex-col gap-2 justify-center bg-slate-50">
-            <div className="flex items-center gap-2 text-slate-400 text-xs font-medium"><Cloud size={14} /> Azure Blob Storage</div>
-            <div className="flex items-center gap-2 text-slate-400 text-xs font-medium"><HardDrive size={14} /> PostgreSQL Metadata</div>
-            <div className="flex items-center gap-2 text-slate-400 text-xs font-medium"><Shield size={14} /> SAS-Token Downloads</div>
+            <div className="flex items-center gap-2 text-slate-400 text-xs font-medium"><Cloud size={14} /> Stored in Azure Blob</div>
+            <div className="flex items-center gap-2 text-slate-400 text-xs font-medium"><HardDrive size={14} /> Indexed in PostgreSQL</div>
+            <div className="flex items-center gap-2 text-slate-400 text-xs font-medium"><Shield size={14} /> Time-limited download links</div>
           </div>
         </div>
+        <PrimaryBtn onClick={handleDownload} loading={starting}
+          disabled={count === 0 || starting || !!jobId} label="Download FRI data" />
+        {jobId && <RunningBanner title="Downloading and saving…" subtitle="Running in the background" />}
+        {alert && <Alert {...alert} onClose={() => setAlert(null)} />}
+      </SectionCard>
 
-        <ExportBtn onClick={handleExport} loading={starting}
-          disabled={count === 0 || isExporting} label="Export FRI Data → Azure Blob" />
-
-        {jobId && <ExportProgress label="Export in progress — building Excel & uploading to Blob…" />}
-        {alert && <Alert type={alert.type} message={alert.message} onClose={() => setAlert(null)} />}
-      </div>
-
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-        <div className="flex items-center justify-between mb-5">
-          <div className="flex items-center gap-2">
-            <BarChart3 size={18} className="text-blue-600" />
-            <h3 className="font-bold text-slate-800">FRI Archive</h3>
-            <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-xs font-semibold rounded-full">{files.length} files</span>
-          </div>
+      <SectionCard icon={BarChart3} iconBg="bg-blue-500" title="FRI archive"
+        subtitle={`${files.length} file${files.length === 1 ? "" : "s"}`}
+        action={
           <button onClick={loadFiles} disabled={loadingFiles}
             className="flex items-center gap-1.5 text-xs text-blue-600 hover:text-blue-800 font-medium px-3 py-1.5 hover:bg-blue-50 rounded-lg transition-colors">
             <RefreshCw size={13} className={loadingFiles ? "animate-spin" : ""} /> Refresh
           </button>
-        </div>
-        <FilesTable files={files} loading={loadingFiles} onDownload={handleDownload} />
-      </div>
+        }>
+        <FilesTable files={files} loading={loadingFiles}
+          onDownload={async (f) => {
+            try {
+              const { url, file_name } = await api.getDownloadUrl(f.id, "FRI");
+              triggerBlobDownload(url, file_name);
+            } catch (e) { showAlert("error", `Download failed: ${e.message}`); }
+          }} />
+      </SectionCard>
     </div>
   );
 };
 
-// ─────────────────────────────────────────────
-// MNRL MODULE
-// ─────────────────────────────────────────────
 const MNRLModule = () => {
-  const [date, setDate]               = useState(today());
-  const [normalCount, setNC]          = useState(null);
-  const [reactCount, setRC]           = useState(null);
-  const [rcNormal, setRcNormal]       = useState(0); // poller record counts
-  const [rcReact, setRcReact]         = useState(0);
-  const [files, setFiles]             = useState([]);
-  const [loadingFiles, setLF]         = useState(true);
-  const [startingNormal, setSN]       = useState(false);
-  const [startingReact, setSR]        = useState(false);
-  const [jobNormal, setJobNormal]     = useState(null);
-  const [jobReact, setJobReact]       = useState(null);
-  const [alert, setAlert]             = useState(null);
+  const [date, setDate]       = useState(today());
+  const [normalCount, setNC]  = useState(null);
+  const [reactCount, setRC]   = useState(null);
+  const [rcNormal, setRcN]    = useState(0);
+  const [rcReact, setRcR]     = useState(0);
+  const [files, setFiles]     = useState([]);
+  const [loadingFiles, setLF] = useState(true);
+  const [startingN, setSN]    = useState(false);
+  const [startingR, setSR]    = useState(false);
+  const [jobNormal, setJN]    = useState(null);
+  const [jobReact, setJR]     = useState(null);
+  const [alert, setAlert]     = useState(null);
 
   const showAlert = (type, message) => {
     setAlert({ type, message });
@@ -748,166 +593,158 @@ const MNRLModule = () => {
   const loadFiles = useCallback(async () => {
     setLF(true);
     try { setFiles(await api.listFiles("MNRL")); }
-    catch (e) { showAlert("error", "Failed to load archive: " + e.message); }
+    catch (e) { showAlert("error", `Couldn't load the archive: ${e.message}`); }
     finally { setLF(false); }
   }, []);
 
   const fetchCounts = async (d) => {
-    const [n, r] = await Promise.allSettled([
-      api.fetchMNRLCount(d),
-      api.fetchMNRLCountReactivated(d),
-    ]);
+    const [n, r] = await Promise.allSettled([api.fetchMNRLCount(d), api.fetchMNRLCountReactivated(d)]);
     setNC(n.status === "fulfilled" ? n.value.count : null);
     setRC(r.status === "fulfilled" ? r.value.count : null);
   };
 
-  const handleDateChange = async (d) => {
-    setDate(d); setNC(null); setRC(null);
-    await fetchCounts(d);
-  };
+  const start = async (dataType) => {
+    const setBusy = dataType === "Normal" ? setSN : setSR;
+    const count   = dataType === "Normal" ? normalCount : reactCount;
+    const setRc   = dataType === "Normal" ? setRcN : setRcR;
+    const setJob  = dataType === "Normal" ? setJN : setJR;
 
-  const handleExportNormal = async () => {
-    setSN(true); setAlert(null);
+    setBusy(true); setAlert(null);
     try {
-      if (normalCount === 0) { showAlert("warning", "No normal records for selected date."); return; }
-      setRcNormal(normalCount ?? 0);     // ← tell poller
-      const job = await api.startMNRLExport(date, "Normal");
-      setJobNormal(job.job_id);
+      if (count === 0) { showAlert("warning", `Nothing published for ${dataType.toLowerCase()} on that date.`); return; }
+      setRc(count ?? 0);
+      const job = await api.startMNRLExport(date, dataType);
+      setJob(job.job_id);
     } catch (e) { showAlert("error", e.message); }
-    finally { setSN(false); }
-  };
-
-  const handleExportReactivated = async () => {
-    setSR(true); setAlert(null);
-    try {
-      if (reactCount === 0) { showAlert("warning", "No reactivated records for selected date."); return; }
-      setRcReact(reactCount ?? 0);       // ← tell poller
-      const job = await api.startMNRLExport(date, "Reactivated");
-      setJobReact(job.job_id);
-    } catch (e) { showAlert("error", e.message); }
-    finally { setSR(false); }
+    finally { setBusy(false); }
   };
 
   useJobPoller({
-    jobId: jobNormal,
-    recordCount: rcNormal,               // ← drives slow/fast phase
-    onDone: async (result) => {
-      setJobNormal(null); await loadFiles();
-      showAlert("success", `✓ Exported ${fmt(result.record_count)} Normal records → Azure Blob`);
-    },
-    onFailed: (err) => { setJobNormal(null); showAlert("error", err); },
+    jobId: jobNormal, recordCount: rcNormal,
+    onDone: async (r) => { setJN(null); await loadFiles(); showAlert("success", `Downloaded ${fmt(r.record_count)} normal records.`); },
+    onFailed: (e) => { setJN(null); showAlert("error", e); },
   });
-
   useJobPoller({
-    jobId: jobReact,
-    recordCount: rcReact,                // ← drives slow/fast phase
-    onDone: async (result) => {
-      setJobReact(null); await loadFiles();
-      showAlert("success", `✓ Exported ${fmt(result.record_count)} Reactivated records → Azure Blob`);
-    },
-    onFailed: (err) => { setJobReact(null); showAlert("error", err); },
+    jobId: jobReact, recordCount: rcReact,
+    onDone: async (r) => { setJR(null); await loadFiles(); showAlert("success", `Downloaded ${fmt(r.record_count)} reactivated records.`); },
+    onFailed: (e) => { setJR(null); showAlert("error", e); },
   });
-
-  const handleDownload = async (file) => {
-    try {
-      const { url, file_name } = await api.getDownloadUrl(file.id, "MNRL");
-      triggerBlobDownload(url, file_name);
-    } catch (e) { showAlert("error", "Download failed: " + e.message); }
-  };
 
   useEffect(() => { loadFiles(); }, [loadFiles]);
   useEffect(() => { fetchCounts(date); }, []); // eslint-disable-line
 
+  const busy = !!jobNormal || !!jobReact;
+
   return (
     <div className="space-y-6">
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-        <div className="flex items-center gap-3 mb-6">
-          <div className="w-10 h-10 rounded-xl bg-teal-600 flex items-center justify-center">
-            <Database size={18} className="text-white" />
-          </div>
-          <div>
-            <h2 className="text-lg font-bold text-slate-800">MNRL Data Export</h2>
-            <p className="text-xs text-slate-400">Normal & Reactivated · Azure Blob · Background processing</p>
-          </div>
-        </div>
-
+      <SectionCard icon={Database} iconBg="bg-teal-600" title="MNRL data"
+        subtitle="Pull a day's revoked and reactivated number lists">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
-          <DatePicker value={date} onChange={handleDateChange} label="Select Export Date" />
-          <CountBadge label="Normal Records"      count={normalCount} color="teal" />
-          <CountBadge label="Reactivated Records" count={reactCount}  color="violet" />
+          <DatePicker value={date} onChange={(d) => { setDate(d); setNC(null); setRC(null); fetchCounts(d); }} label="Data date" />
+          <CountBadge label="Normal" count={normalCount} color="teal" />
+          <CountBadge label="Reactivated" count={reactCount} color="violet" />
         </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-2">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div>
-            <ExportBtn onClick={handleExportNormal} loading={startingNormal}
-              disabled={normalCount === 0 || !!jobNormal || !!jobReact}
-              label="Export Normal → Azure Blob" />
-            {jobNormal && <ExportProgress label="Normal export running…" />}
+            <PrimaryBtn onClick={() => start("Normal")} loading={startingN}
+              disabled={normalCount === 0 || busy}
+              gradient="linear-gradient(135deg, #0d9488, #0891b2)" label="Download normal" />
+            {jobNormal && <RunningBanner title="Downloading normal list…" subtitle="Running in the background" />}
           </div>
           <div>
-            <ExportBtn onClick={handleExportReactivated} loading={startingReact}
-              disabled={reactCount === 0 || !!jobReact || !!jobNormal}
-              label="Export Reactivated → Azure Blob" />
-            {jobReact && <ExportProgress label="Reactivated export running…" />}
+            <PrimaryBtn onClick={() => start("Reactivated")} loading={startingR}
+              disabled={reactCount === 0 || busy}
+              gradient="linear-gradient(135deg, #7c3aed, #6d28d9)" label="Download reactivated" />
+            {jobReact && <RunningBanner title="Downloading reactivated list…" subtitle="Running in the background" />}
           </div>
         </div>
+        {alert && <Alert {...alert} onClose={() => setAlert(null)} />}
+      </SectionCard>
 
-        {alert && <Alert type={alert.type} message={alert.message} onClose={() => setAlert(null)} />}
-      </div>
-
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-        <div className="flex items-center justify-between mb-5">
-          <div className="flex items-center gap-2">
-            <BarChart3 size={18} className="text-teal-600" />
-            <h3 className="font-bold text-slate-800">MNRL Archive</h3>
-            <span className="px-2 py-0.5 bg-teal-100 text-teal-700 text-xs font-semibold rounded-full">{files.length} files</span>
-          </div>
+      <SectionCard icon={BarChart3} iconBg="bg-teal-500" title="MNRL archive"
+        subtitle={`${files.length} file${files.length === 1 ? "" : "s"}`}
+        action={
           <button onClick={loadFiles} disabled={loadingFiles}
             className="flex items-center gap-1.5 text-xs text-teal-600 hover:text-teal-800 font-medium px-3 py-1.5 hover:bg-teal-50 rounded-lg transition-colors">
             <RefreshCw size={13} className={loadingFiles ? "animate-spin" : ""} /> Refresh
           </button>
-        </div>
-        <FilesTable files={files} loading={loadingFiles} onDownload={handleDownload} showDataType />
-      </div>
+        }>
+        <FilesTable files={files} loading={loadingFiles} showDataType
+          onDownload={async (f) => {
+            try {
+              const { url, file_name } = await api.getDownloadUrl(f.id, "MNRL");
+              triggerBlobDownload(url, file_name);
+            } catch (e) { showAlert("error", `Download failed: ${e.message}`); }
+          }} />
+      </SectionCard>
     </div>
   );
 };
 
 // ─────────────────────────────────────────────
-// MATCHOFF MODULE
+// TAB 3 — RECONCILE
 // ─────────────────────────────────────────────
-const MatchStatBar = ({ inputRows, matchedCount }) => {
-  const pct = inputRows > 0 ? Math.round((matchedCount / inputRows) * 100) : 0;
+const MasterFilters = ({ module, setModule, date, setDate, segment, setSegment,
+                         gho, setGho, dates, ghoCodes, loading, disabled }) => {
+  const ghoOptions = [
+    { value: "ALL", label: "All GHO codes" },
+    ...ghoCodes
+      .filter((g) => segment === "ALL" || g.segment === segment)
+      .map((g) => ({ value: g.gho_code, label: `${g.gho_code} · ${fmt(g.record_count)}` })),
+  ];
+  const dateOptions = [
+    { value: "ALL", label: "All dates in the window" },
+    ...dates.map((d) => ({ value: d.feed_date, label: `${d.feed_date} · ${fmt(d.record_count)}` })),
+  ];
+
   return (
-    <div className="rounded-xl border border-indigo-200 bg-indigo-50 p-4 mt-4">
-      <div className="flex items-baseline justify-between mb-2">
-        <span className="text-sm font-semibold text-indigo-700">Match result</span>
-        <span className="text-sm text-indigo-500 tabular-nums">
-          {fmt(matchedCount)} / {fmt(inputRows)} rows ({pct}%)
-        </span>
-      </div>
-      <div className="h-2.5 bg-indigo-200 rounded-full overflow-hidden">
-        <div className="h-2.5 bg-indigo-600 rounded-full transition-all duration-700"
-          style={{ width: `${pct}%` }} />
-      </div>
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <SegmentedControl label="Source" value={module} onChange={setModule} disabled={disabled}
+        options={[{ value: "FRI", label: "FRI" }, { value: "MNRL", label: "MNRL" }]} />
+      <SegmentedControl label="Classification" value={segment} onChange={(v) => { setSegment(v); setGho("ALL"); }}
+        disabled={disabled}
+        options={[
+          { value: "ALL", label: "Both" },
+          { value: "IWPB", label: "IWPB" },
+          { value: "Non-IWPB", label: "Non-IWPB" },
+        ]} />
+      <SearchableSelect label="Data date" value={date} onChange={setDate}
+        options={dateOptions} loading={loading} disabled={disabled} placeholder="All dates" />
+      <SearchableSelect label="GHO code" value={gho} onChange={setGho}
+        options={ghoOptions} loading={loading} disabled={disabled} placeholder="All GHO codes" />
     </div>
   );
 };
 
-const MatchoffModule = () => {
-  const [container, setContainer]     = useState("mnrl-exports");
-  const [folders, setFolders]         = useState([]);
-  const [selDate, setSelDate]         = useState("");
-  const [files, setFiles]             = useState([]);
-  const [selFile, setSelFile]         = useState("");
-  const [loadingFolders, setLF]       = useState(false);
-  const [loadingFiles, setLFiles]     = useState(false);
-  const [starting, setStarting]       = useState(false);
-  const [jobId, setJobId]             = useState(null);
-  const [lastResult, setLastResult]   = useState(null);
-  const [runs, setRuns]               = useState([]);
-  const [loadingRuns, setLoadingRuns] = useState(true);
-  const [alert, setAlert]             = useState(null);
+const ReconcileModule = () => {
+  // reconcile a file
+  const [container, setContainer]   = useState("mnrl-exports");
+  const [folders, setFolders]       = useState([]);
+  const [srcDate, setSrcDate]       = useState("");
+  const [srcFiles, setSrcFiles]     = useState([]);
+  const [srcFile, setSrcFile]       = useState("");
+  const [loadingFolders, setLFo]    = useState(false);
+  const [loadingSrcFiles, setLFi]   = useState(false);
+  const [startingRun, setSR]        = useState(false);
+  const [runJob, setRunJob]         = useState(null);
+  const [lastRun, setLastRun]       = useState(null);
+
+  // download from master
+  const [module, setModule]   = useState("MNRL");
+  const [mDate, setMDate]     = useState("ALL");
+  const [segment, setSegment] = useState("ALL");
+  const [gho, setGho]         = useState("ALL");
+  const [dates, setDates]     = useState([]);
+  const [ghoCodes, setGho2]   = useState([]);
+  const [loadingMeta, setLM]  = useState(false);
+  const [preview, setPreview] = useState(null);
+  const [dlJob, setDlJob]     = useState(null);
+  const [startingDl, setSD]   = useState(false);
+  const [lastFile, setLastFile] = useState(null);
+
+  const [runs, setRuns]       = useState([]);
+  const [loadingRuns, setLR]  = useState(true);
+  const [alert, setAlert]     = useState(null);
 
   const showAlert = (type, message) => {
     setAlert({ type, message });
@@ -915,241 +752,708 @@ const MatchoffModule = () => {
   };
 
   const loadFolders = useCallback(async (c) => {
-    setLF(true); setFolders([]); setSelDate(""); setFiles([]); setSelFile("");
+    setLFo(true); setFolders([]); setSrcDate(""); setSrcFiles([]); setSrcFile("");
     try {
-      const data = await api.fetchMatchoffFolders(c);
-      const list = data.folders || [];
+      const list = (await api.fetchReconcileFolders(c)).folders || [];
       setFolders(list);
-      if (list.length) setSelDate(list[0]);
-    } catch (e) { showAlert("error", "Failed to load date folders: " + e.message); }
-    finally { setLF(false); }
+      if (list.length) setSrcDate(list[0]);
+    } catch (e) { showAlert("error", `Couldn't list dates: ${e.message}`); }
+    finally { setLFo(false); }
   }, []);
 
-  const loadFiles = useCallback(async (c, d) => {
+  const loadSrcFiles = useCallback(async (c, d) => {
     if (!d) return;
-    setLFiles(true); setFiles([]); setSelFile("");
+    setLFi(true); setSrcFiles([]); setSrcFile("");
     try {
-      const data = await api.fetchMatchoffFiles(c, d);
-      const list = data.files || [];
-      setFiles(list);
-      if (list.length) setSelFile(list[0]);
-    } catch (e) { showAlert("error", "Failed to load files: " + e.message); }
-    finally { setLFiles(false); }
+      const list = (await api.fetchReconcileFiles(c, d)).files || [];
+      setSrcFiles(list);
+      if (list.length) setSrcFile(list[0]);
+    } catch (e) { showAlert("error", `Couldn't list files: ${e.message}`); }
+    finally { setLFi(false); }
   }, []);
 
-  const loadHistory = useCallback(async () => {
-    setLoadingRuns(true);
-    try { setRuns(await api.listMatchoffHistory()); }
-    catch (e) { showAlert("error", "Failed to load history: " + e.message); }
-    finally { setLoadingRuns(false); }
+  const loadMeta = useCallback(async (mod) => {
+    setLM(true);
+    try {
+      const [d, g] = await Promise.all([api.fetchMasterDates(mod), api.fetchGhoCodes(mod)]);
+      setDates(d.dates || []);
+      setGho2(g.gho_codes || []);
+    } catch (e) { showAlert("error", `Couldn't load filters: ${e.message}`); }
+    finally { setLM(false); }
   }, []);
 
-  const handleContainerChange = (c) => { setContainer(c); setLastResult(null); loadFolders(c); };
-  const handleDateChange = (d) => { setSelDate(d); setLastResult(null); loadFiles(container, d); };
+  const loadRuns = useCallback(async () => {
+    setLR(true);
+    try { setRuns(await api.listReconcileHistory()); }
+    catch (e) { showAlert("error", `Couldn't load history: ${e.message}`); }
+    finally { setLR(false); }
+  }, []);
 
-  const handleStart = async () => {
-    if (!selFile) { showAlert("warning", "Please select a file."); return; }
-    setStarting(true); setAlert(null); setLastResult(null);
+  const refreshPreview = useCallback(async () => {
     try {
-      const job = await api.startMatchoff(container, selDate, selFile); // mob_col fixed internally
-      setJobId(job.job_id);
+      setPreview(await api.fetchMasterCount({
+        type: module, date: mDate === "ALL" ? "" : mDate,
+        segment, gho_code: gho,
+      }));
+    } catch { setPreview(null); }
+  }, [module, mDate, segment, gho]);
+
+  useEffect(() => { loadFolders(container); loadRuns(); }, []); // eslint-disable-line
+  useEffect(() => { if (srcDate) loadSrcFiles(container, srcDate); }, [srcDate]); // eslint-disable-line
+  useEffect(() => { loadMeta(module); setMDate("ALL"); setGho("ALL"); }, [module, loadMeta]);
+  useEffect(() => { refreshPreview(); }, [refreshPreview]);
+
+  const handleReconcile = async () => {
+    if (!srcFile) { showAlert("warning", "Pick a file to reconcile."); return; }
+    setSR(true); setAlert(null); setLastRun(null);
+    try {
+      const job = await api.startReconcile(container, srcDate, srcFile);
+      setRunJob(job.job_id);
     } catch (e) { showAlert("error", e.message); }
-    finally { setStarting(false); }
+    finally { setSR(false); }
   };
 
   useJobPoller({
-    jobId,
-    recordCount: 0, // Matchoff row count is unknown until server reads Excel → always fast
+    jobId: runJob, recordCount: 0,
     onDone: async (result) => {
-      setJobId(null); setLastResult(result); await loadHistory();
-      showAlert("success", `Match-off complete — ${fmt(result.matched_count)} of ${fmt(result.input_row_count)} rows matched.`);
+      setRunJob(null); setLastRun(result);
+      await Promise.all([loadRuns(), loadMeta(module), refreshPreview()]);
+      const m = result.master || {};
+      showAlert("success",
+        `Reconciled ${fmt(result.matched_count)} of ${fmt(result.input_row_count)} rows. ` +
+        `${fmt(m.master_inserted)} new, ${fmt(m.master_updated)} updated in the master.`);
     },
-    onFailed: (err) => { setJobId(null); showAlert("error", err); },
+    onFailed: (e) => { setRunJob(null); showAlert("error", e); },
   });
 
-  const handleDownloadLatest = () => {
-    if (lastResult?.sas_url) triggerBlobDownload(lastResult.sas_url, lastResult.output_file);
-  };
-
-  const handleDownloadRun = async (run) => {
+  const handleDownload = async () => {
+    setSD(true); setAlert(null); setLastFile(null);
     try {
-      const { url, file_name } = await api.getMatchoffDownloadUrl(run.id);
-      triggerBlobDownload(url, file_name);
-    } catch (e) { showAlert("error", "Download failed: " + e.message); }
+      const job = await api.startMasterDownload({
+        type: module, date: mDate === "ALL" ? null : mDate,
+        segment, gho_code: gho,
+      });
+      setDlJob(job.job_id);
+    } catch (e) { showAlert("error", e.message); }
+    finally { setSD(false); }
   };
 
-  useEffect(() => { loadFolders(container); loadHistory(); }, []); // eslint-disable-line
-  useEffect(() => { if (selDate) loadFiles(container, selDate); }, [selDate]); // eslint-disable-line
+  useJobPoller({
+    jobId: dlJob, recordCount: preview?.count || 0,
+    onDone: (result) => {
+      setDlJob(null); setLastFile(result);
+      showAlert("success", `Built ${fmt(result.record_count)} rows across ${result.file_count} file(s).`);
+    },
+    onFailed: (e) => { setDlJob(null); showAlert("error", e); },
+  });
 
-  const isRunning = starting || !!jobId;
-  const canRun    = !isRunning && !!selFile && !!selDate;
+  const reconciling = startingRun || !!runJob;
+  const downloading = startingDl || !!dlJob;
 
   return (
     <div className="space-y-6">
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-        <div className="flex items-center gap-3 mb-6">
-          <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center">
-            <GitMerge size={18} className="text-white" />
+      {/* ── Step 1: reconcile a file into the master ── */}
+      <SectionCard icon={GitMerge} iconBg="bg-indigo-600" title="Reconcile a file"
+        subtitle="Match a downloaded list against HSBC customer data and write it to the master">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
+          <SearchableSelect label="Source" value={container} disabled={reconciling}
+            onChange={(c) => { setContainer(c); loadFolders(c); }}
+            options={[
+              { value: "fri-exports", label: "FRI downloads" },
+              { value: "mnrl-exports", label: "MNRL downloads" },
+            ]} />
+          <SearchableSelect label="Data date" value={srcDate} onChange={setSrcDate}
+            disabled={reconciling} loading={loadingFolders} options={folders}
+            placeholder="No dates available" />
+          <SearchableSelect label="File" value={srcFile} onChange={setSrcFile}
+            disabled={reconciling} loading={loadingSrcFiles} options={srcFiles}
+            placeholder="Pick a date first" />
+        </div>
+
+        {srcFile && (
+          <div className="flex flex-wrap items-center gap-2 text-xs bg-slate-50 rounded-xl px-4 py-3 mb-5 border border-slate-100">
+            <span className={`px-2 py-1 rounded font-semibold ${
+              container === "fri-exports" ? "bg-blue-100 text-blue-700" : "bg-teal-100 text-teal-700"
+            }`}>{container === "fri-exports" ? "FRI" : "MNRL"} · {srcDate}</span>
+            <ArrowRight size={12} className="text-slate-300" />
+            <span className="px-2 py-1 bg-amber-100 text-amber-700 rounded font-semibold">Match on HSBC data</span>
+            <ArrowRight size={12} className="text-slate-300" />
+            <span className="px-2 py-1 bg-green-100 text-green-700 rounded font-semibold">
+              {container === "fri-exports" ? "fri_master" : "mnrl_master"}
+            </span>
           </div>
-          <div>
-            <h2 className="text-lg font-bold text-slate-800">Mobile Number Match-off</h2>
+        )}
+
+        <PrimaryBtn onClick={handleReconcile} loading={startingRun} Icon={GitMerge}
+          disabled={!srcFile || reconciling}
+          gradient="linear-gradient(135deg, #4f46e5, #6d28d9)" label="Reconcile into master" />
+
+        {runJob && <RunningBanner tone="indigo" title="Matching against HSBC data…"
+          subtitle="Writing reconciled numbers to the master table" />}
+
+        {lastRun && !runJob && (
+          <div className="mt-4 rounded-xl border border-indigo-200 bg-indigo-50 p-4">
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+              <StatChip label="Rows read" value={lastRun.input_row_count} />
+              <StatChip label="Matched" value={lastRun.matched_count} tone="indigo" />
+              <StatChip label="New" value={lastRun.master?.master_inserted} tone="green" />
+              <StatChip label="Updated" value={lastRun.master?.master_updated} tone="blue" />
+              <StatChip label="Cleared" value={lastRun.master?.cleared} tone="amber" />
+              <StatChip label="Ignored (same-day conflict)" value={lastRun.master?.conflicts_ignored} tone="rose" />
+            </div>
+            {lastRun.master?.by_segment && (
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-3 pt-3 border-t border-indigo-200">
+                <StatChip label="IWPB" value={lastRun.master.by_segment.IWPB} tone="indigo" />
+                <StatChip label="Non-IWPB" value={lastRun.master.by_segment["Non-IWPB"]} tone="slate" />
+                {lastRun.master.by_segment.UNKNOWN > 0 && (
+                  <StatChip label="No GHO code" value={lastRun.master.by_segment.UNKNOWN} tone="rose" />
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </SectionCard>
+
+      {/* ── Step 2: download from the master ── */}
+      <SectionCard icon={Filter} iconBg="bg-emerald-600" title="Download reconciled data"
+        subtitle="Pulled straight from the master table — pick a date and classification">
+        <MasterFilters
+          module={module} setModule={setModule}
+          date={mDate} setDate={setMDate}
+          segment={segment} setSegment={setSegment}
+          gho={gho} setGho={setGho}
+          dates={dates} ghoCodes={ghoCodes}
+          loading={loadingMeta} disabled={downloading}
+        />
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 my-5">
+          <CountBadge label="Will download" count={preview?.count} color="slate" sub="active records" />
+          <CountBadge label="Awaiting ATR" count={preview?.atr_pending} color="amber" sub="of those records" />
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 flex flex-col justify-center gap-1.5">
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Selection</p>
+            <p className="text-sm text-slate-700 font-medium">
+              {module} · {segment === "ALL" ? "Both classifications" : segment}
+            </p>
             <p className="text-xs text-slate-400">
-              Pick source Excel from Blob · Match mob_num vs Azure SQL finalmob_num · Get cust_id
+              {mDate === "ALL" ? "All dates in the 90-day window" : mDate}
+              {gho !== "ALL" && ` · ${gho}`}
             </p>
           </div>
         </div>
 
-        {/* ── 3 cascade searchable dropdowns ── */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
-          <SearchableSelect
-            label="Source container"
-            value={container}
-            onChange={handleContainerChange}
-            disabled={isRunning}
-            options={[
-              { value: "fri-exports",  label: "FRI Exports" },
-              { value: "mnrl-exports", label: "MNRL Exports" },
-            ]}
-            placeholder="Select container"
-          />
-          <SearchableSelect
-            label="Date folder"
-            value={selDate}
-            onChange={handleDateChange}
-            disabled={isRunning}
-            loading={loadingFolders}
-            options={folders}
-            placeholder="No folders found"
-          />
-          <SearchableSelect
-            label="Excel file"
-            value={selFile}
-            onChange={(v) => { setSelFile(v); setLastResult(null); }}
-            disabled={isRunning}
-            loading={loadingFiles}
-            options={files}
-            placeholder="Select a date first"
-          />
-        </div>
+        <PrimaryBtn onClick={handleDownload} loading={startingDl} Icon={Download}
+          disabled={downloading || !preview?.count}
+          gradient="linear-gradient(135deg, #059669, #047857)" label="Build Excel and download" />
 
-        {/* Fixed mob_col info chip — read-only */}
-        <div className="flex items-center gap-2 mb-5 p-3 bg-slate-50 rounded-xl border border-slate-200">
-          <span className="text-xs text-slate-500 font-medium">Mobile number column:</span>
-          <code className="px-2.5 py-1 bg-white border border-slate-200 text-slate-700 rounded-lg text-xs font-mono font-semibold shadow-sm">
-            mob_num
-          </code>
-          <span className="text-xs text-slate-400 italic">· fixed, not editable</span>
-        </div>
+        {dlJob && <RunningBanner title="Building the workbook…"
+          subtitle="Streamed from the master; large sets split across files" />}
 
-        {/* Flow summary strip */}
-        {selFile && (
-          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400
-            bg-slate-50 rounded-xl px-4 py-3 mb-5 border border-slate-100">
-            <span className={`px-2 py-1 rounded font-semibold ${
-              container === "fri-exports" ? "bg-blue-100 text-blue-700" : "bg-teal-100 text-teal-700"
-            }`}>
-              {container}/{selDate}/
-            </span>
-            <span className="px-2 py-1 bg-slate-200 text-slate-600 rounded font-mono truncate max-w-[200px]">
-              {selFile}
-            </span>
-            <ArrowRight size={12} />
-            <span className="px-2 py-1 bg-amber-100 text-amber-700 rounded font-semibold">Azure SQL match</span>
-            <ArrowRight size={12} />
-            <span className="px-2 py-1 bg-green-100 text-green-700 rounded font-semibold">
-              matchoff-output/{selDate}/
-            </span>
-          </div>
-        )}
-
-        {/* Run button */}
-        <button
-          onClick={handleStart}
-          disabled={!canRun}
-          className="w-full flex items-center justify-center gap-2.5 px-5 py-3.5 rounded-xl
-            font-semibold text-sm transition-all shadow-md hover:shadow-lg
-            disabled:opacity-50 disabled:cursor-not-allowed"
-          style={{
-            background: canRun ? "linear-gradient(135deg, #4f46e5, #6d28d9)" : "#94a3b8",
-            color: "white",
-          }}
-        >
-          {starting
-            ? <><Loader2 size={16} className="animate-spin" /> Starting…</>
-            : isRunning
-            ? <><Loader2 size={16} className="animate-spin" /> Running match-off…</>
-            : <><GitMerge size={16} /> Run Match-off</>}
-        </button>
-
-        {/* Progress */}
-        {jobId && (
-          <div className="flex items-center gap-3 px-4 py-3 bg-indigo-50 border-l-4 border-indigo-500 rounded-lg mt-3">
-            <Loader2 size={18} className="animate-spin text-indigo-600 shrink-0" />
-            <div className="flex-1">
-              <p className="text-sm font-semibold text-indigo-800">
-                Reading Excel from Blob → querying Azure SQL → building matched output…
-              </p>
-              <p className="text-xs text-indigo-400 mt-0.5">Running in background · checking every 3s…</p>
-            </div>
-            <Clock size={15} className="text-indigo-400" />
-          </div>
-        )}
-
-        {/* Inline result after completion */}
-        {lastResult && !jobId && (
-          <div className="mt-2">
-            <MatchStatBar inputRows={lastResult.input_row_count} matchedCount={lastResult.matched_count} />
-            <button
-              onClick={handleDownloadLatest}
-              className="mt-3 w-full flex items-center justify-center gap-2 px-5 py-3 rounded-xl
+        {lastFile && !dlJob && (
+          <div className="mt-3">
+            <button onClick={() => triggerBlobDownload(lastFile.sas_url, lastFile.file_name)}
+              className="w-full flex items-center justify-center gap-2 px-5 py-3 rounded-xl
                 font-semibold text-sm bg-green-600 hover:bg-green-700 text-white transition-all shadow-md">
-              <Download size={16} /> Download {lastResult.output_file}
+              <Download size={16} /> {lastFile.file_name}
             </button>
+            {lastFile.file_count > 1 && (
+              <p className="text-xs text-slate-400 mt-2 text-center">
+                Split into {lastFile.file_count} files — the rest are in the {module} archive tab.
+              </p>
+            )}
           </div>
         )}
 
-        {alert && <Alert type={alert.type} message={alert.message} onClose={() => setAlert(null)} />}
-      </div>
+        {alert && <Alert {...alert} onClose={() => setAlert(null)} />}
+      </SectionCard>
 
-      {/* History */}
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-        <div className="flex items-center justify-between mb-5">
-          <div className="flex items-center gap-2">
-            <BarChart3 size={18} className="text-indigo-600" />
-            <h3 className="font-bold text-slate-800">Matchoff History</h3>
-            <span className="px-2 py-0.5 bg-indigo-100 text-indigo-700 text-xs font-semibold rounded-full">
-              {runs.length} runs
-            </span>
-          </div>
-          <button onClick={loadHistory} disabled={loadingRuns}
-            className="flex items-center gap-1.5 text-xs text-indigo-600 hover:text-indigo-800
-              font-medium px-3 py-1.5 hover:bg-indigo-50 rounded-lg transition-colors">
+      {/* ── History ── */}
+      <SectionCard icon={ListChecks} iconBg="bg-slate-600" title="Reconcile history"
+        subtitle={`${runs.length} run${runs.length === 1 ? "" : "s"}`}
+        action={
+          <button onClick={loadRuns} disabled={loadingRuns}
+            className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-800 font-medium px-3 py-1.5 hover:bg-slate-100 rounded-lg transition-colors">
             <RefreshCw size={13} className={loadingRuns ? "animate-spin" : ""} /> Refresh
           </button>
-        </div>
-        <HistoryTable runs={runs} loading={loadingRuns} onDownload={handleDownloadRun} />
-      </div>
+        }>
+        <Paginated items={runs} loading={loadingRuns} accent="indigo"
+          emptyTitle="No reconcile runs yet"
+          emptyHint="Reconcile a downloaded file to populate the master"
+          columns={["Source", "Date", "File", "Rows", "Matched", "New", "Ignored", "Run at"]}
+          renderRow={(run) => (
+            <tr key={run.id} className="hover:bg-indigo-50/30 transition-colors">
+              <td className="px-4 py-3.5">
+                <span className={`px-2.5 py-1 rounded-full text-xs font-semibold whitespace-nowrap ${
+                  run.module === "FRI" ? "bg-blue-100 text-blue-700" : "bg-teal-100 text-teal-700"
+                }`}>
+                  {run.module || (run.source_container === "fri-exports" ? "FRI" : "MNRL")}
+                  {run.data_type ? ` · ${run.data_type}` : ""}
+                </span>
+              </td>
+              <td className="px-4 py-3.5 text-slate-500 text-xs font-mono whitespace-nowrap">{run.source_date_folder}</td>
+              <td className="px-4 py-3.5">
+                <span className="text-slate-700 truncate max-w-[180px] text-xs block" title={run.source_file_name}>
+                  {run.source_file_name}
+                </span>
+              </td>
+              <td className="px-4 py-3.5 text-xs tabular-nums text-slate-600">{fmt(run.input_row_count)}</td>
+              <td className="px-4 py-3.5">
+                <span className="px-2 py-0.5 bg-indigo-100 text-indigo-700 rounded-full text-xs font-semibold tabular-nums">
+                  {fmt(run.matched_count)}
+                </span>
+              </td>
+              <td className="px-4 py-3.5 text-xs tabular-nums text-slate-600">{fmt(run.master_inserted)}</td>
+              <td className="px-4 py-3.5">
+                {run.conflicts_ignored > 0 ? (
+                  <span className="px-2 py-0.5 bg-rose-100 text-rose-700 rounded-full text-xs font-semibold tabular-nums">
+                    {fmt(run.conflicts_ignored)}
+                  </span>
+                ) : <span className="text-slate-300 text-xs">—</span>}
+              </td>
+              <td className="px-4 py-3.5 text-slate-400 text-xs whitespace-nowrap">{fmtDateTime(run.created_at)}</td>
+            </tr>
+          )} />
+      </SectionCard>
     </div>
   );
 };
 
 // ─────────────────────────────────────────────
-// HEADER + ROOT
+// TAB 4 — ATR
 // ─────────────────────────────────────────────
+const BOA_LABELS = {
+  "1": "Account freeze",
+  "2": "Credit and debit restriction",
+  "3": "Account not found / suspicious after EDD",
+  "7": "Service denied (loan, insurance, card)",
+  "8": "Debit restriction",
+  "9": "Rejected at onboarding",
+  "10": "Blacklisted",
+};
+const BOT_LABELS = { "5": "Transaction declined", "6": "User blacklisted" };
+
+const DefaultsCard = ({ module, def, onSave, saving }) => {
+  const [draft, setDraft] = useState(def);
+  const [dirty, setDirty] = useState(false);
+
+  useEffect(() => { setDraft(def); setDirty(false); }, [def]);
+
+  const set = (k, v) => { setDraft((d) => ({ ...d, [k]: v })); setDirty(true); };
+  const labels = draft.action_type === "BOT" ? BOT_LABELS : BOA_LABELS;
+
+  return (
+    <div className="rounded-xl border border-slate-200 p-4 bg-white">
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Users size={15} className={draft.segment === "IWPB" ? "text-indigo-600" : "text-slate-500"} />
+          <h4 className="font-bold text-slate-800 text-sm">{draft.segment}</h4>
+        </div>
+        <span className="text-xs text-slate-400">{module}</span>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <SegmentedControl label="Type" value={draft.action_type}
+          onChange={(v) => { set("action_type", v); set("action_taken", v === "BOT" ? "5" : "2"); }}
+          options={[{ value: "BOA", label: "BOA" }, { value: "BOT", label: "BOT" }]} />
+        <SearchableSelect label="Action taken" value={String(draft.action_taken)}
+          onChange={(v) => set("action_taken", v)}
+          options={Object.entries(labels).map(([code, text]) => ({ value: code, label: `${code} · ${text}` }))} />
+      </div>
+
+      <div className="flex flex-col gap-1.5 mb-3">
+        <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Investigation details</label>
+        <textarea rows={2} maxLength={500} value={draft.investigation_details || ""}
+          onChange={(e) => set("investigation_details", e.target.value)}
+          className="px-3 py-2 rounded-lg border border-slate-200 text-sm text-slate-700 resize-none
+            focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent" />
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <SegmentedControl label="Grievance received" value={draft.grievance_received || "No"}
+          onChange={(v) => set("grievance_received", v)}
+          options={[{ value: "No", label: "No" }, { value: "Yes", label: "Yes" }]} />
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Remarks</label>
+          <input type="text" maxLength={100} value={draft.remarks || ""}
+            onChange={(e) => set("remarks", e.target.value)}
+            className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm text-slate-700
+              focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent" />
+        </div>
+      </div>
+
+      {draft.action_type === "BOT" && (
+        <div className="grid grid-cols-2 gap-3 mb-3">
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Money saved (₹)</label>
+            <input type="number" value={draft.total_money_saved ?? ""}
+              onChange={(e) => set("total_money_saved", e.target.value)}
+              className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm text-slate-700
+                focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Transactions declined</label>
+            <input type="number" value={draft.transaction_declined ?? ""}
+              onChange={(e) => set("transaction_declined", e.target.value)}
+              className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm text-slate-700
+                focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </div>
+        </div>
+      )}
+
+      <button onClick={() => onSave(draft)} disabled={!dirty || saving}
+        className="w-full mt-1 px-4 py-2.5 rounded-lg text-sm font-semibold transition-all
+          disabled:opacity-40 disabled:cursor-not-allowed bg-slate-800 hover:bg-slate-900 text-white">
+        {saving ? "Saving…" : dirty ? "Save changes" : "Saved"}
+      </button>
+    </div>
+  );
+};
+
+const ATRModule = () => {
+  const [module, setModule]   = useState("FRI");
+  const [segment, setSegment] = useState("ALL");
+  const [mDate, setMDate]     = useState("ALL");
+  const [gho, setGho]         = useState("ALL");
+  const [dates, setDates]     = useState([]);
+  const [ghoCodes, setGhoCodes] = useState([]);
+  const [loadingMeta, setLM]  = useState(false);
+
+  const [defaults, setDefaults] = useState([]);
+  const [savingSeg, setSaving]  = useState(null);
+  const [showSettings, setShow] = useState(false);
+
+  const [preview, setPreview] = useState(null);
+  const [starting, setStarting] = useState(false);
+  const [jobId, setJobId]     = useState(null);
+  const [lastRun, setLastRun] = useState(null);
+
+  const [runs, setRuns]       = useState([]);
+  const [loadingRuns, setLR]  = useState(true);
+  const [rejects, setRejects] = useState(null);
+  const [alert, setAlert]     = useState(null);
+
+  const showAlert = (type, message) => {
+    setAlert({ type, message });
+    if (type === "success") setTimeout(() => setAlert(null), 9000);
+  };
+
+  const loadMeta = useCallback(async (mod) => {
+    setLM(true);
+    try {
+      const [d, g, df] = await Promise.all([
+        api.fetchMasterDates(mod), api.fetchGhoCodes(mod), api.fetchAtrDefaults(mod),
+      ]);
+      setDates(d.dates || []);
+      setGhoCodes(g.gho_codes || []);
+      setDefaults(df.defaults || []);
+    } catch (e) { showAlert("error", `Couldn't load settings: ${e.message}`); }
+    finally { setLM(false); }
+  }, []);
+
+  const loadRuns = useCallback(async () => {
+    setLR(true);
+    try { setRuns((await api.fetchAtrRuns()).runs || []); }
+    catch (e) { showAlert("error", `Couldn't load run history: ${e.message}`); }
+    finally { setLR(false); }
+  }, []);
+
+  const refreshPreview = useCallback(async () => {
+    try {
+      setPreview(await api.fetchAtrPreview({
+        type: module, date: mDate === "ALL" ? "" : mDate, segment, gho_code: gho,
+      }));
+    } catch { setPreview(null); }
+  }, [module, mDate, segment, gho]);
+
+  useEffect(() => { loadMeta(module); setMDate("ALL"); setGho("ALL"); }, [module, loadMeta]);
+  useEffect(() => { loadRuns(); }, [loadRuns]);
+  useEffect(() => { refreshPreview(); }, [refreshPreview]);
+
+  const handleSaveDefaults = async (draft) => {
+    setSaving(draft.segment);
+    try {
+      await api.saveAtrDefaults({ ...draft, type: module });
+      await loadMeta(module);
+      await refreshPreview();
+      showAlert("success", `${draft.segment} defaults saved.`);
+    } catch (e) { showAlert("error", e.message); }
+    finally { setSaving(null); }
+  };
+
+  const handleSubmit = async (dryRun) => {
+    setStarting(true); setAlert(null); setLastRun(null);
+    try {
+      const job = await api.submitAtr({
+        type: module, date: mDate === "ALL" ? null : mDate,
+        segment, gho_code: gho, dry_run: dryRun,
+      });
+      setJobId(job.job_id);
+    } catch (e) { showAlert("error", e.message); }
+    finally { setStarting(false); }
+  };
+
+  const handleRetry = async () => {
+    try {
+      const r = await api.retryAtr({ type: module, date: mDate === "ALL" ? null : mDate, segment });
+      await refreshPreview();
+      showAlert("success", `${fmt(r.requeued)} number(s) put back in the queue.`);
+    } catch (e) { showAlert("error", e.message); }
+  };
+
+  useJobPoller({
+    jobId, recordCount: preview?.total_pending || 0,
+    onDone: async (result) => {
+      setJobId(null); setLastRun(result);
+      await Promise.all([loadRuns(), refreshPreview()]);
+      const sent = result.total_sent ?? result.sent ?? 0;
+      const rej  = result.total_rejected ?? result.rejected ?? 0;
+      showAlert(rej > 0 ? "warning" : "success",
+        rej > 0
+          ? `Sent ${fmt(sent)}, ${fmt(rej)} rejected by C-DOT. Open the run to see why.`
+          : `Sent ${fmt(sent)} action taken reports.`);
+    },
+    onFailed: (e) => { setJobId(null); showAlert("error", e); },
+  });
+
+  const running = starting || !!jobId;
+  const ghoOptions = [
+    { value: "ALL", label: "All GHO codes" },
+    ...ghoCodes.filter((g) => segment === "ALL" || g.segment === segment)
+      .map((g) => ({ value: g.gho_code, label: `${g.gho_code} · ${fmt(g.record_count)}` })),
+  ];
+  const dateOptions = [
+    { value: "ALL", label: "All dates in the window" },
+    ...dates.map((d) => ({ value: d.feed_date, label: `${d.feed_date} · ${fmt(d.record_count)}` })),
+  ];
+
+  return (
+    <div className="space-y-6">
+      <SectionCard icon={Send} iconBg="bg-amber-600" title="Action taken reports"
+        subtitle="Send the action your team applied back to C-DOT, per classification"
+        action={
+          <button onClick={() => setShow((s) => !s)}
+            className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-900 font-medium px-3 py-1.5 hover:bg-slate-100 rounded-lg transition-colors">
+            <Settings2 size={13} /> {showSettings ? "Hide" : "Edit"} defaults
+          </button>
+        }>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
+          <SegmentedControl label="Source" value={module} onChange={setModule} disabled={running}
+            options={[{ value: "FRI", label: "FRI" }, { value: "MNRL", label: "MNRL" }]} />
+          <SegmentedControl label="Classification" value={segment} disabled={running}
+            onChange={(v) => { setSegment(v); setGho("ALL"); }}
+            options={[
+              { value: "ALL", label: "Both" },
+              { value: "IWPB", label: "IWPB" },
+              { value: "Non-IWPB", label: "Non-IWPB" },
+            ]} />
+          <SearchableSelect label="Data date" value={mDate} onChange={setMDate}
+            options={dateOptions} loading={loadingMeta} disabled={running} />
+          <SearchableSelect label="GHO code" value={gho} onChange={setGho}
+            options={ghoOptions} loading={loadingMeta} disabled={running} />
+        </div>
+
+        {showSettings && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5 p-4 bg-slate-50 rounded-xl border border-slate-200">
+            <div className="md:col-span-2">
+              <p className="text-xs text-slate-500 mb-1">
+                These values go into every report for that classification. Confirm the action
+                codes with compliance before the first live send.
+              </p>
+            </div>
+            {defaults.map((d) => (
+              <DefaultsCard key={d.segment} module={module} def={d}
+                onSave={handleSaveDefaults} saving={savingSeg === d.segment} />
+            ))}
+          </div>
+        )}
+
+        {/* What will be sent */}
+        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 mb-5">
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-sm font-semibold text-amber-800">Ready to send</p>
+            <span className="text-2xl font-bold text-amber-900 tabular-nums">
+              {fmt(preview?.total_pending ?? 0)}
+            </span>
+          </div>
+          <div className="space-y-2">
+            {(preview?.breakdown || []).map((b) => (
+              <div key={b.segment} className="flex items-center justify-between text-xs bg-white rounded-lg px-3 py-2 border border-amber-100">
+                <span className="font-semibold text-slate-700">{b.segment}</span>
+                <span className="text-slate-500">
+                  {b.defaults
+                    ? `${b.defaults.action_type} · ${b.defaults.action_taken} — ${
+                        (b.defaults.action_type === "BOT" ? BOT_LABELS : BOA_LABELS)[String(b.defaults.action_taken)] || "custom"
+                      }`
+                    : "No defaults set"}
+                </span>
+                <span className="font-semibold tabular-nums text-amber-700">{fmt(b.pending)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <button onClick={() => handleSubmit(true)} disabled={running || !preview?.total_pending}
+            className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold
+              border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 transition-all
+              disabled:opacity-40 disabled:cursor-not-allowed">
+            <TestTube2 size={15} /> Dry run
+          </button>
+          <button onClick={handleRetry} disabled={running}
+            className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold
+              border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 transition-all
+              disabled:opacity-40 disabled:cursor-not-allowed">
+            <RotateCcw size={15} /> Requeue failures
+          </button>
+          <PrimaryBtn onClick={() => handleSubmit(false)} loading={starting} Icon={Send}
+            disabled={running || !preview?.total_pending}
+            gradient="linear-gradient(135deg, #d97706, #b45309)" label="Send reports" />
+        </div>
+
+        {jobId && <RunningBanner tone="amber" title="Sending to C-DOT…"
+          subtitle="Encrypted batches; failures are logged per number" />}
+
+        {lastRun && !jobId && (
+          <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+              <StatChip label="Sent" value={lastRun.total_sent ?? lastRun.sent} tone="green" />
+              <StatChip label="Rejected" value={lastRun.total_rejected ?? lastRun.rejected} tone="rose" />
+              {(lastRun.skipped ?? 0) > 0 && <StatChip label="Skipped" value={lastRun.skipped} tone="amber" />}
+              {lastRun.dry_run && (
+                <span className="px-2 py-0.5 bg-slate-200 text-slate-600 rounded-full text-xs font-semibold">
+                  Dry run — nothing was sent
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {alert && <Alert {...alert} onClose={() => setAlert(null)} />}
+      </SectionCard>
+
+      <SectionCard icon={ListChecks} iconBg="bg-slate-600" title="Submission log"
+        subtitle={`${runs.length} run${runs.length === 1 ? "" : "s"}`}
+        action={
+          <button onClick={loadRuns} disabled={loadingRuns}
+            className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-800 font-medium px-3 py-1.5 hover:bg-slate-100 rounded-lg transition-colors">
+            <RefreshCw size={13} className={loadingRuns ? "animate-spin" : ""} /> Refresh
+          </button>
+        }>
+        <Paginated items={runs} loading={loadingRuns} accent="amber"
+          emptyTitle="Nothing sent yet"
+          emptyHint="Reconcile some data, then send the reports"
+          columns={["Module", "Classification", "Date", "Action", "Sent", "Rejected", "Status", "Started", ""]}
+          renderRow={(run) => (
+            <tr key={run.id} className="hover:bg-amber-50/30 transition-colors">
+              <td className="px-4 py-3.5">
+                <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
+                  run.module === "FRI" ? "bg-blue-100 text-blue-700" : "bg-teal-100 text-teal-700"
+                }`}>{run.module}</span>
+              </td>
+              <td className="px-4 py-3.5 text-xs text-slate-600">{run.segment || "All"}</td>
+              <td className="px-4 py-3.5 text-xs font-mono text-slate-500">{run.feed_date || "All"}</td>
+              <td className="px-4 py-3.5 text-xs text-slate-600 whitespace-nowrap">
+                {run.action_type} · {run.action_taken}
+              </td>
+              <td className="px-4 py-3.5">
+                <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded-full text-xs font-semibold tabular-nums">
+                  {fmt(run.total_sent)}
+                </span>
+              </td>
+              <td className="px-4 py-3.5">
+                {run.total_rejected > 0 ? (
+                  <span className="px-2 py-0.5 bg-rose-100 text-rose-700 rounded-full text-xs font-semibold tabular-nums">
+                    {fmt(run.total_rejected)}
+                  </span>
+                ) : <span className="text-slate-300 text-xs">—</span>}
+              </td>
+              <td className="px-4 py-3.5">
+                <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
+                  run.status === "done" ? "bg-green-100 text-green-700"
+                    : run.status === "partial" ? "bg-amber-100 text-amber-700"
+                    : run.status === "failed" ? "bg-rose-100 text-rose-700"
+                    : "bg-slate-100 text-slate-600"
+                }`}>{run.dry_run ? "dry run" : run.status}</span>
+              </td>
+              <td className="px-4 py-3.5 text-slate-400 text-xs whitespace-nowrap">{fmtDateTime(run.started_at)}</td>
+              <td className="px-4 py-3.5">
+                {run.total_rejected > 0 && (
+                  <button onClick={async () => {
+                    try { setRejects({ run, rows: (await api.fetchAtrRejects(run.id)).rejects }); }
+                    catch (e) { showAlert("error", e.message); }
+                  }}
+                    className="px-3 py-1.5 text-xs font-semibold text-rose-600 bg-rose-50 hover:bg-rose-600 hover:text-white rounded-lg transition-all whitespace-nowrap">
+                    View errors
+                  </button>
+                )}
+              </td>
+            </tr>
+          )} />
+      </SectionCard>
+
+      {/* Rejection drawer */}
+      {rejects && (
+        <div className="fixed inset-0 bg-slate-900/40 flex items-end md:items-center justify-center z-50 p-4"
+          onClick={() => setRejects(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
+              <div>
+                <h3 className="font-bold text-slate-800">Rejected by C-DOT</h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  {rejects.run.module} · {rejects.run.segment || "All"} · {fmt(rejects.rows.length)} shown
+                </p>
+              </div>
+              <button onClick={() => setRejects(null)} className="text-slate-400 hover:text-slate-600">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="overflow-y-auto p-6">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200">
+                    <th className="text-left pb-2 text-xs font-semibold text-slate-500 uppercase">Mobile</th>
+                    <th className="text-left pb-2 text-xs font-semibold text-slate-500 uppercase">Customer</th>
+                    <th className="text-left pb-2 text-xs font-semibold text-slate-500 uppercase">Reason</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {rejects.rows.map((r, i) => (
+                    <tr key={i}>
+                      <td className="py-2.5 font-mono text-xs text-slate-700">{r.mobile_no}</td>
+                      <td className="py-2.5 text-xs text-slate-500">{r.cust_id || "—"}</td>
+                      <td className="py-2.5 text-xs text-rose-600">{r.error_message}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─────────────────────────────────────────────
+// SHELL
+// ─────────────────────────────────────────────
+const TABS = [
+  { key: "FRI",       label: "FRI" },
+  { key: "MNRL",      label: "MNRL" },
+  { key: "RECONCILE", label: "Reconcile" },
+  { key: "ATR",       label: "Reports" },
+];
+
 const Header = ({ active, setActive }) => (
   <header className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
-    <div className="max-w-5xl mx-auto flex items-center justify-between h-16 px-6">
+    <div className="max-w-6xl mx-auto flex items-center justify-between h-16 px-6">
       <div className="flex items-center gap-3">
         <img src="/HSBC_MASTERBRAND_LOGO_RGB.png" alt="HSBC" style={{ height: 44 }} />
         <div className="h-7 w-px bg-slate-200" />
         <span className="text-sm font-semibold text-slate-600 tracking-wide">DOT Intelligence Platform</span>
       </div>
       <nav className="flex gap-1 bg-slate-100 rounded-xl p-1">
-        {[
-          { key: "FRI",      label: "FRI" },
-          { key: "MNRL",     label: "MNRL" },
-          { key: "MATCHOFF", label: "Match-off" },
-        ].map(({ key, label }) => (
+        {TABS.map(({ key, label }) => (
           <button key={key} onClick={() => setActive(key)}
             className={`px-5 py-1.5 rounded-lg text-sm font-semibold transition-all ${
               active === key ? "bg-white shadow-sm text-blue-700" : "text-slate-500 hover:text-slate-700"
@@ -1167,10 +1471,11 @@ export default function HomeScreen() {
   return (
     <div className="min-h-screen bg-slate-50">
       <Header active={active} setActive={setActive} />
-      <main className="max-w-5xl mx-auto px-6 py-8">
-        {active === "FRI"      && <FRIModule />}
-        {active === "MNRL"     && <MNRLModule />}
-        {active === "MATCHOFF" && <MatchoffModule />}
+      <main className="max-w-6xl mx-auto px-6 py-8">
+        {active === "FRI"       && <FRIModule />}
+        {active === "MNRL"      && <MNRLModule />}
+        {active === "RECONCILE" && <ReconcileModule />}
+        {active === "ATR"       && <ATRModule />}
       </main>
     </div>
   );
