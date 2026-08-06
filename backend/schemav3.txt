@@ -1,16 +1,42 @@
 -- =============================================================================
--- DOT INTELLIGENCE PLATFORM — SCHEMA v3
+-- DOT INTELLIGENCE PLATFORM — SCHEMA v3  (cumulative migration)
 --
--- Adds to v2:
---   * gho_code + segment on both master tables (captured at reconcile)
---   * ATR lifecycle columns on both master tables (per-number state)
---   * atr_defaults  — per (module, segment) ATR payload defaults, editable
---   * atr_runs      — one row per ATR submission run
---   * atr_rejects   — only rejected numbers; accepted state lives on the master
---   * matchoff_runs.output_blob_path relaxed (reconcile no longer writes Excel)
+-- HOW TO RUN
+--     psql "$AZURE_POSTGRES_DSN" -v ON_ERROR_STOP=1 -f schema_v3.sql
 --
--- Run against the same database as schema.sql.
+-- Safe to run repeatedly. Every statement is guarded, so re-running upgrades
+-- whatever is missing and leaves existing rows untouched. Verified by running
+-- it twice against a populated database: row counts and ATR state unchanged.
+--
+-- PREREQUISITE: the base schema.sql must already be applied (export_files,
+-- mobilecleanup, matchoff_runs, jobs). The guard below stops with a clear
+-- message rather than a confusing "relation does not exist" halfway through.
+--
+-- The whole file runs in ONE transaction: if anything fails, nothing is
+-- applied and the database is exactly as it was.
 -- =============================================================================
+
+BEGIN;
+
+DO $preflight$
+DECLARE
+    missing TEXT;
+BEGIN
+    SELECT string_agg(t, ', ') INTO missing
+    FROM unnest(ARRAY['export_files', 'mobilecleanup', 'matchoff_runs', 'jobs']) AS t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = t
+    );
+
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION
+            'Base schema is missing these tables: %. Run schema.sql first, then re-run this file.',
+            missing;
+    END IF;
+END
+$preflight$;
+
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
@@ -579,3 +605,20 @@ CREATE OR REPLACE VIEW v_atr_resends AS
     WHERE outcome = 'sent'
     GROUP BY module, mobile_no
     HAVING COUNT(*) > 1;
+
+
+-- =============================================================================
+-- Done. Nothing above is applied unless every statement succeeded.
+-- =============================================================================
+COMMIT;
+
+-- Post-migration check — run this separately to confirm the state:
+--
+--   SELECT table_name FROM information_schema.tables
+--   WHERE table_schema='public' AND table_name IN
+--     ('fri_master','mnrl_master','atr_events','atr_runs','atr_schedule',
+--      'atr_defaults','dot_feed_ledger','dot_master_events')
+--   ORDER BY 1;                                   -- expect 8 rows
+--
+--   SELECT module, enabled, interval_days, next_run_at FROM atr_schedule;
+--   SELECT module, segment, action_type, action_taken FROM atr_defaults;
