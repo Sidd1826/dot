@@ -362,9 +362,9 @@ ON CONFLICT (mobile_no) DO UPDATE SET
     cleared_at   = CASE WHEN {_FRESHER} THEN NULL     ELSE m.cleared_at END,
     cleared_on   = CASE WHEN {_FRESHER} THEN NULL     ELSE m.cleared_on END,
 
-    -- a re-reported number owes a fresh ATR
-    atr_status   = CASE WHEN EXCLUDED.last_reported_on > m.last_reported_on
-                        THEN 'pending' ELSE m.atr_status END,
+    -- Deliberately NOT resetting atr_status here. Whether a fresh report is
+    -- owed is decided by the state fingerprint, so a number re-reported with an
+    -- unchanged status stays settled instead of being sent again.
 
     first_reported_on = LEAST(m.first_reported_on, EXCLUDED.first_reported_on),
     last_reported_on  = GREATEST(m.last_reported_on, EXCLUDED.last_reported_on),
@@ -962,98 +962,252 @@ def list_feed_dates(module: str) -> list[dict]:
 
 
 # ── ATR QUEUE ────────────────────────────────────────────────────────────────
+#
+# Duplicate protection lives here, in two layers.
+#
+#   1. STATE FINGERPRINT. atr_state_hash captures everything that determines the
+#      report: classification, the feed status, and the action codes in force.
+#      A row is eligible only when the stored hash differs from the hash computed
+#      now. Clicking Send twice therefore sends once: the second run recomputes
+#      the same hash for every row and finds nothing to do. A genuine status
+#      change alters the hash and makes the number eligible again by itself.
+#
+#   2. ATOMIC CLAIM. Batches are taken with FOR UPDATE SKIP LOCKED and flipped to
+#      'sending' in the same statement, so two concurrent runs — a scheduled
+#      cycle and an impatient operator, say — can never claim the same row.
+#
+# Cleared numbers are excluded throughout by _filter_clause's status='active'.
+# That is what stops a number that turned compliant mid-fortnight from being
+# reported: clearing it removes it from the queue with no special case.
+
+# The feed column whose value counts as "the status" for fingerprint purposes
+_STATUS_COL = {MODULE_FRI: "fri_status", MODULE_MNRL: "disconnection_reason_id"}
+
+# Rows claimed but never completed (process died mid-run) are released after this
+ATR_STUCK_MINUTES = int(os.environ.get("ATR_STUCK_MINUTES", "30"))
+
+
+def _hash_expr(module: str) -> str:
+    """SQL computing a row's current state fingerprint.
+
+    Deliberately excludes dates and report_count: a number re-reported with an
+    unchanged status is not a new state and must not trigger a second report.
+    """
+    status_col = _STATUS_COL[module]
+    return (
+        "md5(concat_ws('|', segment, "
+        f"coalesce({status_col}, ''), "
+        "%s::text, %s::text))"
+    )
+
+
+def state_snapshot(row: dict, module: str, action_type: str, action_taken: str) -> dict:
+    """The human-readable form of what the fingerprint covers."""
+    return {
+        "segment": row.get("segment"),
+        "status": row.get(_STATUS_COL[module]),
+        "action_type": action_type,
+        "action_taken": str(action_taken),
+    }
+
+
+def release_stuck_claims(module: str, minutes: int = ATR_STUCK_MINUTES) -> int:
+    """Return rows abandoned mid-send to the queue. Run before each cycle."""
+    table = _TABLES[module.upper()]
+    with _cursor() as cur:
+        cur.execute(
+            f"""UPDATE {table}
+                SET atr_status = 'pending', atr_claimed_at = NULL, updated_at = NOW()
+                WHERE atr_status = 'sending'
+                  AND atr_claimed_at < NOW() - (%s || ' minutes')::interval""",
+            (minutes,),
+        )
+        return cur.rowcount
+
+
+def count_atr_eligible(module: str, feed_date: Any = None, segment: str | None = None,
+                       action_type: str = "", action_taken: str = "") -> int:
+    """How many numbers would actually be reported right now.
+
+    Counts rows whose state differs from the one last reported — not rows
+    marked 'pending', which is why pressing Send twice shows zero the second
+    time instead of re-sending.
+    """
+    module = module.upper()
+    table = _TABLES[module]
+    where, params = _filter_clause(feed_date, segment)
+    with _cursor() as cur:
+        cur.execute(
+            f"""SELECT COUNT(*) FROM {table}
+                WHERE {where}
+                  AND atr_status <> 'sending'
+                  AND atr_state_hash IS DISTINCT FROM {_hash_expr(module)}""",
+            params + [action_type, action_taken],
+        )
+        return int(cur.fetchone()[0])
+
+
 def count_atr_pending(module: str, feed_date: Any = None, segment: str | None = None) -> int:
+    """Rows never successfully reported. Used for dashboard display only."""
     table = _TABLES[module.upper()]
     where, params = _filter_clause(feed_date, segment)
     with _cursor() as cur:
         cur.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE {where} AND atr_status = 'pending'",
+            f"""SELECT COUNT(*) FROM {table}
+                WHERE {where} AND atr_status IN ('pending', 'rejected')""",
             params,
         )
         return int(cur.fetchone()[0])
 
 
-def iter_atr_queue(module: str, feed_date: Any = None, segment: str | None = None,
-                   batch_size: int = 1000,
-                   limit: int | None = None) -> Iterator[list[dict]]:
-    """Yield batches of numbers awaiting ATR.
+def count_cleared_in_window(module: str, feed_date: Any = None,
+                            segment: str | None = None) -> int:
+    """Numbers that cleared before ever being reported.
 
-    Keyset pagination on id rather than a server-side cursor: the caller mutates
-    atr_status as it goes, so each query naturally picks up where the last left
-    off, and an interrupted run resumes correctly on restart.
+    Surfaced so a cycle can say "42 numbers turned compliant before this run and
+    were left out" rather than the operator wondering where they went.
     """
     module = module.upper()
     table = _TABLES[module]
-    where, base_params = _filter_clause(feed_date, segment)
+    where, params = _filter_clause(feed_date, segment, include_cleared=True)
+    with _cursor() as cur:
+        cur.execute(
+            f"""SELECT COUNT(*) FROM {table}
+                WHERE {where} AND status = 'cleared' AND atr_send_count = 0""",
+            params,
+        )
+        return int(cur.fetchone()[0])
 
-    last_id = 0
-    sent = 0
-    while True:
-        take = batch_size
-        if limit is not None:
-            if sent >= limit:
-                return
-            take = min(batch_size, limit - sent)
 
-        with _cursor(dict_cursor=True) as cur:
-            cur.execute(
-                f"""SELECT {', '.join(ATR_COLUMNS)} FROM {table}
-                    WHERE {where} AND atr_status = 'pending' AND id > %s
-                    ORDER BY id LIMIT %s""",
-                base_params + [last_id, take],
+def claim_atr_batch(module: str, run_id: str, action_type: str, action_taken: str,
+                    feed_date: Any = None, segment: str | None = None,
+                    batch_size: int = 1000) -> list[dict]:
+    """Atomically take the next batch of eligible rows and mark them 'sending'.
+
+    SKIP LOCKED means a concurrent run steps over anything this one holds rather
+    than blocking or double-claiming. Returns [] when the queue is exhausted,
+    which is the loop's termination condition.
+    """
+    module = module.upper()
+    table = _TABLES[module]
+    where, params = _filter_clause(feed_date, segment)
+    hash_expr = _hash_expr(module)
+    status_col = _STATUS_COL[module]
+
+    select_cols = ", ".join(
+        ["id", "mobile_no", "cust_id", "segment", "gho_code", status_col,
+         "atr_state_hash", "atr_send_count", "atr_status", "atr_action_type",
+         "atr_action_taken"]
+    )
+
+    with _cursor(dict_cursor=True) as cur:
+        cur.execute(
+            f"""
+            WITH claimed AS (
+                SELECT id FROM {table}
+                WHERE {where}
+                  AND atr_status <> 'sending'
+                  AND atr_state_hash IS DISTINCT FROM {hash_expr}
+                ORDER BY id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
             )
-            rows = [dict(r) for r in cur.fetchall()]
+            UPDATE {table} AS m
+            SET atr_status = 'sending', atr_claimed_at = NOW(), atr_run_id = %s
+            FROM claimed c
+            WHERE m.id = c.id
+            RETURNING {", ".join("m." + c for c in select_cols.split(", "))},
+                      {hash_expr.replace("segment", "m.segment").replace(f"coalesce({status_col}", f"coalesce(m.{status_col}")} AS new_hash
+            """,
+            params + [action_type, action_taken, batch_size, run_id,
+                      action_type, action_taken],
+        )
+        return [dict(r) for r in cur.fetchall()]
 
-        if not rows:
-            return
 
-        last_id = rows[-1]["id"]
-        sent += len(rows)
-        yield rows
+def complete_atr_batch(module: str, run_id: str, action_type: str, action_taken: str,
+                       sent: dict[int, str] | None = None,
+                       failed: dict[int, tuple[str, str]] | None = None) -> None:
+    """Write the outcome back and, for successes, store the new fingerprint.
 
+    Storing the hash is what makes the send idempotent: until the number's state
+    changes again it will not be selected by any future run.
 
-def mark_atr_result(module: str, run_id: str, action_type: str, action_taken: str,
-                    sent_ids: list[int] | None = None,
-                    rejected: dict[int, str] | None = None,
-                    skipped: dict[int, str] | None = None) -> None:
-    """Write ATR outcome back onto the master rows. Keyed on id, not mobile."""
+    sent   {row_id: state_hash}
+    failed {row_id: (status, error)} where status is 'rejected' or 'skipped'
+    """
     table = _TABLES[module.upper()]
     with _cursor() as cur:
-        if sent_ids:
-            cur.execute(
-                f"""UPDATE {table}
-                    SET atr_status = 'sent', atr_run_id = %s, atr_action_type = %s,
-                        atr_action_taken = %s, atr_submitted_at = NOW(),
-                        atr_error = NULL, updated_at = NOW()
-                    WHERE id = ANY(%s)""",
-                (run_id, action_type, action_taken, sent_ids),
-            )
-        for bucket, state in ((rejected, "rejected"), (skipped, "skipped")):
-            if not bucket:
-                continue
+        if sent:
             cur.execute(
                 f"""UPDATE {table} AS m
-                    SET atr_status = %s, atr_run_id = %s, atr_action_type = %s,
-                        atr_action_taken = %s, atr_submitted_at = NOW(),
-                        atr_error = v.err, updated_at = NOW()
+                    SET atr_status = 'sent',
+                        atr_state_hash = v.hash,
+                        atr_send_count = m.atr_send_count + 1,
+                        atr_last_sent_at = NOW(),
+                        atr_submitted_at = NOW(),
+                        atr_claimed_at = NULL,
+                        atr_run_id = %s,
+                        atr_action_type = %s,
+                        atr_action_taken = %s,
+                        atr_error = NULL,
+                        updated_at = NOW()
                     FROM (SELECT unnest(%s::bigint[]) AS row_id,
+                                 unnest(%s::text[])   AS hash) AS v
+                    WHERE m.id = v.row_id""",
+                (run_id, action_type, action_taken,
+                 list(sent.keys()), list(sent.values())),
+            )
+        if failed:
+            # Deliberately does NOT store the hash: a rejected number stays
+            # eligible so the next cycle retries it.
+            cur.execute(
+                f"""UPDATE {table} AS m
+                    SET atr_status = v.state,
+                        atr_claimed_at = NULL,
+                        atr_run_id = %s,
+                        atr_action_type = %s,
+                        atr_action_taken = %s,
+                        atr_error = v.err,
+                        updated_at = NOW()
+                    FROM (SELECT unnest(%s::bigint[]) AS row_id,
+                                 unnest(%s::text[])   AS state,
                                  unnest(%s::text[])   AS err) AS v
                     WHERE m.id = v.row_id""",
-                (state, run_id, action_type, action_taken,
-                 list(bucket.keys()), list(bucket.values())),
+                (run_id, action_type, action_taken,
+                 list(failed.keys()),
+                 [v[0] for v in failed.values()],
+                 [v[1] for v in failed.values()]),
             )
+
+
+def classify_trigger(row: dict, action_type: str, action_taken: str) -> str:
+    """Why this number is being reported now — recorded on every event."""
+    if not row.get("atr_state_hash"):
+        return "first_send"
+    if row.get("atr_status") == "rejected":
+        return "retry_after_reject"
+    prev = (row.get("atr_action_type"), str(row.get("atr_action_taken") or ""))
+    if prev != (action_type, str(action_taken)):
+        return "action_config_change"
+    return "status_change"
 
 
 def reset_atr_status(module: str, feed_date: Any = None, segment: str | None = None,
                      only_failed: bool = True) -> int:
-    """Put numbers back in the queue so a failed run can be retried."""
+    """Put numbers back in the queue so failures can be retried.
+
+    Clears the fingerprint too — otherwise the row would be marked pending but
+    still filtered out as unchanged.
+    """
     table = _TABLES[module.upper()]
     where, params = _filter_clause(feed_date, segment)
     extra = "AND atr_status IN ('rejected', 'skipped')" if only_failed else ""
     with _cursor() as cur:
         cur.execute(
             f"""UPDATE {table}
-                SET atr_status = 'pending', atr_error = NULL, updated_at = NOW()
+                SET atr_status = 'pending', atr_state_hash = NULL,
+                    atr_error = NULL, atr_claimed_at = NULL, updated_at = NOW()
                 WHERE {where} {extra}""",
             params,
         )

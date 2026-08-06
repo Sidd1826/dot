@@ -696,31 +696,44 @@ def save_export_metadata(
     record_count: int,
     export_date: str,
     data_type: str = None,
+    source: str = "feed",
+    segment: str = None,
 ) -> str:
+    """source='feed' for a raw FRI/MNRL download, 'reconciled' for a master
+    export. The two archives are listed separately so the FRI and MNRL tabs
+    show only what those tabs produced."""
     row_id = str(uuid.uuid4())
     container = _get_container_name(module)
     with _pg_cursor() as cur:
         cur.execute(
             """
             INSERT INTO export_files
-            (id, module, file_name, blob_name, container, record_count, export_date, data_type, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            (id, module, file_name, blob_name, container, record_count,
+             export_date, data_type, source, segment, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """,
             (row_id, module.upper(), file_name, blob_name, container,
-             record_count, export_date, data_type),
+             record_count, export_date, data_type, source, segment),
         )
     return row_id
 
 
-def list_export_metadata(module: str) -> list:
+def list_export_metadata(module: str, source: str = "feed") -> list:
+    """Files for one archive. 'feed' powers the FRI/MNRL tabs, 'reconciled' the
+    Reconcile tab; passing None returns both."""
+    sql = """
+        SELECT id, file_name, blob_name, container, record_count, export_date,
+               data_type, source, segment, created_at
+        FROM export_files WHERE module = %s
+    """
+    params = [module.upper()]
+    if source:
+        sql += " AND source = %s"
+        params.append(source)
+    sql += " ORDER BY created_at DESC LIMIT 500"
+
     with _pg_cursor(dict_cursor=True) as cur:
-        cur.execute(
-            """
-            SELECT id, file_name, blob_name, container, record_count, export_date, data_type, created_at
-            FROM export_files WHERE module = %s ORDER BY created_at DESC
-            """,
-            (module.upper(),),
-        )
+        cur.execute(sql, params)
         rows = cur.fetchall()
 
     result = []
@@ -912,6 +925,7 @@ def export_master(
             module=module, file_name=part_fname, blob_name=blob_name,
             record_count=row_count, export_date=label_date,
             data_type=(segment or "All segments"),
+            source="reconciled", segment=segment,
         )
         parts_meta.append({
             "id": row_id, "file_name": part_fname, "record_count": row_count,

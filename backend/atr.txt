@@ -6,17 +6,28 @@ Action Taken Report submission to C-DOT.
 
 Flow
 ----
-    master rows (reconciled, atr_status='pending')
+    master rows whose state differs from the one last reported
+        -> claim a batch atomically (FOR UPDATE SKIP LOCKED -> 'sending')
         -> apply atr_defaults for (module, segment)
         -> build atr_data records per the C-DOT spec
         -> encrypt {client_id, atr_data} with the ATR RSA public key
-        -> POST in batches
-        -> write outcome back to the master row + atr_runs / atr_rejects
+        -> POST
+        -> record every attempt in atr_events, store the new fingerprint
+
+Sent once per state
+-------------------
+Eligibility is "the state fingerprint on the row differs from the one computed
+now", not "the row is marked pending". Pressing Send twice therefore sends once.
+A number is reported again only when its status, classification or action code
+actually changed — and atr_events records which of those it was.
+
+Cleared numbers are never selected, so a number that turned compliant during the
+fortnight simply is not in the cycle. No special case, no cut-off date.
 
 Volume handling
 ---------------
-Numbers are pulled in keyset-paginated batches and never held as one list, so a
-10 lakh run costs one batch of memory. Batch size adapts downward on HTTP 413.
+Batches are claimed and released one at a time, so a 10 lakh run costs one batch
+of memory. Batch size adapts downward on HTTP 413.
 
 FRI and MNRL differ only by URL, client_id, encryption key id and auth source —
 everything else is shared. MNRL values are placeholders until C-DOT publishes
@@ -29,6 +40,7 @@ from datetime import datetime
 import json
 import os
 import re
+import threading
 import time
 from typing import Any
 import uuid
@@ -58,8 +70,18 @@ ATR_URL = {
     "MNRL": os.getenv("MNRL_ATR_URL", "https://REPLACE-ME.example.gov.in/mnrlatr/v2/atr"),
 }
 
-# crypto_utils.encrypt_data resolves the env var f"{key_id}_PUBLIC_KEY".
-# C-DOT issues a SEPARATE RSA key for ATR, so this is not the fetch key.
+# ── KEY CONFIG — read this before setting the env vars ───────────────────────
+# These hold a key *NAME*, not a key. crypto_utils.load_public_key(key_id) looks
+# up the env var f"{key_id}_PUBLIC_KEY", so:
+#
+#     FRI_ATR_KEY_ID=FRI_ATR                 <- short name
+#     FRI_ATR_PUBLIC_KEY=LS0tLS1CRUdJTi...   <- the base64 key itself
+#
+# Putting the key in FRI_ATR_KEY_ID makes the loader search for an env var
+# called "LS0tLS1CRUdJTi..._PUBLIC_KEY", which will never exist. _key_id()
+# catches that and says so instead of echoing the key back in the error.
+#
+# C-DOT issues a SEPARATE RSA key for ATR — this is not the data-fetch key.
 ATR_KEY_ID = {
     "FRI": os.getenv("FRI_ATR_KEY_ID", "FRI_ATR"),
     "MNRL": os.getenv("MNRL_ATR_KEY_ID", "MNRL_ATR"),
@@ -75,7 +97,13 @@ ATR_MIN_BATCH_SIZE = int(os.getenv("ATR_MIN_BATCH_SIZE", "100"))
 ATR_MAX_RETRIES = int(os.getenv("ATR_MAX_RETRIES", "3"))
 ATR_TIMEOUT = int(os.getenv("ATR_TIMEOUT", "90"))
 ATR_VERIFY_SSL = os.getenv("ATR_VERIFY_SSL", "0") == "1"
-ATR_THROTTLE_MS = int(os.getenv("ATR_THROTTLE_MS", "0"))  # pause between batches
+ATR_THROTTLE_MS = int(os.getenv("ATR_THROTTLE_MS", "0"))
+
+# ── FORTNIGHTLY CYCLE ────────────────────────────────────────────────────────
+# The interval itself lives in the atr_schedule table so it can be changed from
+# the UI. These only control the ticker that notices when a cycle is due.
+ATR_SCHEDULER_ENABLED = os.getenv("ATR_SCHEDULER_ENABLED", "1") == "1"
+ATR_SCHEDULER_TICK_SECONDS = int(os.getenv("ATR_SCHEDULER_TICK_SECONDS", "300"))  # pause between batches
 
 MAX_INVESTIGATION = 500
 MAX_REMARKS = 100
@@ -123,6 +151,95 @@ class _cursor:
         except Exception:
             pass
         return False
+
+
+# ── CONFIG VALIDATION ────────────────────────────────────────────────────────
+_KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+
+def _redact(text: str) -> str:
+    """Strip anything that looks like key material out of a message.
+
+    Errors end up in logs, in atr_runs.error and on screen. A base64 RSA key
+    has no business in any of those.
+    """
+    text = str(text)
+    text = re.sub(r"-----BEGIN[^-]*-----.*?-----END[^-]*-----", "<key redacted>",
+                  text, flags=re.S)
+    text = re.sub(r"[A-Za-z0-9+/=]{64,}", "<redacted>", text)
+    return text
+
+
+def _key_id(module: str) -> str:
+    """The configured key NAME, with a readable error if it holds a key."""
+    raw = ATR_KEY_ID[module]
+    var = f"{module}_ATR_KEY_ID"
+
+    if not raw:
+        raise ValueError(
+            f"{var} is not set. It should be a short name such as "
+            f"'{module}_ATR', with the key itself in {module}_ATR_PUBLIC_KEY."
+        )
+
+    if not _KEY_ID_PATTERN.match(raw):
+        looks_like_key = len(raw) > 64 or "BEGIN" in raw or raw.endswith("==")
+        if looks_like_key:
+            raise ValueError(
+                f"{var} contains the public key itself, but it should contain a "
+                f"NAME. Set {var}={module}_ATR and move the key into "
+                f"{module}_ATR_PUBLIC_KEY."
+            )
+        raise ValueError(
+            f"{var} must be letters, digits and underscores only "
+            f"(for example {module}_ATR)."
+        )
+    return raw
+
+
+def preflight(module: str) -> dict:
+    """Check everything needed to send, WITHOUT sending.
+
+    Called before a run is created so a misconfiguration fails immediately
+    rather than after a run row, a queue scan and a half-built batch.
+    """
+    module = module.upper()
+    problems: list[str] = []
+
+    try:
+        key_id = _key_id(module)
+        if not os.getenv(f"{key_id}_PUBLIC_KEY"):
+            problems.append(
+                f"{key_id}_PUBLIC_KEY is not set — that env var should hold the "
+                f"base64 RSA public key C-DOT issued for ATR."
+            )
+    except ValueError as exc:
+        key_id = None
+        problems.append(str(exc))
+
+    if not ATR_CLIENT_ID.get(module):
+        problems.append(
+            f"{module} client id is not set "
+            f"({'FRI_CLIENT_ID' if module == 'FRI' else 'MNRL_CLIENT_ID'})."
+        )
+
+    url = ATR_URL.get(module) or ""
+    if not url:
+        problems.append(f"{module}_ATR_URL is not set.")
+    elif "REPLACE-ME" in url:
+        problems.append(
+            f"{module}_ATR_URL is still the placeholder. C-DOT has not published "
+            f"this endpoint yet."
+        )
+
+    return {
+        "module": module,
+        "ready": not problems,
+        "key_id": key_id,
+        "key_present": bool(key_id and os.getenv(f"{key_id}_PUBLIC_KEY")),
+        "client_id_present": bool(ATR_CLIENT_ID.get(module)),
+        "url": url,
+        "problems": problems,
+    }
 
 
 # ── HTTP SESSION ─────────────────────────────────────────────────────────────
@@ -302,7 +419,7 @@ def submit_batch(module: str, records: list[dict]) -> dict:
         raise ValueError(f"{module} client_id is not configured")
 
     payload = {"client_id": str(client_id), "atr_data": records}
-    encrypted = encrypt_data(payload, ATR_KEY_ID[module])
+    encrypted = encrypt_data(payload, _key_id(module))
     session = _get_session()
 
     for attempt in range(1, ATR_MAX_RETRIES + 1):
@@ -360,50 +477,63 @@ def submit_batch(module: str, records: list[dict]) -> dict:
 
 
 # ── RUN LOGGING ──────────────────────────────────────────────────────────────
-def _create_run(module, segment, feed_date, defaults, total, batch_size, dry_run) -> str:
+def _create_run(module, segment, feed_date, defaults, total, batch_size,
+                trigger_source="manual") -> str:
     run_id = str(uuid.uuid4())
     with _cursor() as cur:
         cur.execute(
             """
             INSERT INTO atr_runs (
                 id, module, segment, feed_date, action_type, action_taken,
-                total_selected, batch_size, status, dry_run, started_at
+                total_selected, batch_size, status, trigger_source, started_at
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'running', %s, NOW())
             """,
-            (
-                run_id, module.upper(), segment, ms._to_date(feed_date),
-                (defaults or {}).get("action_type"), (defaults or {}).get("action_taken"),
-                total, batch_size, dry_run,
-            ),
+            (run_id, module.upper(), segment, ms._to_date(feed_date),
+             (defaults or {}).get("action_type"), (defaults or {}).get("action_taken"),
+             total, batch_size, trigger_source),
         )
     return run_id
 
 
-def _finish_run(run_id, status, sent, rejected, skipped, batches, request_ids, error=None) -> None:
+def _finish_run(run_id, status, *, sent=0, rejected=0, skipped=0, resent=0,
+                cleared=0, batches=0, request_ids=None, error=None) -> None:
     with _cursor() as cur:
         cur.execute(
             """
             UPDATE atr_runs
-            SET status = %s, total_sent = %s, total_rejected = %s, total_skipped = %s,
-                batches_sent = %s, request_ids = %s::jsonb, error = %s, finished_at = NOW()
+            SET status = %s, total_sent = %s, total_rejected = %s,
+                total_skipped = %s, total_resent = %s, total_cleared = %s,
+                batches_sent = %s, request_ids = %s::jsonb, error = %s,
+                finished_at = NOW()
             WHERE id = %s
             """,
-            (status, sent, rejected, skipped, batches,
-             json.dumps(request_ids), error, run_id),
+            (status, sent, rejected, skipped, resent, cleared, batches,
+             json.dumps(request_ids or []), error, run_id),
         )
 
 
-def _log_rejects(run_id, module, rows: list[tuple]) -> None:
-    """rows = [(mobile_no, cust_id, batch_no, error_message), ...]"""
+def _log_events(rows: list[tuple]) -> None:
+    """Append to atr_events — the single audit table.
+
+    One row per attempt per number, whatever the outcome, holding the exact
+    payload sent and the response that came back. This is the only place ATR
+    history is kept; the master row carries just the current state.
+    """
     if not rows:
         return
     with _cursor() as cur:
         psycopg2.extras.execute_values(
             cur,
-            """INSERT INTO atr_rejects (run_id, module, mobile_no, cust_id, batch_no, error_message)
-               VALUES %s""",
-            [(run_id, module.upper(), *r) for r in rows],
+            """INSERT INTO atr_events (
+                   run_id, module, mobile_no, cust_id, segment, outcome, trigger,
+                   action_type, action_taken, request_payload, response_code,
+                   response_message, request_id, state_hash, previous_state,
+                   current_state, attempt_no, batch_no
+               ) VALUES %s""",
+            rows,
+            template=("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, "
+                      "%s, %s::jsonb, %s::jsonb, %s, %s)"),
             page_size=1000,
         )
 
@@ -424,22 +554,214 @@ def list_runs(module: str | None = None, limit: int = 50) -> list[dict]:
     for row in rows:
         row["id"] = str(row["id"])
         row["feed_date"] = str(row["feed_date"]) if row.get("feed_date") else None
-        row["started_at"] = row["started_at"].isoformat() if row.get("started_at") else None
-        row["finished_at"] = row["finished_at"].isoformat() if row.get("finished_at") else None
+        for key in ("started_at", "finished_at"):
+            row[key] = row[key].isoformat() if row.get(key) else None
     return rows
 
 
-def list_rejects(run_id: str, limit: int = 1000) -> list[dict]:
+def list_events(run_id: str | None = None, module: str | None = None,
+                mobile_no: str | None = None, outcome: str | None = None,
+                limit: int = 500) -> list[dict]:
+    """Query the audit table. By run, by number, or by outcome."""
+    clauses, params = [], []
+    if run_id:
+        clauses.append("run_id = %s")
+        params.append(run_id)
+    if module:
+        clauses.append("module = %s")
+        params.append(module.upper())
+    if mobile_no:
+        clauses.append("mobile_no = %s")
+        params.append(ms._norm_mobile(mobile_no))
+    if outcome:
+        clauses.append("outcome = %s")
+        params.append(outcome)
+    where = " AND ".join(clauses) or "TRUE"
+    params.append(limit)
+
     with _cursor(dict_cursor=True) as cur:
         cur.execute(
-            """SELECT mobile_no, cust_id, batch_no, error_message, created_at
-               FROM atr_rejects WHERE run_id = %s ORDER BY id LIMIT %s""",
-            (run_id, limit),
+            f"""SELECT id, run_id, module, mobile_no, cust_id, segment, outcome,
+                       trigger, action_type, action_taken, request_payload,
+                       response_code, response_message, request_id,
+                       previous_state, current_state, attempt_no, batch_no, created_at
+                FROM atr_events WHERE {where}
+                ORDER BY created_at DESC, id DESC LIMIT %s""",
+            params,
         )
         rows = [dict(r) for r in cur.fetchall()]
+
     for row in rows:
+        row["run_id"] = str(row["run_id"])
         row["created_at"] = row["created_at"].isoformat()
     return rows
+
+
+def number_history(mobile_no: str) -> dict:
+    """Everything ever reported for one number, newest first.
+
+    The answer to "when did we send an ATR for this number, what did we send,
+    what came back, and was it ever re-sent because the status changed".
+    """
+    mobile = ms._norm_mobile(mobile_no)
+    events = list_events(mobile_no=mobile, limit=200)
+    return {
+        "mobile_no": mobile,
+        "master": ms.lookup(mobile).get("records", []),
+        "events": events,
+        "send_count": sum(1 for e in events if e["outcome"] == "sent"),
+        "resend_count": max(0, sum(1 for e in events if e["outcome"] == "sent") - 1),
+    }
+
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+def get_schedule(module: str | None = None) -> list[dict]:
+    sql = "SELECT * FROM atr_schedule"
+    params: list[Any] = []
+    if module:
+        sql += " WHERE module = %s"
+        params.append(module.upper())
+    sql += " ORDER BY module"
+
+    with _cursor(dict_cursor=True) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    for row in rows:
+        for key in ("next_run_at", "last_run_at", "updated_at"):
+            row[key] = row[key].isoformat() if row.get(key) else None
+        row["last_run_id"] = str(row["last_run_id"]) if row.get("last_run_id") else None
+    return rows
+
+
+def save_schedule(module: str, enabled: bool | None = None,
+                  interval_days: int | None = None,
+                  run_at_hour: int | None = None,
+                  next_run_at: Any = None) -> dict:
+    module = module.upper()
+    sets, params = [], []
+
+    if enabled is not None:
+        sets.append("enabled = %s")
+        params.append(bool(enabled))
+    if interval_days is not None:
+        if not 1 <= int(interval_days) <= 90:
+            raise ValueError("Interval must be between 1 and 90 days.")
+        sets.append("interval_days = %s")
+        params.append(int(interval_days))
+    if run_at_hour is not None:
+        if not 0 <= int(run_at_hour) <= 23:
+            raise ValueError("Hour must be between 0 and 23.")
+        sets.append("run_at_hour = %s")
+        params.append(int(run_at_hour))
+    if next_run_at:
+        sets.append("next_run_at = %s")
+        params.append(next_run_at)
+
+    if not sets:
+        return get_schedule(module)[0]
+
+    sets.append("updated_at = NOW()")
+    params.append(module)
+    with _cursor() as cur:
+        cur.execute(f"UPDATE atr_schedule SET {', '.join(sets)} WHERE module = %s", params)
+    return get_schedule(module)[0]
+
+
+def _advance_schedule(module: str, run_id: str | None, status: str) -> None:
+    """Move next_run_at forward by one interval, anchored to the hour setting."""
+    with _cursor() as cur:
+        cur.execute(
+            """
+            UPDATE atr_schedule
+            SET last_run_at = NOW(), last_run_id = %s, last_status = %s,
+                next_run_at = date_trunc('day', NOW() + (interval_days || ' days')::interval)
+                              + (run_at_hour || ' hours')::interval,
+                updated_at  = NOW()
+            WHERE module = %s
+            """,
+            (run_id, status, module.upper()),
+        )
+
+
+def due_modules() -> list[str]:
+    with _cursor() as cur:
+        cur.execute(
+            "SELECT module FROM atr_schedule WHERE enabled AND next_run_at <= NOW() ORDER BY module"
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def run_due_cycles() -> list[dict]:
+    """Run whatever the schedule says is due. Safe to call from anywhere.
+
+    A Postgres advisory lock means only one process does the work even when
+    several web workers tick at the same moment; the rest return immediately.
+    """
+    results = []
+    for module in due_modules():
+        conn = _get_pool().getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (_lock_key(module),))
+                if not cur.fetchone()[0]:
+                    print(f"[ATR] {module} cycle already running elsewhere, skipping")
+                    continue
+            conn.commit()
+            try:
+                result = run_atr(module, trigger_source="scheduled")
+                _advance_schedule(module, result.get("run_id"), result.get("status", "done"))
+                results.append(result)
+            except Exception as exc:
+                _advance_schedule(module, None, "failed")
+                print(f"[ATR] scheduled {module} cycle failed: {exc}")
+                results.append({"module": module, "status": "failed", "error": str(exc)})
+            finally:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (_lock_key(module),))
+                conn.commit()
+        finally:
+            _get_pool().putconn(conn)
+    return results
+
+
+def _lock_key(module: str) -> int:
+    """Stable 32-bit advisory lock id per module."""
+    return 990000 + (1 if module.upper() == "FRI" else 2)
+
+
+_scheduler_thread: threading.Thread | None = None
+
+
+def start_scheduler() -> None:
+    """Start the fortnightly cycle ticker. Call once at app start.
+
+    Deliberately a plain thread with a DB advisory lock rather than a scheduler
+    library: with several gunicorn workers every process would otherwise fire
+    the same cycle. The lock makes running it everywhere harmless.
+    """
+    global _scheduler_thread
+    if not ATR_SCHEDULER_ENABLED:
+        print("[ATR] Scheduler disabled (ATR_SCHEDULER_ENABLED=0)")
+        return
+    if _scheduler_thread and _scheduler_thread.is_alive():
+        return
+
+    def _tick():
+        while True:
+            try:
+                ran = run_due_cycles()
+                for r in ran:
+                    print(f"[ATR] scheduled cycle: {r}")
+            except Exception as exc:
+                print(f"[ATR] scheduler tick failed: {exc}")
+            time.sleep(ATR_SCHEDULER_TICK_SECONDS)
+
+    _scheduler_thread = threading.Thread(target=_tick, name="atr-scheduler", daemon=True)
+    _scheduler_thread.start()
+    print(
+        f"[ATR] Scheduler started, ticking every {ATR_SCHEDULER_TICK_SECONDS}s"
+    )
 
 
 # ── MAIN ENTRY POINT ─────────────────────────────────────────────────────────
@@ -449,98 +771,147 @@ def run_atr(
     segment: str | None = None,
     batch_size: int = ATR_BATCH_SIZE,
     limit: int | None = None,
-    dry_run: bool = False,
+    trigger_source: str = "manual",
 ) -> dict:
-    """Submit ATRs for every pending, reconciled number matching the filters.
+    """Send reports for every number whose state differs from the last one sent.
 
-    A run is scoped to ONE segment because action codes differ per segment.
-    Calling with segment=None loops the segments that actually have work.
+    Scoped to one classification at a time because the action code differs per
+    classification; segment=None loops the ones that have work.
     """
     module = module.upper()
 
-    # No segment given -> run each segment that has pending rows, in turn
-    if not segment or segment.upper() == "ALL":
+    if not segment or str(segment).upper() == "ALL":
         results = []
         for seg in (ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB):
-            if ms.count_atr_pending(module, feed_date, seg):
-                results.append(run_atr(module, feed_date, seg,
-                                       batch_size, limit, dry_run))
+            defaults = get_defaults(module, seg)
+            if not defaults:
+                continue
+            d = defaults[0]
+            if ms.count_atr_eligible(module, feed_date, seg,
+                                     d["action_type"], str(d["action_taken"])):
+                results.append(run_atr(module, feed_date, seg, batch_size,
+                                       limit, trigger_source))
         if not results:
-            return {"status": "skipped", "reason": "no_pending_records",
-                    "module": module, "runs": []}
+            return {
+                "status": "nothing_to_send",
+                "module": module,
+                "runs": [],
+                "sent": 0,
+                "rejected": 0,
+                "message": (
+                    "Every reconciled number has already been reported in its "
+                    "current state. Nothing to send."
+                ),
+            }
         return {
             "status": "done",
             "module": module,
             "runs": results,
-            "total_sent": sum(r.get("sent", 0) for r in results),
-            "total_rejected": sum(r.get("rejected", 0) for r in results),
+            "sent": sum(r.get("sent", 0) for r in results),
+            "rejected": sum(r.get("rejected", 0) for r in results),
+            "resent": sum(r.get("resent", 0) for r in results),
         }
 
     defaults_list = get_defaults(module, segment)
     if not defaults_list:
-        raise ValueError(f"No ATR defaults configured for {module} / {segment}")
+        raise ValueError(f"No ATR defaults are configured for {module} / {segment}.")
     defaults = defaults_list[0]
     if not defaults.get("is_active", True):
-        raise ValueError(f"ATR defaults for {module} / {segment} are switched off")
+        raise ValueError(f"ATR defaults for {module} / {segment} are switched off.")
 
-    total = ms.count_atr_pending(module, feed_date, segment)
-    if total == 0:
-        return {"status": "skipped", "reason": "no_pending_records",
-                "module": module, "segment": segment, "sent": 0, "rejected": 0}
-    if limit:
-        total = min(total, limit)
+    action_type = defaults["action_type"]
+    action_taken = str(defaults["action_taken"])
 
-    run_id = _create_run(module, segment, feed_date, defaults,
-                         total, batch_size, dry_run)
+    # Free anything a crashed run left claimed, or it would sit stuck forever
+    released = ms.release_stuck_claims(module)
+    if released:
+        print(f"[ATR] released {released} stuck claim(s) from an earlier run")
+
+    eligible = ms.count_atr_eligible(module, feed_date, segment, action_type, action_taken)
+    cleared = ms.count_cleared_in_window(module, feed_date, segment)
+
+    if eligible == 0:
+        return {
+            "status": "nothing_to_send",
+            "module": module,
+            "segment": segment,
+            "sent": 0, "rejected": 0, "resent": 0,
+            "cleared_skipped": cleared,
+            "message": (
+                f"Nothing to send for {segment}. Every number has already been "
+                f"reported in its current state"
+                + (f", and {cleared:,} turned compliant before this run."
+                   if cleared else ".")
+            ),
+        }
+
+    run_id = _create_run(module, segment, feed_date, defaults, eligible,
+                         batch_size, trigger_source)
 
     date_of_action = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sent = rejected = skipped = batches = 0
+    sent = rejected = skipped = resent = batches = 0
     request_ids: list[str] = []
-    current_batch = batch_size
     fatal_error: str | None = None
 
     print(
-        f"[ATR] {module}/{segment} run={run_id} pending={total:,} "
-        f"action={defaults['action_type']}/{defaults['action_taken']} dry_run={dry_run}"
+        f"[ATR] {module}/{segment} run={run_id} eligible={eligible:,} "
+        f"action={action_type}/{action_taken} source={trigger_source}"
     )
 
     try:
-        for rows in ms.iter_atr_queue(module, feed_date, segment,
-                                      batch_size=current_batch, limit=limit):
+        while True:
+            if limit is not None and sent + rejected >= limit:
+                break
+
+            take = batch_size
+            if limit is not None:
+                take = min(batch_size, limit - (sent + rejected))
+
+            rows = ms.claim_atr_batch(module, run_id, action_type, action_taken,
+                                      feed_date, segment, take)
+            if not rows:
+                break
             batches += 1
+
             by_mobile: dict[str, dict] = {}
             records: list[dict] = []
-            skip_map: dict[int, str] = {}
+            failed: dict[int, tuple[str, str]] = {}
+            events: list[tuple] = []
 
             for row in rows:
+                trigger = ms.classify_trigger(row, action_type, action_taken)
+                row["_trigger"] = trigger
+                row["_current"] = ms.state_snapshot(row, module, action_type, action_taken)
+                row["_previous"] = {
+                    "action_type": row.get("atr_action_type"),
+                    "action_taken": row.get("atr_action_taken"),
+                    "reported_before": bool(row.get("atr_state_hash")),
+                    "previous_status": row.get("atr_status"),
+                } if row.get("atr_state_hash") else None
+
                 try:
                     record = build_record(row, defaults, date_of_action)
                 except ValueError as exc:
-                    skip_map[row["id"]] = str(exc)
+                    failed[row["id"]] = ("skipped", str(exc))
+                    events.append((
+                        run_id, module, ms._norm_mobile(row["mobile_no"]),
+                        row.get("cust_id"), row.get("segment"), "skipped", trigger,
+                        action_type, action_taken, None, None, str(exc), None,
+                        None, json.dumps(row["_previous"]) if row["_previous"] else None,
+                        json.dumps(row["_current"]),
+                        int(row.get("atr_send_count", 0)) + 1, batches,
+                    ))
                     continue
                 records.append(record)
                 by_mobile[record["mobile_no"]] = row
 
-            if skip_map:
-                skipped += len(skip_map)
-                ms.mark_atr_result(
-                    module, run_id, defaults["action_type"], defaults["action_taken"],
-                    skipped=skip_map,
-                )
-                _log_rejects(run_id, module, [
-                    (ms._norm_mobile(r["mobile_no"]), r.get("cust_id"), batches, err)
-                    for r in rows if (err := skip_map.get(r["id"]))
-                ])
-
             if not records:
+                ms.complete_atr_batch(module, run_id, action_type, action_taken,
+                                      failed=failed)
+                _log_events(events)
+                skipped += len(failed)
                 continue
 
-            if dry_run:
-                sent += len(records)
-                print(f"[ATR] batch {batches}: {len(records):,} records (dry run, not sent)")
-                continue
-
-            # ── send, halving the batch if C-DOT says it's too large ──────────
             chunks = [records]
             while chunks:
                 chunk = chunks.pop(0)
@@ -557,60 +928,66 @@ def run_atr(
                 if result["request_id"]:
                     request_ids.append(str(result["request_id"]))
 
-                chunk_mobiles = [r["mobile_no"] for r in chunk]
-
-                if result["outcome"] == "failed":
-                    fatal_error = result["message"]
-                    reject_map = {by_mobile[m]["id"]: result["message"]
-                                  for m in chunk_mobiles if m in by_mobile}
-                    rejected += len(reject_map)
-                    ms.mark_atr_result(
-                        module, run_id, defaults["action_type"], defaults["action_taken"],
-                        rejected=reject_map,
-                    )
-                    _log_rejects(run_id, module, [
-                        (m, by_mobile[m].get("cust_id"), batches, result["message"])
-                        for m in chunk_mobiles if m in by_mobile
-                    ])
-                    continue
-
                 errors = result["errors"]
-                ok_mobiles = [m for m in chunk_mobiles if m not in errors]
-                bad_mobiles = [m for m in chunk_mobiles if m in errors]
+                by_number = {r["mobile_no"]: r for r in chunk}
+                ok_hashes: dict[int, str] = {}
 
-                sent_ids = [by_mobile[m]["id"] for m in ok_mobiles if m in by_mobile]
-                reject_map = {by_mobile[m]["id"]: errors[m]
-                              for m in bad_mobiles if m in by_mobile}
+                for mobile, record in by_number.items():
+                    row = by_mobile.get(mobile)
+                    if row is None:
+                        continue
+                    attempt = int(row.get("atr_send_count", 0)) + 1
+                    prev = json.dumps(row["_previous"]) if row["_previous"] else None
+                    cur_state = json.dumps(row["_current"])
 
-                ms.mark_atr_result(
-                    module, run_id, defaults["action_type"], defaults["action_taken"],
-                    sent_ids=sent_ids, rejected=reject_map,
-                )
-                if reject_map:
-                    _log_rejects(run_id, module, [
-                        (m, by_mobile[m].get("cust_id"), batches, errors[m])
-                        for m in bad_mobiles if m in by_mobile
-                    ])
+                    if result["outcome"] == "failed":
+                        outcome, message = "failed", result["message"]
+                        failed[row["id"]] = ("rejected", message)
+                        rejected += 1
+                        fatal_error = message
+                    elif mobile in errors:
+                        outcome, message = "rejected", errors[mobile]
+                        failed[row["id"]] = ("rejected", message)
+                        rejected += 1
+                    else:
+                        outcome, message = "sent", result["message"]
+                        ok_hashes[row["id"]] = row["new_hash"]
+                        sent += 1
+                        if row["_trigger"] != "first_send":
+                            resent += 1
 
-                sent += len(sent_ids)
-                rejected += len(reject_map)
-                print(
-                    f"[ATR] batch {batches}: sent={len(sent_ids):,} "
-                    f"rejected={len(reject_map):,} ({result['outcome']})"
-                )
+                    events.append((
+                        run_id, module, ms._norm_mobile(mobile), row.get("cust_id"),
+                        row.get("segment"), outcome, row["_trigger"],
+                        action_type, action_taken, json.dumps(record),
+                        str(result.get("http_status")), message,
+                        result.get("request_id"),
+                        row["new_hash"] if outcome == "sent" else None,
+                        prev, cur_state, attempt, batches,
+                    ))
+
+                ms.complete_atr_batch(module, run_id, action_type, action_taken,
+                                      sent=ok_hashes, failed=failed)
+                failed = {}
+
+            _log_events(events)
+            skipped += sum(1 for e in events if e[5] == "skipped")
 
             if ATR_THROTTLE_MS:
                 time.sleep(ATR_THROTTLE_MS / 1000)
 
     except Exception as exc:
-        _finish_run(run_id, "failed", sent, rejected, skipped, batches,
-                    request_ids, str(exc))
+        _finish_run(run_id, "failed", sent=sent, rejected=rejected, skipped=skipped,
+                    resent=resent, cleared=cleared, batches=batches,
+                    request_ids=request_ids, error=str(exc))
+        ms.release_stuck_claims(module, minutes=0)
         print(f"[ATR] X run {run_id} failed: {exc}")
         raise
 
     status = "done" if rejected == 0 and not fatal_error else "partial"
-    _finish_run(run_id, status, sent, rejected, skipped, batches,
-                request_ids, fatal_error)
+    _finish_run(run_id, status, sent=sent, rejected=rejected, skipped=skipped,
+                resent=resent, cleared=cleared, batches=batches,
+                request_ids=request_ids, error=fatal_error)
 
     summary = {
         "status": status,
@@ -618,14 +995,16 @@ def run_atr(
         "module": module,
         "segment": segment,
         "feed_date": str(ms._to_date(feed_date)) if feed_date else None,
-        "action_type": defaults["action_type"],
-        "action_taken": defaults["action_taken"],
-        "selected": total,
+        "action_type": action_type,
+        "action_taken": action_taken,
+        "selected": eligible,
         "sent": sent,
+        "resent": resent,
         "rejected": rejected,
         "skipped": skipped,
+        "cleared_skipped": cleared,
         "batches": batches,
-        "dry_run": dry_run,
+        "trigger_source": trigger_source,
     }
     print(f"[ATR] Done: {summary}")
     return summary

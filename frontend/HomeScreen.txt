@@ -4,7 +4,7 @@ import {
   CheckCircle, AlertCircle, X, Calendar, Loader2,
   Cloud, HardDrive, Shield, Upload, BarChart3, Clock,
   GitMerge, ChevronDown, ArrowRight, Search, Send,
-  Settings2, Users, Filter, ListChecks, RotateCcw, TestTube2,
+  Settings2, Users, Filter, ListChecks, RotateCcw, CalendarClock,
 } from "lucide-react";
 
 // ─────────────────────────────────────────────
@@ -65,7 +65,7 @@ const api = {
   startFRIExport:            (date)            => api.post("/fri/export-and-save", { date }),
   startMNRLExport:           (date, data_type) => api.post("/mnrl/export-and-save", { date, data_type }),
   pollJobStatus:             (jobId)           => api.get(`/export/status/${jobId}`),
-  listFiles:                 (type)            => api.get(`/files/list?type=${type}`),
+  listFiles:                 (type, source = "feed") => api.get(`/files/list?${qs({ type, source })}`),
   getDownloadUrl:            (id, type)        => api.get(`/files/download-url/${id}?type=${type}`),
 
   // Reconcile
@@ -82,13 +82,17 @@ const api = {
   startMasterDownload: (p)   => api.post("/master/download", p),
 
   // ATR
+  fetchAtrConfig:   (type)   => api.get(`/atr/config?type=${type}`),
   fetchAtrDefaults: (type)   => api.get(`/atr/defaults?type=${type}`),
   saveAtrDefaults:  (body)   => api.put("/atr/defaults", body),
   fetchAtrPreview:  (p)      => api.get(`/atr/preview?${qs(p)}`),
   submitAtr:        (p)      => api.post("/atr/submit", p),
   fetchAtrRuns:     (type)   => api.get(`/atr/runs?${qs({ type })}`),
-  fetchAtrRejects:  (runId)  => api.get(`/atr/runs/${runId}/rejects`),
+  fetchAtrEvents:   (runId, outcome) => api.get(`/atr/runs/${runId}/events?${qs({ outcome })}`),
+  fetchNumberHistory: (mob)  => api.get(`/atr/history/${mob}`),
   retryAtr:         (p)      => api.post("/atr/retry", p),
+  fetchAtrSchedule: (type)   => api.get(`/atr/schedule?${qs({ type })}`),
+  saveAtrSchedule:  (body)   => api.put("/atr/schedule", body),
 };
 
 // ─────────────────────────────────────────────
@@ -777,11 +781,22 @@ const ReconcileModule = () => {
   const [runs, setRuns]       = useState([]);
   const [loadingRuns, setLR]  = useState(true);
   const [alert, setAlert]     = useState(null);
+  const [recFiles, setRecFiles] = useState([]);
+  const [loadingRecFiles, setLRF] = useState(true);
 
   const showAlert = (type, message) => {
     setAlert({ type, message });
     if (type === "success" || type === "info") setTimeout(() => setAlert(null), 9000);
   };
+
+  // Reconciled downloads are listed here, not in the FRI/MNRL tabs — those show
+  // only what was pulled from the source APIs.
+  const loadRecFiles = useCallback(async (mod) => {
+    setLRF(true);
+    try { setRecFiles(await api.listFiles(mod, "reconciled")); }
+    catch (e) { showAlert("error", `Couldn't load reconciled files: ${e.message}`); }
+    finally { setLRF(false); }
+  }, []);
 
   const loadFolders = useCallback(async (c) => {
     setLFo(true); setFolders([]); setSrcDate(""); setSrcFiles([]); setSrcFile("");
@@ -834,7 +849,10 @@ const ReconcileModule = () => {
 
   useEffect(() => { loadFolders(container); loadRuns(); }, []); // eslint-disable-line
   useEffect(() => { if (srcDate) loadSrcFiles(container, srcDate); }, [srcDate]); // eslint-disable-line
-  useEffect(() => { setMDate("ALL"); setSegment("ALL"); loadMeta(module, "ALL"); }, [module, loadMeta]);
+  useEffect(() => {
+    setMDate("ALL"); setSegment("ALL");
+    loadMeta(module, "ALL"); loadRecFiles(module);
+  }, [module, loadMeta, loadRecFiles]);
   useEffect(() => { loadMeta(module, mDate); }, [mDate]); // eslint-disable-line
   useEffect(() => { refreshPreview(); }, [refreshPreview]);
 
@@ -903,6 +921,7 @@ const ReconcileModule = () => {
         return;
       }
       setLastFile(result);
+      loadRecFiles(module);
       showAlert("success", `Built ${fmt(result.record_count)} rows across ${result.file_count} file(s).`);
     },
     onFailed: (e) => { setDlJob(null); showAlert("error", e); },
@@ -1022,6 +1041,55 @@ const ReconcileModule = () => {
         {alert && <Alert {...alert} onClose={() => setAlert(null)} />}
       </SectionCard>
 
+      {/* ── Reconciled downloads live here, not in the FRI/MNRL archives ── */}
+      <SectionCard icon={FileSpreadsheet} iconBg="bg-emerald-500"
+        title="Reconciled downloads"
+        subtitle={`${recFiles.length} file${recFiles.length === 1 ? "" : "s"} built from the ${module} master`}
+        action={
+          <button onClick={() => loadRecFiles(module)} disabled={loadingRecFiles}
+            className="flex items-center gap-1.5 text-xs text-emerald-600 hover:text-emerald-800 font-medium px-3 py-1.5 hover:bg-emerald-50 rounded-lg transition-colors">
+            <RefreshCw size={13} className={loadingRecFiles ? "animate-spin" : ""} /> Refresh
+          </button>
+        }>
+        <Paginated items={recFiles} loading={loadingRecFiles} accent="emerald"
+          emptyTitle="No reconciled downloads yet"
+          emptyHint="Build one with the panel above"
+          columns={["File name", "Classification", "Records", "Built at", ""]}
+          renderRow={(file) => (
+            <tr key={file.id} className="hover:bg-emerald-50/40 transition-colors">
+              <td className="px-4 py-3.5">
+                <div className="flex items-center gap-2">
+                  <FileSpreadsheet size={15} className="text-emerald-600 shrink-0" />
+                  <span className="text-slate-700 font-medium truncate max-w-[240px]" title={file.file_name}>
+                    {file.file_name}
+                  </span>
+                </div>
+              </td>
+              <td className="px-4 py-3.5 text-xs text-slate-600">
+                {file.segment ? segLabel(file.segment) : "Both"}
+              </td>
+              <td className="px-4 py-3.5">
+                <span className="px-2.5 py-1 bg-emerald-100 text-emerald-700 rounded-full text-xs font-semibold tabular-nums">
+                  {fmt(file.record_count)}
+                </span>
+              </td>
+              <td className="px-4 py-3.5 text-slate-400 text-xs whitespace-nowrap">{fmtDateTime(file.created_at)}</td>
+              <td className="px-4 py-3.5">
+                <button onClick={async () => {
+                  try {
+                    const { url, file_name } = await api.getDownloadUrl(file.id, module);
+                    triggerBlobDownload(url, file_name);
+                  } catch (e) { showAlert("error", `Download failed: ${e.message}`); }
+                }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-600
+                    bg-emerald-50 hover:bg-emerald-600 hover:text-white rounded-lg transition-all">
+                  <Download size={13} /> Download
+                </button>
+              </td>
+            </tr>
+          )} />
+      </SectionCard>
+
       {/* ── History ── */}
       <SectionCard icon={ListChecks} iconBg="bg-slate-600" title="Reconcile history"
         subtitle={`${runs.length} run${runs.length === 1 ? "" : "s"}`}
@@ -1076,6 +1144,72 @@ const ReconcileModule = () => {
 // ─────────────────────────────────────────────
 // TAB 4 — ATR
 // ─────────────────────────────────────────────
+const ScheduleCard = ({ schedule, onSave, saving }) => {
+  if (!schedule) return null;
+  const next = schedule.next_run_at ? new Date(schedule.next_run_at) : null;
+  const daysAway = next ? Math.max(0, Math.ceil((next - Date.now()) / 86400000)) : null;
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex items-center gap-2">
+          <CalendarClock size={16} className={schedule.enabled ? "text-emerald-600" : "text-slate-400"} />
+          <div>
+            <p className="text-sm font-semibold text-slate-800">
+              Automatic {schedule.interval_days === 14 ? "fortnightly" : `${schedule.interval_days}-day`} cycle
+            </p>
+            <p className="text-xs text-slate-400 mt-0.5">
+              {schedule.enabled
+                ? next
+                  ? `Next run ${fmtDateTime(schedule.next_run_at)}${daysAway !== null ? ` · in ${daysAway} day${daysAway === 1 ? "" : "s"}` : ""}`
+                  : "Scheduled"
+                : "Paused — reports only go when you press Send"}
+            </p>
+          </div>
+        </div>
+        <button onClick={() => onSave({ enabled: !schedule.enabled })} disabled={saving}
+          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all shrink-0 ${
+            schedule.enabled
+              ? "bg-slate-100 text-slate-600 hover:bg-slate-200"
+              : "bg-emerald-600 text-white hover:bg-emerald-700"
+          } disabled:opacity-40`}>
+          {schedule.enabled ? "Pause" : "Resume"}
+        </button>
+      </div>
+
+      <div className="flex items-center gap-3 mt-3 pt-3 border-t border-slate-100">
+        <label className="text-xs text-slate-500">Every</label>
+        <select value={schedule.interval_days} disabled={saving}
+          onChange={(e) => onSave({ interval_days: Number(e.target.value) })}
+          className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white">
+          {[7, 14, 21, 30].map((d) => <option key={d} value={d}>{d} days</option>)}
+        </select>
+        <label className="text-xs text-slate-500 ml-2">at</label>
+        <select value={schedule.run_at_hour} disabled={saving}
+          onChange={(e) => onSave({ run_at_hour: Number(e.target.value) })}
+          className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white">
+          {Array.from({ length: 24 }, (_, h) => (
+            <option key={h} value={h}>{String(h).padStart(2, "0")}:00</option>
+          ))}
+        </select>
+        {schedule.last_run_at && (
+          <span className="text-xs text-slate-400 ml-auto">
+            Last ran {fmtDateTime(schedule.last_run_at)}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const TRIGGER_LABELS = {
+  first_send: "First report",
+  status_change: "Status changed",
+  action_config_change: "Action code changed",
+  retry_after_reject: "Retry after rejection",
+  manual: "Sent manually",
+};
+
 const BOA_LABELS = {
   "1": "Account freeze",
   "2": "Credit and debit restriction",
@@ -1164,6 +1298,32 @@ const DefaultsCard = ({ module, def, onSave, saving }) => {
   );
 };
 
+// Shown when the ATR credentials aren't wired up. Catching this here means the
+// operator sees the problem before pressing Send, not as a failed run.
+const ConfigWarning = ({ config, module }) => {
+  if (!config || config.ready) return null;
+  return (
+    <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 mb-5">
+      <div className="flex items-start gap-2.5">
+        <AlertCircle size={16} className="text-rose-500 shrink-0 mt-0.5" />
+        <div className="flex-1">
+          <p className="text-sm font-semibold text-rose-800">
+            {module} reports aren't configured yet
+          </p>
+          <ul className="mt-2 space-y-1">
+            {(config.problems || []).map((p, i) => (
+              <li key={i} className="text-xs text-rose-700 leading-relaxed">• {p}</li>
+            ))}
+          </ul>
+          <p className="text-xs text-rose-500 mt-2">
+            Reports stay queued until this is sorted — nothing is lost.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const ATRModule = () => {
   const [module, setModule]   = useState("FRI");
   const [segment, setSegment] = useState("ALL");
@@ -1173,6 +1333,7 @@ const ATRModule = () => {
   const [segCounts, setSegC]  = useState(null);
   const [loadingMeta, setLM]  = useState(false);
 
+  const [config, setConfig]     = useState(null);
   const [defaults, setDefaults] = useState([]);
   const [savingSeg, setSaving]  = useState(null);
   const [showSettings, setShow] = useState(false);
@@ -1184,7 +1345,9 @@ const ATRModule = () => {
 
   const [runs, setRuns]       = useState([]);
   const [loadingRuns, setLR]  = useState(true);
-  const [rejects, setRejects] = useState(null);
+  const [events, setEvents] = useState(null);
+  const [schedule, setSchedule] = useState(null);
+  const [savingSched, setSavingSched] = useState(false);
   const [alert, setAlert]     = useState(null);
 
   const showAlert = (type, message) => {
@@ -1195,9 +1358,11 @@ const ATRModule = () => {
   const loadMeta = useCallback(async (mod) => {
     setLM(true);
     try {
-      const [d, g, df] = await Promise.all([
-        api.fetchMasterDates(mod), api.fetchMasterSegments(mod), api.fetchAtrDefaults(mod),
+      const [d, g, df, cfg] = await Promise.all([
+        api.fetchMasterDates(mod), api.fetchMasterSegments(mod),
+        api.fetchAtrDefaults(mod), api.fetchAtrConfig(mod),
       ]);
+      setConfig(cfg);
       setDates(d.dates || []);
       setSegC(g);
       setDefaults(df.defaults || []);
@@ -1235,16 +1400,25 @@ const ATRModule = () => {
     finally { setSaving(null); }
   };
 
-  const handleSubmit = async (dryRun) => {
+  const handleSubmit = async () => {
     setStarting(true); setAlert(null); setLastRun(null);
     try {
       const job = await api.submitAtr({
         type: module, date: mDate === "ALL" ? null : mDate,
-        segment, dry_run: dryRun,
+        segment,
       });
       setJobId(job.job_id);
     } catch (e) { showAlert("error", e.message); }
     finally { setStarting(false); }
+  };
+
+  const handleSaveSchedule = async (patch) => {
+    setSavingSched(true);
+    try {
+      const r = await api.saveAtrSchedule({ type: module, ...patch });
+      setSchedule(r.saved);
+    } catch (e) { showAlert("error", e.message); }
+    finally { setSavingSched(false); }
   };
 
   const handleRetry = async () => {
@@ -1256,7 +1430,7 @@ const ATRModule = () => {
   };
 
   useJobPoller({
-    jobId, recordCount: preview?.total_pending || 0,
+    jobId, recordCount: preview?.total_eligible || 0,
     onDone: async (result) => {
       setJobId(null); setLastRun(result);
       await Promise.all([loadRuns(), refreshPreview()]);
@@ -1312,12 +1486,18 @@ const ATRModule = () => {
           </div>
         )}
 
+        <ConfigWarning config={config} module={module} />
+
+        <div className="mb-5">
+          <ScheduleCard schedule={schedule} onSave={handleSaveSchedule} saving={savingSched} />
+        </div>
+
         {/* What will be sent */}
         <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 mb-5">
           <div className="flex items-center justify-between mb-3">
             <p className="text-sm font-semibold text-amber-800">Ready to send</p>
             <span className="text-2xl font-bold text-amber-900 tabular-nums">
-              {fmt(preview?.total_pending ?? 0)}
+              {fmt(preview?.total_eligible ?? 0)}
             </span>
           </div>
           <div className="space-y-2">
@@ -1337,22 +1517,16 @@ const ATRModule = () => {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <button onClick={() => handleSubmit(true)} disabled={running || !preview?.total_pending}
-            className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold
-              border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 transition-all
-              disabled:opacity-40 disabled:cursor-not-allowed">
-            <TestTube2 size={15} /> Dry run
-          </button>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <button onClick={handleRetry} disabled={running}
             className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold
               border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 transition-all
               disabled:opacity-40 disabled:cursor-not-allowed">
-            <RotateCcw size={15} /> Requeue failures
+            <RotateCcw size={15} /> Requeue rejected
           </button>
-          <PrimaryBtn onClick={() => handleSubmit(false)} loading={starting} Icon={Send}
-            disabled={running || !preview?.total_pending}
-            gradient="linear-gradient(135deg, #d97706, #b45309)" label="Send reports" />
+          <PrimaryBtn onClick={handleSubmit} loading={starting} Icon={Send}
+            disabled={running || !preview?.total_eligible || (config && !config.ready)}
+            gradient="linear-gradient(135deg, #d97706, #b45309)" label="Send now" />
         </div>
 
         {jobId && <RunningBanner tone="amber" title="Sending to C-DOT…"
@@ -1364,10 +1538,11 @@ const ATRModule = () => {
               <StatChip label="Sent" value={lastRun.total_sent ?? lastRun.sent} tone="green" />
               <StatChip label="Rejected" value={lastRun.total_rejected ?? lastRun.rejected} tone="rose" />
               {(lastRun.skipped ?? 0) > 0 && <StatChip label="Skipped" value={lastRun.skipped} tone="amber" />}
-              {lastRun.dry_run && (
-                <span className="px-2 py-0.5 bg-slate-200 text-slate-600 rounded-full text-xs font-semibold">
-                  Dry run — nothing was sent
-                </span>
+              {(lastRun.resent ?? 0) > 0 && (
+                <StatChip label="Re-sent after a status change" value={lastRun.resent} tone="indigo" />
+              )}
+              {(lastRun.cleared_skipped ?? 0) > 0 && (
+                <StatChip label="Left out (already compliant)" value={lastRun.cleared_skipped} tone="slate" />
               )}
             </div>
           </div>
@@ -1418,60 +1593,87 @@ const ATRModule = () => {
                     : run.status === "partial" ? "bg-amber-100 text-amber-700"
                     : run.status === "failed" ? "bg-rose-100 text-rose-700"
                     : "bg-slate-100 text-slate-600"
-                }`}>{run.dry_run ? "dry run" : run.status}</span>
+                }`}>{run.status}</span>
               </td>
               <td className="px-4 py-3.5 text-slate-400 text-xs whitespace-nowrap">{fmtDateTime(run.started_at)}</td>
               <td className="px-4 py-3.5">
-                {run.total_rejected > 0 && (
-                  <button onClick={async () => {
-                    try { setRejects({ run, rows: (await api.fetchAtrRejects(run.id)).rejects }); }
-                    catch (e) { showAlert("error", e.message); }
-                  }}
-                    className="px-3 py-1.5 text-xs font-semibold text-rose-600 bg-rose-50 hover:bg-rose-600 hover:text-white rounded-lg transition-all whitespace-nowrap">
-                    View errors
-                  </button>
-                )}
+                <button onClick={async () => {
+                  try { setEvents({ run, rows: (await api.fetchAtrEvents(run.id)).events }); }
+                  catch (e) { showAlert("error", e.message); }
+                }}
+                  className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-700 hover:text-white rounded-lg transition-all whitespace-nowrap">
+                  Audit
+                </button>
               </td>
             </tr>
           )} />
       </SectionCard>
 
-      {/* Rejection drawer */}
-      {rejects && (
+      {/* Audit drawer — every attempt in the run, not just the failures */}
+      {events && (
         <div className="fixed inset-0 bg-slate-900/40 flex items-end md:items-center justify-center z-50 p-4"
-          onClick={() => setRejects(null)}>
-          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-hidden flex flex-col"
+          onClick={() => setEvents(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl max-w-4xl w-full max-h-[85vh] overflow-hidden flex flex-col"
             onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
               <div>
-                <h3 className="font-bold text-slate-800">Rejected by C-DOT</h3>
+                <h3 className="font-bold text-slate-800">Report audit</h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  {rejects.run.module} · {rejects.run.segment ? segLabel(rejects.run.segment) : "Both"} · {fmt(rejects.rows.length)} shown
+                  {events.run.module} · {events.run.segment ? segLabel(events.run.segment) : "Both"} ·
+                  {" "}{fmtDateTime(events.run.started_at)} · {fmt(events.rows.length)} entries
                 </p>
               </div>
-              <button onClick={() => setRejects(null)} className="text-slate-400 hover:text-slate-600">
+              <button onClick={() => setEvents(null)} className="text-slate-400 hover:text-slate-600">
                 <X size={18} />
               </button>
             </div>
-            <div className="overflow-y-auto p-6">
+            <div className="overflow-y-auto">
               <table className="w-full text-sm">
-                <thead>
+                <thead className="sticky top-0 bg-slate-50">
                   <tr className="border-b border-slate-200">
-                    <th className="text-left pb-2 text-xs font-semibold text-slate-500 uppercase">Mobile</th>
-                    <th className="text-left pb-2 text-xs font-semibold text-slate-500 uppercase">Customer</th>
-                    <th className="text-left pb-2 text-xs font-semibold text-slate-500 uppercase">Reason</th>
+                    {["Mobile", "Customer", "Outcome", "Why sent", "Action", "Response"].map((h) => (
+                      <th key={h} className="text-left px-4 py-2.5 text-xs font-semibold text-slate-500 uppercase">
+                        {h}
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {rejects.rows.map((r, i) => (
-                    <tr key={i}>
-                      <td className="py-2.5 font-mono text-xs text-slate-700">{r.mobile_no}</td>
-                      <td className="py-2.5 text-xs text-slate-500">{r.cust_id || "—"}</td>
-                      <td className="py-2.5 text-xs text-rose-600">{r.error_message}</td>
+                  {events.rows.map((e) => (
+                    <tr key={e.id} className="hover:bg-slate-50/60">
+                      <td className="px-4 py-2.5 font-mono text-xs text-slate-700">{e.mobile_no}</td>
+                      <td className="px-4 py-2.5 text-xs text-slate-500">{e.cust_id || "—"}</td>
+                      <td className="px-4 py-2.5">
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
+                          e.outcome === "sent" ? "bg-green-100 text-green-700"
+                            : e.outcome === "rejected" ? "bg-rose-100 text-rose-700"
+                            : "bg-amber-100 text-amber-700"
+                        }`}>{e.outcome}</span>
+                      </td>
+                      <td className="px-4 py-2.5 text-xs text-slate-600">
+                        {TRIGGER_LABELS[e.trigger] || e.trigger}
+                        {e.attempt_no > 1 && (
+                          <span className="ml-1 text-slate-400">· attempt {e.attempt_no}</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2.5 text-xs text-slate-600 whitespace-nowrap">
+                        {e.action_type} · {e.action_taken}
+                      </td>
+                      <td className="px-4 py-2.5 text-xs max-w-[220px]">
+                        <span className={e.outcome === "sent" ? "text-slate-500" : "text-rose-600"}>
+                          {e.response_message || "—"}
+                        </span>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+            </div>
+            <div className="px-6 py-3 border-t border-slate-200 bg-slate-50">
+              <p className="text-xs text-slate-400">
+                Every attempt is kept, including the exact payload sent to C-DOT.
+                Query one number's full history at <code className="font-mono">/api/atr/history/&lt;mobile&gt;</code>.
+              </p>
             </div>
           </div>
         </div>

@@ -1,7 +1,9 @@
 import os
+
 from dotenv import load_dotenv
 from flask import Flask, send_from_directory
 from flask_cors import CORS
+
 from routes import routes
 
 load_dotenv()
@@ -15,6 +17,21 @@ def create_app():
 
     # Register blueprints
     app.register_blueprint(routes, url_prefix="/api")
+
+    # Fortnightly ATR cycle.
+    #
+    # Started in every worker on purpose. The ticker takes a Postgres advisory
+    # lock before running anything, so whichever worker gets there first does
+    # the work and the rest return immediately — no leader election, no extra
+    # process to deploy, and no risk of the cycle firing several times.
+    #
+    # Set ATR_SCHEDULER_ENABLED=0 to run it from an external scheduler instead,
+    # by POSTing to /api/atr/schedule/tick.
+    try:
+        from atr import start_scheduler
+        start_scheduler()
+    except Exception as exc:  # never let the scheduler stop the API booting
+        print(f"[APP] ATR scheduler did not start: {exc}")
 
     @app.route("/")
     def root():

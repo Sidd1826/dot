@@ -153,10 +153,10 @@ def _do_master_export(module, feed_date, segment) -> dict:
     return export_master(module=module, feed_date=feed_date, segment=segment)
 
 
-def _do_atr_run(module, feed_date, segment, batch_size, limit, dry_run) -> dict:
+def _do_atr_run(module, feed_date, segment, batch_size, limit) -> dict:
     return atr_service.run_atr(
         module=module, feed_date=feed_date, segment=segment,
-        batch_size=batch_size, limit=limit, dry_run=dry_run,
+        batch_size=batch_size, limit=limit, trigger_source="manual",
     )
 
 
@@ -290,8 +290,19 @@ def route_export_status(job_id):
 # ── ARCHIVE ──────────────────────────────────────────────────────────────────
 @routes.route("/files/list", methods=["GET"])
 def route_files_list():
+    """GET /files/list?type=FRI&source=feed|reconciled
+
+    Defaults to 'feed' so the FRI and MNRL tabs show only their own downloads;
+    reconciled exports live in the Reconcile tab.
+    """
     try:
-        return jsonify(list_export_metadata(_validate_module(request.args.get("type", "FRI"))))
+        source = request.args.get("source", "feed")
+        if source not in ("feed", "reconciled", "all"):
+            raise ValueError("source must be feed, reconciled or all")
+        return jsonify(list_export_metadata(
+            _validate_module(request.args.get("type", "FRI")),
+            None if source == "all" else source,
+        ))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -554,27 +565,54 @@ def route_atr_defaults_save():
         return _fail(e)
 
 
+@routes.route("/atr/config", methods=["GET"])
+def route_atr_config():
+    """GET /atr/config?type=FRI — is ATR wired up? Checked before any send."""
+    try:
+        module = _validate_module(request.args.get("type", "FRI"))
+        return jsonify(atr_service.preflight(module))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
 @routes.route("/atr/preview", methods=["GET"])
 def route_atr_preview():
-    """GET /atr/preview?type=FRI&date=...&segment=IWPB — what a run would send."""
+    """GET /atr/preview?type=FRI&date=...&segment=IWPB
+
+    'eligible' is what a run would actually send: numbers whose state differs
+    from the one already reported. It drops to zero straight after a send, which
+    is what stops a second click doing anything.
+    """
     try:
         module = _validate_module(request.args.get("type", "FRI"))
         feed_date = _optional_date(request.args.get("date"))
         segment = _validate_segment(request.args.get("segment"))
+
         breakdown = []
         for seg in ([segment] if segment else [ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB]):
             defaults = atr_service.get_defaults(module, seg)
+            d = defaults[0] if defaults else None
+            eligible = ms.count_atr_eligible(
+                module, feed_date, seg,
+                d["action_type"] if d else "", str(d["action_taken"]) if d else "",
+            ) if d else 0
             breakdown.append({
                 "segment": seg,
-                "pending": ms.count_atr_pending(module, feed_date, seg),
-                "defaults": defaults[0] if defaults else None,
+                "eligible": eligible,
+                "never_sent": ms.count_atr_pending(module, feed_date, seg),
+                "cleared_skipped": ms.count_cleared_in_window(module, feed_date, seg),
+                "defaults": d,
             })
 
         return jsonify({
             "module": module,
             "date": feed_date,
-            "total_pending": sum(b["pending"] for b in breakdown),
+            "total_eligible": sum(b["eligible"] for b in breakdown),
+            "total_cleared_skipped": sum(b["cleared_skipped"] for b in breakdown),
             "breakdown": breakdown,
+            "schedule": atr_service.get_schedule(module),
         })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -584,7 +622,11 @@ def route_atr_preview():
 
 @routes.route("/atr/submit", methods=["POST"])
 def route_atr_submit():
-    """POST /atr/submit {type, date, segment, dry_run} — background job."""
+    """POST /atr/submit {type, date, segment} — background job.
+
+    Safe to call twice: eligibility is decided by the state fingerprint, so a
+    second call finds nothing to send rather than duplicating reports.
+    """
     req = request.get_json(silent=True) or {}
     try:
         module = _validate_module(req.get("type", "FRI"))
@@ -592,13 +634,12 @@ def route_atr_submit():
         segment = _validate_segment(req.get("segment"))
         batch_size = int(req.get("batch_size") or atr_service.ATR_BATCH_SIZE)
         limit = int(req["limit"]) if req.get("limit") else None
-        dry_run = bool(req.get("dry_run", False))
     except (ValueError, TypeError) as e:
         return jsonify({"error": str(e)}), 400
 
     try:
         job_id = start_job(
-            _do_atr_run, module, feed_date, segment, batch_size, limit, dry_run
+            _do_atr_run, module, feed_date, segment, batch_size, limit
         )
         return jsonify({"job_id": job_id, "status": "pending"}), 202
     except Exception as e:
@@ -621,10 +662,92 @@ def route_atr_runs():
         return _fail(e)
 
 
-@routes.route("/atr/runs/<run_id>/rejects", methods=["GET"])
-def route_atr_rejects(run_id):
+@routes.route("/atr/runs/<run_id>/events", methods=["GET"])
+def route_atr_run_events(run_id):
+    """Every attempt in one run — sent, rejected and skipped alike."""
     try:
-        return jsonify({"run_id": run_id, "rejects": atr_service.list_rejects(run_id)})
+        return jsonify({
+            "run_id": run_id,
+            "events": atr_service.list_events(
+                run_id=run_id,
+                outcome=request.args.get("outcome"),
+                limit=int(request.args.get("limit", 500)),
+            ),
+        })
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/history/<mobile_no>", methods=["GET"])
+def route_atr_number_history(mobile_no):
+    """Full report history for one number: what was sent, when, what came back,
+    and whether a status change caused a re-send."""
+    try:
+        return jsonify(atr_service.number_history(mobile_no))
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/events", methods=["GET"])
+def route_atr_events():
+    """GET /atr/events?type=FRI&outcome=rejected — the audit table."""
+    try:
+        module = request.args.get("type")
+        return jsonify({
+            "events": atr_service.list_events(
+                module=_validate_module(module) if module else None,
+                mobile_no=request.args.get("mobile_no"),
+                outcome=request.args.get("outcome"),
+                limit=int(request.args.get("limit", 500)),
+            )
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/schedule", methods=["GET"])
+def route_atr_schedule():
+    """The fortnightly cycle settings and when it next runs."""
+    try:
+        module = request.args.get("type")
+        return jsonify({
+            "schedule": atr_service.get_schedule(
+                _validate_module(module) if module else None
+            )
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/schedule", methods=["PUT"])
+def route_atr_schedule_save():
+    """PUT /atr/schedule {type, enabled, interval_days, run_at_hour}"""
+    req = request.get_json(silent=True) or {}
+    try:
+        module = _validate_module(req.get("type", "FRI"))
+        return jsonify({"saved": atr_service.save_schedule(
+            module,
+            enabled=req.get("enabled"),
+            interval_days=req.get("interval_days"),
+            run_at_hour=req.get("run_at_hour"),
+        )})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/schedule/tick", methods=["POST"])
+def route_atr_schedule_tick():
+    """Run any cycle that is due. The in-process ticker calls this logic on a
+    timer; the endpoint exists so an external scheduler can drive it instead.
+    Guarded by an advisory lock, so calling it repeatedly is harmless."""
+    try:
+        return jsonify({"ran": atr_service.run_due_cycles()})
     except Exception as e:
         return _fail(e)
 
