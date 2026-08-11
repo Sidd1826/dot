@@ -1015,7 +1015,8 @@ def run_matchoff(
     print(f"[RECONCILE] Matching {unique_count:,} unique numbers against mobilecleanup")
 
     matched_map = match_mob_numbers(mob_numbers)
-    print(f"[RECONCILE] {len(matched_map):,} matched")
+    print(f"[RECONCILE] {len(matched_map):,} unique numbers found in HSBC data "
+          f"(across all {len(input_rows):,} rows, compliant included)")
 
     # Master store gets ALL rows — including compliant ones — so it can spot a
     # number contradicted within the same feed date.
@@ -1034,7 +1035,9 @@ def run_matchoff(
             )
         print(
             f"[MASTER][{module}] inserted={master['master_inserted']:,} "
-            f"updated={master['master_updated']:,} cleared={master['cleared']:,} "
+            f"updated={master['master_updated']:,} "
+            f"cleared={master['cleared']:,} (new={master.get('cleared_new', 0):,}) "
+            f"unreconciled={master['unreconciled']:,} "
             f"conflicts={master['conflicts_ignored']:,} "
             f"segments={master['by_segment']}"
         )
@@ -1077,9 +1080,17 @@ def run_matchoff(
         master=master,
     )
 
+    # Two different denominators, so both are named explicitly:
+    #   unique_matched  distinct numbers found in HSBC data across ALL rows,
+    #                   compliant ones included
+    #   actionable_matched  rows still requiring action that matched; these are
+    #                   the ones written to the master as active
+    # The gap between them is compliant numbers, which clear instead of adding.
     print(
-        f"[RECONCILE] Done. input={len(input_rows):,} matched={matched_count:,} "
-        f"run_id={run_id}"
+        f"[RECONCILE] Done. input_rows={len(input_rows):,} "
+        f"unique_matched={len(matched_map):,} "
+        f"actionable_matched={matched_count:,} "
+        f"compliant_rows={excluded_compliant:,} run_id={run_id}"
     )
 
     cleared = master.get("cleared", 0)

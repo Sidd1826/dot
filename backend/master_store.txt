@@ -787,7 +787,13 @@ def ingest_fri_reconciled(
         "rows_in_file": len(rows),
         "invalid_mobile": invalid,
         "conflicts_ignored": len(conflicted),
-        "cleared": clear_stats["flagged"],
+        # Two clear paths, and BOTH must be counted: reconciled numbers are
+        # inserted/updated as cleared rows by _upsert_cleared, unreconciled ones
+        # can only update a row that already exists. Reporting just the second
+        # made a run that cleared 14 reconciled numbers log "cleared=0".
+        "cleared": cleared_stats["flagged"] + clear_stats["flagged"],
+        "cleared_reconciled": cleared_stats["flagged"],
+        "cleared_new": cleared_stats["inserted"],
         "clear_unmatched": clear_stats["absent_or_already_cleared"],
         "unreconciled": unreconciled,
         "master_inserted": upsert_stats["inserted"],
@@ -900,7 +906,13 @@ def ingest_mnrl_reconciled(
         "rows_in_file": len(rows),
         "invalid_mobile": invalid,
         "conflicts_ignored": len(conflicted),
-        "cleared": clear_stats["flagged"],
+        # Two clear paths, and BOTH must be counted: reconciled numbers are
+        # inserted/updated as cleared rows by _upsert_cleared, unreconciled ones
+        # can only update a row that already exists. Reporting just the second
+        # made a run that cleared 14 reconciled numbers log "cleared=0".
+        "cleared": cleared_stats["flagged"] + clear_stats["flagged"],
+        "cleared_reconciled": cleared_stats["flagged"],
+        "cleared_new": cleared_stats["inserted"],
         "clear_unmatched": clear_stats["absent_or_already_cleared"],
         "unreconciled": unreconciled,
         "master_inserted": upsert_stats["inserted"],
