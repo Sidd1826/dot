@@ -140,14 +140,16 @@ EXPORT_COLUMNS: dict[str, list[str]] = {
     MODULE_FRI: (
         ["mobile_no", "cust_id", "segment"]
         + CUSTOMER_COLS
-        + ["fri", "fri_status", "lsa_id", "tsp_id",
+        + ["fri", "fri_status", "status", "clear_reason", "cleared_on",
+           "lsa_id", "tsp_id",
            "first_reported_on", "last_reported_on", "report_count",
            "atr_status", "atr_action_taken", "atr_submitted_at"]
     ),
     MODULE_MNRL: (
         ["mobile_no", "cust_id", "segment"]
         + CUSTOMER_COLS
-        + ["date_of_disconnection", "disconnection_reason_id", "lsa_id", "tsp_id",
+        + ["date_of_disconnection", "disconnection_reason_id",
+           "status", "clear_reason", "cleared_on", "lsa_id", "tsp_id",
            "first_reported_on", "last_reported_on", "report_count",
            "atr_status", "atr_action_taken", "atr_submitted_at"]
     ),
@@ -160,6 +162,9 @@ EXPORT_LABELS: dict[str, str] = {
     "mobile_no": "Mobile Number",
     "cust_id": "Customer Id",
     "segment": "Classification",
+    "status": "Record Status",
+    "clear_reason": "Cleared Because",
+    "cleared_on": "Cleared On",
     "zbadid": "Address ID",
     "zbnad1": "Name & Address 1",
     "zbnad2": "Name & Address 2",
@@ -480,6 +485,87 @@ def _upsert(module: str, rows: list[tuple]) -> dict:
     return {"received": len(rows), "inserted": inserted, "updated": len(result) - inserted}
 
 
+_CLEARED_UPSERT_CACHE: dict[str, tuple[str, str]] = {}
+
+
+def _cleared_upsert_sql(module: str) -> tuple[str, str]:
+    """Insert-or-update a number as CLEARED.
+
+    A number that reconciles with HSBC and arrives already compliant has never
+    been in the master, so there is nothing to update. It still belongs there:
+    the reconciled report has to be able to say "these turned compliant today".
+    This inserts it in the cleared state, and updates an existing row the same
+    way _clear would.
+    """
+    if module in _CLEARED_UPSERT_CACHE:
+        return _CLEARED_UPSERT_CACHE[module]
+
+    table = _TABLES[module]
+    reason = _CLEAR_REASON[module]
+    extra_col = ", reactivation_id" if module == MODULE_MNRL else ""
+    extra_val = ", %s" if module == MODULE_MNRL else ""
+    extra_upd = ("\n    reactivation_id = COALESCE(EXCLUDED.reactivation_id, m.reactivation_id),"
+                 if module == MODULE_MNRL else "")
+
+    cols = (["mobile_no", "cust_id", "gho_code", "segment"] + CUSTOMER_COLS
+            + ["status", "clear_reason", "cleared_on", "cleared_at",
+               "first_reported_on", "last_reported_on", "report_count", "atr_status"])
+
+    template = (
+        "(%s, %s, %s, %s, "
+        + ", ".join(["%s"] * len(CUSTOMER_COLS))
+        + f", 'cleared', '{reason}', %s::date, NOW(), %s::date, %s::date, 1, 'not_required'"
+        + extra_val + ")"
+    )
+    customer_updates = "\n".join(
+        f"    {c} = COALESCE(EXCLUDED.{c}, m.{c})," for c in CUSTOMER_COLS
+    )
+
+    sql = f"""
+INSERT INTO {table} AS m ({", ".join(cols)}{extra_col})
+VALUES %s
+ON CONFLICT (mobile_no) DO UPDATE SET
+    -- Only a clearance NEWER than the one on file wins, so replaying an old
+    -- file can never un-clear or re-date a number.
+    status       = CASE WHEN m.cleared_on IS NULL OR EXCLUDED.cleared_on > m.cleared_on
+                        THEN 'cleared' ELSE m.status END,
+    clear_reason = CASE WHEN m.cleared_on IS NULL OR EXCLUDED.cleared_on > m.cleared_on
+                        THEN '{reason}' ELSE m.clear_reason END,
+    cleared_on   = CASE WHEN m.cleared_on IS NULL OR EXCLUDED.cleared_on > m.cleared_on
+                        THEN EXCLUDED.cleared_on ELSE m.cleared_on END,
+    cleared_at   = CASE WHEN m.cleared_on IS NULL OR EXCLUDED.cleared_on > m.cleared_on
+                        THEN NOW() ELSE m.cleared_at END,
+    -- A number already reported keeps its ATR history; one that cleared before
+    -- any report was due is marked so it never enters a cycle.
+    atr_status   = CASE WHEN m.atr_send_count > 0 THEN m.atr_status ELSE 'not_required' END,
+    first_reported_on = LEAST(m.first_reported_on, EXCLUDED.first_reported_on),
+    cust_id  = COALESCE(EXCLUDED.cust_id, m.cust_id),
+    gho_code = COALESCE(EXCLUDED.gho_code, m.gho_code),
+    segment  = CASE WHEN EXCLUDED.segment = 'UNKNOWN' THEN m.segment ELSE EXCLUDED.segment END,
+{customer_updates}{extra_upd}
+    updated_at = NOW()
+RETURNING m.mobile_no, (xmax::text::bigint = 0) AS was_insert
+"""
+    _CLEARED_UPSERT_CACHE[module] = (sql, template)
+    return sql, template
+
+
+def _upsert_cleared(module: str, rows: list[tuple], feed_date: date,
+                    source_file) -> dict:
+    """Add or refresh reconciled numbers that arrived already cleared."""
+    if not rows:
+        return {"received": 0, "flagged": 0, "inserted": 0}
+    sql, template = _cleared_upsert_sql(module)
+    with _cursor() as cur:
+        result = psycopg2.extras.execute_values(
+            cur, sql, rows, template=template, page_size=PAGE_SIZE, fetch=True
+        )
+    mobiles = [r[0] for r in result]
+    inserted = sum(1 for r in result if r[1])
+    _write_events(module, mobiles, _CLEAR_REASON[module], feed_date, source_file)
+    return {"received": len(rows), "flagged": len(mobiles), "inserted": inserted}
+
+
 def _clear(module: str, values: list[tuple], feed_date: date, source_file) -> dict:
     if not values:
         return {"received": 0, "flagged": 0, "absent_or_already_cleared": 0}
@@ -669,9 +755,29 @@ def ingest_fri_reconciled(
         ))
 
     upsert_stats = _upsert(MODULE_FRI, _dedupe_rows(reconciled_rows))
-    clear_stats = _clear(
-        MODULE_FRI, [(m, d) for m, d in clear_dates.items()], fdate, source_file
-    )
+
+    # Compliant numbers. Those that reconcile with HSBC are inserted-or-updated
+    # as cleared rows so the report can list what turned compliant today; the
+    # rest can only update a row that already exists.
+    cleared_rows, unmatched_clears = [], []
+    for mobile, clear_date in clear_dates.items():
+        hsbc = matched.get(mobile)
+        if hsbc is None:
+            unmatched_clears.append((mobile, clear_date))
+            continue
+        gho = _txt(hsbc.get(gho_key), 20)
+        cleared_rows.append((
+            mobile,
+            _txt(hsbc.get(cust_id_key), 100),
+            gho,
+            segment_for(gho),
+            *_customer_values(hsbc),
+            clear_date, clear_date, clear_date,
+        ))
+
+    cleared_stats = _upsert_cleared(MODULE_FRI, _dedupe_rows(cleared_rows),
+                                    fdate, source_file)
+    clear_stats = _clear(MODULE_FRI, unmatched_clears, fdate, source_file)
     retract_stats = _retract(MODULE_FRI, sorted(conflicted), fdate, source_file)
     purged = purge_expired()
 
@@ -732,16 +838,32 @@ def ingest_mnrl_reconciled(
     unreconciled = 0
     segment_counts = {s: 0 for s in SEGMENTS}
 
+    cleared_stats = {"flagged": 0, "inserted": 0}
+
     if is_react:
-        values = [
-            (
+        # Same as FRI compliance: a reconciled reactivated number is written to
+        # the master as a cleared row so it shows up in the day's report.
+        cleared_rows, unmatched = [], []
+        for mobile, record in feed.items():
+            clear_date = _to_date(_pick(record, hmap, "date_of_reactivation"), fdate)
+            react_id = _txt(_pick(record, hmap, "reactivation_id"), 50)
+            hsbc = matched.get(mobile)
+            if hsbc is None:
+                unmatched.append((mobile, clear_date, react_id))
+                continue
+            gho = _txt(hsbc.get(gho_key), 20)
+            cleared_rows.append((
                 mobile,
-                _to_date(_pick(record, hmap, "date_of_reactivation"), fdate),
-                _txt(_pick(record, hmap, "reactivation_id"), 50),
-            )
-            for mobile, record in feed.items()
-        ]
-        clear_stats = _clear(MODULE_MNRL, values, fdate, source_file)
+                _txt(hsbc.get(cust_id_key), 100),
+                gho,
+                segment_for(gho),
+                *_customer_values(hsbc),
+                clear_date, clear_date, clear_date,
+                react_id,
+            ))
+        cleared_stats = _upsert_cleared(MODULE_MNRL, _dedupe_rows(cleared_rows),
+                                        fdate, source_file)
+        clear_stats = _clear(MODULE_MNRL, unmatched, fdate, source_file)
     else:
         reconciled_rows = []
         for mobile, record in feed.items():
@@ -793,20 +915,39 @@ def ingest_mnrl_reconciled(
 
 # ── FILTERED READS ───────────────────────────────────────────────────────────
 def _filter_clause(feed_date: Any = None, segment: str | None = None,
-                   include_cleared: bool = False) -> tuple[str, list]:
-    """Shared WHERE for download / ATR / count. Returns (sql_fragment, params).
+                   include_cleared: bool = False,
+                   record_status: str = "active") -> tuple[str, list]:
+    """Shared WHERE for download / ATR / count.
 
-    Segment IS the GHO code, mapped: the code 'IWPB' -> IWPB, anything else
-    (currently CIB) -> Non-IWPB. There is no third axis to filter on, so
-    segment is the only classification predicate.
+    record_status
+        'active'   only numbers still requiring action  (the ATR queue)
+        'cleared'  only numbers that turned compliant / were reactivated
+        'all'      both — what the reconciled report for a date shows
+
+    Date matching follows the status. For 'active' a row belongs to a date if it
+    was reported that day; for cleared rows the meaningful date is the day it
+    cleared, so 'all' matches EITHER. That is what puts "numbers that turned
+    compliant today" into today's report alongside the ones still outstanding.
     """
-    clauses = [] if include_cleared else ["status = 'active'"]
+    clauses: list[str] = []
     params: list[Any] = []
+
+    if not include_cleared and record_status == "active":
+        clauses.append("status = 'active'")
+    elif record_status == "cleared":
+        clauses.append("status = 'cleared'")
 
     fdate = _to_date(feed_date)
     if fdate:
-        clauses.append("last_reported_on = %s")
-        params.append(fdate)
+        if record_status == "active":
+            clauses.append("last_reported_on = %s")
+            params.append(fdate)
+        elif record_status == "cleared":
+            clauses.append("cleared_on = %s")
+            params.append(fdate)
+        else:
+            clauses.append("(last_reported_on = %s OR cleared_on = %s)")
+            params.extend([fdate, fdate])
 
     if segment and segment.upper() not in ("ALL", ""):
         clauses.append("segment = %s")
@@ -815,16 +956,18 @@ def _filter_clause(feed_date: Any = None, segment: str | None = None,
     return (" AND ".join(clauses) or "TRUE"), params
 
 
-def count_active(module: str, feed_date: Any = None, segment: str | None = None) -> int:
+def count_active(module: str, feed_date: Any = None, segment: str | None = None,
+                 record_status: str = "active") -> int:
     table = _TABLES[module.upper()]
-    where, params = _filter_clause(feed_date, segment)
+    where, params = _filter_clause(feed_date, segment, record_status=record_status)
     with _cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", params)
         return int(cur.fetchone()[0])
 
 
 def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
-                columns: list[str] | None = None) -> Iterator[dict]:
+                columns: list[str] | None = None,
+                record_status: str = "active") -> Iterator[dict]:
     """Stream master rows for export.
 
     Uses a NAMED (server-side) cursor: Postgres holds the result set and ships
@@ -835,7 +978,7 @@ def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
     module = module.upper()
     table = _TABLES[module]
     cols = columns or EXPORT_COLUMNS[module]
-    where, params = _filter_clause(feed_date, segment)
+    where, params = _filter_clause(feed_date, segment, record_status=record_status)
 
     conn = _get_pool().getconn()
     name = f"stream_{module.lower()}_{os.getpid()}_{id(params)}"
@@ -844,7 +987,7 @@ def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
         cur.itersize = STREAM_SIZE
         cur.execute(
             f"SELECT {', '.join(cols)} FROM {table} WHERE {where} "
-            f"ORDER BY last_reported_on DESC, id",
+            f"ORDER BY GREATEST(last_reported_on, COALESCE(cleared_on, last_reported_on)) DESC, id",
             params,
         )
         for row in cur:

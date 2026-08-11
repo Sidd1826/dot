@@ -875,8 +875,12 @@ def export_master(
     module: str,
     feed_date: str | None = None,
     segment: str | None = None,
+    record_status: str = "all",
 ) -> dict:
     """Stream the filtered master straight into workbook parts and upload each.
+
+    record_status defaults to 'all' so a date's report carries both the numbers
+    still requiring action and the ones that turned compliant that day.
 
     Nothing is materialised: rows arrive from a server-side cursor, go into a
     write-only worksheet, and each finished part is uploaded and dropped before
@@ -885,7 +889,7 @@ def export_master(
     module = module.upper()
     container = _get_container_name(module)
 
-    total = ms.count_active(module, feed_date, segment)
+    total = ms.count_active(module, feed_date, segment, record_status)
     if total == 0:
         # An empty selection is a normal answer, not a failure. Returning a
         # result lets the UI say "nothing here" instead of showing a red error.
@@ -908,9 +912,11 @@ def export_master(
     columns = ms.EXPORT_COLUMNS[module]
     label_date = feed_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     seg_label = (segment or "all").replace("-", "").lower()
-    base_name = f"{module.lower()}_{seg_label}_{label_date}_{total}_records.xlsx"
+    status_label = "" if record_status == "all" else f"_{record_status}"
+    base_name = f"{module.lower()}_{seg_label}{status_label}_{label_date}_{total}_records.xlsx"
 
-    row_iter = ms.iter_active(module, feed_date, segment, columns=columns)
+    row_iter = ms.iter_active(module, feed_date, segment, columns=columns,
+                              record_status=record_status)
 
     parts_meta = []
     exported = 0
@@ -940,6 +946,7 @@ def export_master(
         "module": module,
         "feed_date": feed_date,
         "segment": segment,
+        "record_status": record_status,
         "record_count": exported,
         "file_count": len(parts_meta),
         "parts": parts_meta,
@@ -987,8 +994,8 @@ def run_matchoff(
         ]
         excluded_compliant = len(input_rows) - len(eligible_rows)
         print(
-            f"[RECONCILE] {excluded_compliant:,} compliant rows held back from the "
-            f"match, {len(eligible_rows):,} to reconcile"
+            f"[RECONCILE] {len(eligible_rows):,} actionable, "
+            f"{excluded_compliant:,} already compliant"
         )
     else:
         eligible_rows = input_rows
@@ -1000,7 +1007,10 @@ def run_matchoff(
     # silently skip the clearing, which is the whole point of a compliant file.
     all_compliant = not eligible_rows and not is_clear_feed
 
-    mob_numbers = [row.get(mob_col) for row in eligible_rows]
+    # Match EVERY row, compliant ones included. A compliant number has to be
+    # reconciled too: without a cust_id it cannot be written to the master, and
+    # the report would not be able to show what turned compliant today.
+    mob_numbers = [row.get(mob_col) for row in input_rows]
     unique_count = len({str(m).strip() for m in mob_numbers if m})
     print(f"[RECONCILE] Matching {unique_count:,} unique numbers against mobilecleanup")
 
@@ -1117,4 +1127,83 @@ def run_matchoff(
         "sas_url": sas_url,
         "run_date": run_date,
         "master": master,
+    }
+
+
+# ATR REPORT EXPORT
+AZURE_CONTAINER_ATR_REPORTS = os.environ.get("AZURE_CONTAINER_ATR_REPORTS", "atr-reports")
+
+
+def export_atr_report(
+    run_id: str | None = None,
+    module: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    outcome: str | None = None,
+) -> dict:
+    """Build the ATR submission report as Excel and upload it.
+
+    One row per number per attempt, with every field that was sent to C-DOT and
+    the response that came back — the same detail /api/atr/history/<mobile>
+    returns, for a whole run or date range at once.
+
+    Streamed from atr_events through the same part-splitting writer as the
+    master export, so a fortnightly run covering lakhs of numbers stays within
+    one workbook's worth of memory.
+    """
+    import atr as atr_service
+
+    total = atr_service.count_report_rows(run_id, module, date_from, date_to, outcome)
+    if total == 0:
+        return {
+            "status": "empty",
+            "record_count": 0,
+            "run_id": run_id,
+            "module": module,
+            "message": (
+                "No submissions match those filters yet. A report appears here "
+                "once reports have actually been sent."
+            ),
+        }
+
+    label_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if run_id:
+        stem = f"atr_report_run_{str(run_id)[:8]}"
+    else:
+        parts = ["atr_report", (module or "all").lower()]
+        if date_from:
+            parts.append(str(date_from))
+        stem = "_".join(parts)
+    base_name = f"{stem}_{total}_records.xlsx"
+
+    row_iter = atr_service.iter_report_rows(run_id, module, date_from, date_to, outcome)
+
+    parts_meta = []
+    exported = 0
+    for buf, part_fname, row_count, part_idx in build_excel_parts_stream(
+        row_iter, base_name, atr_service.REPORT_COLUMNS, EXCEL_MAX_ROWS,
+        labels=atr_service.REPORT_LABELS,
+    ):
+        blob_name = f"{label_date}/{part_fname}"
+        upload_blob(AZURE_CONTAINER_ATR_REPORTS, blob_name, buf)
+        buf.close()
+        parts_meta.append({
+            "file_name": part_fname, "record_count": row_count, "blob_name": blob_name,
+        })
+        exported += row_count
+        print(f"[ATR REPORT] part {part_idx} -> {blob_name} ({row_count:,} rows)")
+
+    sas_url = get_sas_download_url(
+        AZURE_CONTAINER_ATR_REPORTS, parts_meta[0]["blob_name"], expiry_hours=24
+    )
+
+    return {
+        "status": "done",
+        "run_id": run_id,
+        "module": module,
+        "record_count": exported,
+        "file_count": len(parts_meta),
+        "parts": parts_meta,
+        "file_name": parts_meta[0]["file_name"],
+        "sas_url": sas_url,
     }

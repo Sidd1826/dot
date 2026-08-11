@@ -6,6 +6,7 @@ from flask import Blueprint, jsonify, request
 import atr as atr_service
 from azure_utils import (
     export_and_store,
+    export_atr_report,
     export_master,
     get_export_metadata_row,
     get_matchoff_run,
@@ -149,8 +150,14 @@ def _do_reconcile(container, date_folder, file_name, mob_col) -> dict:
     )
 
 
-def _do_master_export(module, feed_date, segment) -> dict:
-    return export_master(module=module, feed_date=feed_date, segment=segment)
+def _do_master_export(module, feed_date, segment, record_status) -> dict:
+    return export_master(module=module, feed_date=feed_date, segment=segment,
+                         record_status=record_status)
+
+
+def _do_atr_report(run_id, module, date_from, date_to, outcome) -> dict:
+    return export_atr_report(run_id=run_id, module=module, date_from=date_from,
+                             date_to=date_to, outcome=outcome)
 
 
 def _do_atr_run(module, feed_date, segment, batch_size, limit) -> dict:
@@ -458,11 +465,15 @@ def route_master_count():
         module = _validate_module(request.args.get("type", "FRI"))
         feed_date = _optional_date(request.args.get("date"))
         segment = _validate_segment(request.args.get("segment"))
+        record_status = (request.args.get("record_status") or "all").lower()
         return jsonify({
             "module": module,
             "date": feed_date,
             "segment": segment or "All",
-            "count": ms.count_active(module, feed_date, segment),
+            "record_status": record_status,
+            "count": ms.count_active(module, feed_date, segment, record_status),
+            "active": ms.count_active(module, feed_date, segment, "active"),
+            "cleared": ms.count_active(module, feed_date, segment, "cleared"),
             "atr_pending": ms.count_atr_pending(module, feed_date, segment),
         })
     except ValueError as e:
@@ -479,11 +490,14 @@ def route_master_download():
         module = _validate_module(req.get("type", "FRI"))
         feed_date = _optional_date(req.get("date"))
         segment = _validate_segment(req.get("segment"))
+        record_status = (req.get("record_status") or "all").lower()
+        if record_status not in ("active", "cleared", "all"):
+            raise ValueError("record_status must be active, cleared or all")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
     try:
-        job_id = start_job(_do_master_export, module, feed_date, segment)
+        job_id = start_job(_do_master_export, module, feed_date, segment, record_status)
         return jsonify({"job_id": job_id, "status": "pending"}), 202
     except Exception as e:
         return _fail(e)
@@ -701,6 +715,31 @@ def route_atr_events():
                 limit=int(request.args.get("limit", 500)),
             )
         })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
+@routes.route("/atr/report", methods=["POST"])
+def route_atr_report():
+    """POST /atr/report {run_id} or {type, date_from, date_to, outcome}
+
+    Builds the full submission report as Excel: one row per number per attempt,
+    with everything sent to C-DOT and the response received.
+    """
+    req = request.get_json(silent=True) or {}
+    try:
+        module = req.get("type")
+        module = _validate_module(module) if module else None
+        job_id = start_job(
+            _do_atr_report,
+            req.get("run_id"), module,
+            _optional_date(req.get("date_from")),
+            _optional_date(req.get("date_to")),
+            req.get("outcome"),
+        )
+        return jsonify({"job_id": job_id, "status": "pending"}), 202
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:

@@ -220,7 +220,8 @@ CREATE TABLE IF NOT EXISTS atr_defaults (
     module                VARCHAR(10)  NOT NULL CHECK (module IN ('FRI', 'MNRL')),
     segment               VARCHAR(15)  NOT NULL CHECK (segment IN ('IWPB', 'Non-IWPB')),
 
-    action_type           VARCHAR(5)   NOT NULL CHECK (action_type IN ('BOA', 'BOT')),
+    -- NULL for MNRL, which has no BOA/BOT split. v3.4 tightens this per module.
+    action_type           VARCHAR(5)   CHECK (action_type IS NULL OR action_type IN ('BOA', 'BOT')),
     action_taken          VARCHAR(5)   NOT NULL,
     investigation_details VARCHAR(500),
     grievance_received    VARCHAR(3)   NOT NULL DEFAULT 'No' CHECK (grievance_received IN ('Yes', 'No')),
@@ -254,10 +255,13 @@ CREATE TABLE IF NOT EXISTS atr_defaults (
 INSERT INTO atr_defaults
     (module, segment, action_type, action_taken, investigation_details, grievance_received, remarks)
 VALUES
+    -- FRI carries action_type (BOA/BOT); MNRL has no such field, so NULL.
+    -- CHECK constraints are evaluated before ON CONFLICT, so these rows must
+    -- already satisfy the v3.4 shape constraint or a re-run would fail here.
     ('FRI',  'IWPB',     'BOA', '2', 'Credit and debit restriction applied after internal review', 'No', 'Auto-submitted by DOT platform'),
     ('FRI',  'Non-IWPB', 'BOA', '8', 'Debit restriction applied after internal review',            'No', 'Auto-submitted by DOT platform'),
-    ('MNRL', 'IWPB',     'BOA', '2', 'Credit and debit restriction applied after internal review', 'No', 'Auto-submitted by DOT platform'),
-    ('MNRL', 'Non-IWPB', 'BOA', '8', 'Debit restriction applied after internal review',            'No', 'Auto-submitted by DOT platform')
+    ('MNRL', 'IWPB',     NULL,  '2', 'Debit and credit restrictions applied after internal review','No', NULL),
+    ('MNRL', 'Non-IWPB', NULL,  '8', 'Debit restriction applied after internal review',            'No', NULL)
 ON CONFLICT (module, segment) DO NOTHING;
 
 
@@ -605,6 +609,162 @@ CREATE OR REPLACE VIEW v_atr_resends AS
     WHERE outcome = 'sent'
     GROUP BY module, mobile_no
     HAVING COUNT(*) > 1;
+
+
+-- =============================================================================
+-- v3.3 — COMPLIANT ROWS IN THE MASTER, LOCAL-TIME SCHEDULING, ATR REPORTS
+-- =============================================================================
+
+-- ── 1. Cycle times are local, not UTC ───────────────────────────────────────
+-- Without this, run_at_hour=2 means 02:00 in the SERVER timezone. Azure
+-- Postgres runs in UTC, so "2 AM" would actually have fired at 07:30 IST.
+ALTER TABLE atr_schedule ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata';
+
+-- Re-anchor to the next occurrence of the local hour. Applies to schedules that
+-- have never run (the column DEFAULT is evaluated in the server timezone, so a
+-- fresh install would otherwise sit at 02:00 UTC = 07:30 IST) and to any that
+-- are already overdue.
+UPDATE atr_schedule
+SET next_run_at = (
+        date_trunc('day', (NOW() AT TIME ZONE timezone))
+        + CASE
+            WHEN (NOW() AT TIME ZONE timezone)::time < (run_at_hour || ':00')::time
+            THEN INTERVAL '0 day'      -- today, the hour has not passed yet
+            ELSE INTERVAL '1 day'      -- tomorrow
+          END
+        + (run_at_hour || ' hours')::interval
+    ) AT TIME ZONE timezone,
+    updated_at = NOW()
+WHERE last_run_at IS NULL OR next_run_at <= NOW();
+
+
+-- ── 2. Compliant / reactivated numbers belong in the master too ─────────────
+-- Previously a compliant number only ever UPDATED an existing row; if it had
+-- never been seen it was dropped. Now a reconciled compliant number is inserted
+-- as a cleared row, so "numbers that turned compliant today" can be reported.
+-- atr_status 'not_required' marks a row that cleared before any report was due.
+CREATE INDEX IF NOT EXISTS idx_fri_master_cleared_on
+    ON fri_master (cleared_on) WHERE status = 'cleared';
+CREATE INDEX IF NOT EXISTS idx_mnrl_master_cleared_on
+    ON mnrl_master (cleared_on) WHERE status = 'cleared';
+
+-- Downloads filter on either date, so both need to be indexed together
+CREATE INDEX IF NOT EXISTS idx_fri_master_report_dates
+    ON fri_master (last_reported_on, cleared_on);
+CREATE INDEX IF NOT EXISTS idx_mnrl_master_report_dates
+    ON mnrl_master (last_reported_on, cleared_on);
+
+
+-- ── 3. What the reconciled report shows for a date ──────────────────────────
+-- Active numbers reported that day, PLUS numbers that cleared that day.
+CREATE OR REPLACE VIEW v_fri_daily_report AS
+    SELECT *, CASE WHEN status = 'cleared' THEN clear_reason ELSE fri_status END AS report_status
+    FROM fri_master;
+
+CREATE OR REPLACE VIEW v_mnrl_daily_report AS
+    SELECT *, CASE WHEN status = 'cleared' THEN clear_reason ELSE 'disconnected' END AS report_status
+    FROM mnrl_master;
+
+
+-- =============================================================================
+-- v3.4 — MNRL ATR CONTRACT
+--
+-- MNRL differs from FRI in ways the defaults table has to accommodate:
+--   * no action_type (no BOA/BOT split) — one flat code table, 1-10
+--   * investigation_details is MANDATORY, max 250 chars (FRI: optional, 500)
+--   * no remarks / upi_id / money fields
+--   * disconnectionreason_id is required per number and comes from the FEED,
+--     so it is not stored here at all
+-- =============================================================================
+
+-- action_type must be nullable: MNRL has no such concept
+ALTER TABLE atr_defaults ALTER COLUMN action_type DROP NOT NULL;
+ALTER TABLE atr_defaults DROP CONSTRAINT IF EXISTS atr_defaults_action_type_check;
+ALTER TABLE atr_defaults ADD CONSTRAINT atr_defaults_action_type_check
+    CHECK (action_type IS NULL OR action_type IN ('BOA', 'BOT'));
+
+-- atr_runs records whatever was in force; MNRL rows simply have no action_type
+ALTER TABLE atr_runs ALTER COLUMN action_type DROP NOT NULL;
+
+-- Re-seed the MNRL defaults against the MNRL code table.
+--   1 Account Frozen | 2 Debit/Credit Restrictions | 3 Found Compliant
+--   4 Others | 5 Transaction Decline | 6 Alert Generated | 7 Service Denied
+--   8 Debit Restriction | 9 Rejected at Onboarding | 10 Blacklisted
+-- PLACEHOLDERS — confirm with compliance before the first live run.
+UPDATE atr_defaults
+SET action_type = NULL,
+    action_taken = CASE segment WHEN 'IWPB' THEN '2' ELSE '8' END,
+    investigation_details = COALESCE(
+        NULLIF(left(investigation_details, 250), ''),
+        CASE segment
+            WHEN 'IWPB' THEN 'Debit and credit restrictions applied after internal review'
+            ELSE 'Debit restriction applied after internal review'
+        END
+    ),
+    remarks = NULL,
+    total_money_saved = NULL,
+    transaction_declined = NULL,
+    updated_at = NOW()
+WHERE module = 'MNRL';
+
+-- Only now that the MNRL rows conform can the shape be enforced: FRI requires
+-- action_type, MNRL must not carry one and must have investigation_details.
+ALTER TABLE atr_defaults DROP CONSTRAINT IF EXISTS chk_atr_defaults_module_shape;
+ALTER TABLE atr_defaults ADD CONSTRAINT chk_atr_defaults_module_shape CHECK (
+    (module = 'FRI'  AND action_type IS NOT NULL)
+ OR (module = 'MNRL' AND action_type IS NULL AND investigation_details IS NOT NULL)
+);
+
+-- MNRL caps investigation_details at 250 characters
+DO $$ BEGIN
+    ALTER TABLE atr_defaults ADD CONSTRAINT chk_atr_investigation_len CHECK (
+        module <> 'MNRL' OR length(investigation_details) <= 250
+    );
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- Reference tables, so the codes are queryable rather than only in code
+CREATE TABLE IF NOT EXISTS atr_code_reference (
+    module      VARCHAR(10) NOT NULL CHECK (module IN ('FRI', 'MNRL')),
+    code_type   VARCHAR(24) NOT NULL,
+    code        VARCHAR(5)  NOT NULL,
+    action_type VARCHAR(5),
+    description TEXT        NOT NULL,
+    -- FRI's BOA and BOT code sets do not overlap, so code alone is unique
+    PRIMARY KEY (module, code_type, code)
+);
+
+INSERT INTO atr_code_reference (module, code_type, code, action_type, description) VALUES
+    ('FRI','action_taken','1','BOA','Account Freeze'),
+    ('FRI','action_taken','2','BOA','Credit and Debit Restriction'),
+    ('FRI','action_taken','3','BOA','Account Not Found Suspicious after EDD'),
+    ('FRI','action_taken','7','BOA','User Denied Service (Loan / Insurance / Credit Card etc.)'),
+    ('FRI','action_taken','8','BOA','Debit Restriction'),
+    ('FRI','action_taken','9','BOA','User Rejected at the Time of Onboarding'),
+    ('FRI','action_taken','10','BOA','User Blacklisted'),
+    ('FRI','action_taken','5','BOT','Transaction Declined'),
+    ('FRI','action_taken','6','BOT','User Blacklisted'),
+    ('MNRL','action_taken','1',NULL,'Bank/Wallet Account Frozen'),
+    ('MNRL','action_taken','2',NULL,'Debit/Credit Restrictions on Account'),
+    ('MNRL','action_taken','3',NULL,'Bank/Wallet Account found Compliant'),
+    ('MNRL','action_taken','4',NULL,'Others'),
+    ('MNRL','action_taken','5',NULL,'Transaction Decline'),
+    ('MNRL','action_taken','6',NULL,'Transaction Alert/Warning/Notification Generated'),
+    ('MNRL','action_taken','7',NULL,'User denied service (loan/insurance/credit card etc.)'),
+    ('MNRL','action_taken','8',NULL,'Debit Restriction'),
+    ('MNRL','action_taken','9',NULL,'User rejected at the time of onboarding'),
+    ('MNRL','action_taken','10',NULL,'User blacklisted'),
+    ('MNRL','disconnection_reason','1',NULL,'Subscriber Verification Non-compliant Cases'),
+    ('MNRL','disconnection_reason','2',NULL,'Disconnection due to Zero usage or Non payment'),
+    ('MNRL','disconnection_reason','3',NULL,'LEAs Reported Cybercrime'),
+    ('MNRL','disconnection_reason','4',NULL,'DoT Reported Fake or forged cases'),
+    ('MNRL','disconnection_reason','5',NULL,'TSP Internal Analysis'),
+    ('MNRL','disconnection_reason','6',NULL,'Others'),
+    ('MNRL','reactivation_reason','1',NULL,'Reactivation to same customer due to late reverification'),
+    ('MNRL','reactivation_reason','2',NULL,'Activation after returning from MNP'),
+    ('MNRL','reactivation_reason','3',NULL,'Reactivation to same customer due to grievance'),
+    ('MNRL','reactivation_reason','4',NULL,'Reactivation to same customer due to request from LEA/DoT'),
+    ('MNRL','reactivation_reason','5',NULL,'Reactivation to other customer due to other reason')
+ON CONFLICT DO NOTHING;
 
 
 -- =============================================================================

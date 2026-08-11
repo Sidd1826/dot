@@ -93,6 +93,7 @@ const api = {
   retryAtr:         (p)      => api.post("/atr/retry", p),
   fetchAtrSchedule: (type)   => api.get(`/atr/schedule?${qs({ type })}`),
   saveAtrSchedule:  (body)   => api.put("/atr/schedule", body),
+  buildAtrReport:   (body)   => api.post("/atr/report", body),
 };
 
 // ─────────────────────────────────────────────
@@ -781,6 +782,7 @@ const ReconcileModule = () => {
   const [runs, setRuns]       = useState([]);
   const [loadingRuns, setLR]  = useState(true);
   const [alert, setAlert]     = useState(null);
+  const [recStatus, setRecStatus] = useState("all");
   const [recFiles, setRecFiles] = useState([]);
   const [loadingRecFiles, setLRF] = useState(true);
 
@@ -843,9 +845,10 @@ const ReconcileModule = () => {
     try {
       setPreview(await api.fetchMasterCount({
         type: module, date: mDate === "ALL" ? "" : mDate, segment,
+        record_status: recStatus,
       }));
     } catch { setPreview(null); }
-  }, [module, mDate, segment]);
+  }, [module, mDate, segment, recStatus]);
 
   useEffect(() => { loadFolders(container); loadRuns(); }, []); // eslint-disable-line
   useEffect(() => { if (srcDate) loadSrcFiles(container, srcDate); }, [srcDate]); // eslint-disable-line
@@ -905,6 +908,7 @@ const ReconcileModule = () => {
     try {
       const job = await api.startMasterDownload({
         type: module, date: mDate === "ALL" ? null : mDate, segment,
+        record_status: recStatus,
       });
       setDlJob(job.job_id);
     } catch (e) { showAlert("error", e.message); }
@@ -1002,9 +1006,24 @@ const ReconcileModule = () => {
           loading={loadingMeta} disabled={downloading}
         />
 
+        <div className="mt-4">
+          <SegmentedControl label="Include" value={recStatus} onChange={setRecStatus}
+            disabled={downloading}
+            options={[
+              { value: "all", label: "Everything", count: preview?.count },
+              { value: "active", label: "Still open", count: preview?.active },
+              { value: "cleared", label: `Cleared${module === "FRI" ? " / compliant" : " / reactivated"}`, count: preview?.cleared },
+            ]} />
+          <p className="text-xs text-slate-400 mt-1.5">
+            {mDate === "ALL"
+              ? "Cleared numbers are matched on the day they cleared."
+              : `For ${mDate}: numbers reported that day plus numbers that cleared that day.`}
+          </p>
+        </div>
+
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 my-5">
-          <CountBadge label="Will download" count={preview?.count} color="slate" sub="active records" />
-          <CountBadge label="Awaiting ATR" count={preview?.atr_pending} color="amber" sub="of those records" />
+          <CountBadge label="Will download" count={preview?.count} color="slate" sub="records" />
+          <CountBadge label="Awaiting ATR" count={preview?.atr_pending} color="amber" sub="still open" />
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 flex flex-col justify-center gap-1.5">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Selection</p>
             <p className="text-sm text-slate-700 font-medium">
@@ -1210,6 +1229,19 @@ const TRIGGER_LABELS = {
   manual: "Sent manually",
 };
 
+const MNRL_LABELS = {
+  "1": "Bank/Wallet account frozen",
+  "2": "Debit/credit restrictions on account",
+  "3": "Bank/wallet account found compliant",
+  "4": "Others",
+  "5": "Transaction decline",
+  "6": "Transaction alert/warning generated",
+  "7": "User denied service (loan/insurance/card)",
+  "8": "Debit restriction",
+  "9": "User rejected at onboarding",
+  "10": "User blacklisted",
+};
+
 const BOA_LABELS = {
   "1": "Account freeze",
   "2": "Credit and debit restriction",
@@ -1228,7 +1260,10 @@ const DefaultsCard = ({ module, def, onSave, saving }) => {
   useEffect(() => { setDraft(def); setDirty(false); }, [def]);
 
   const set = (k, v) => { setDraft((d) => ({ ...d, [k]: v })); setDirty(true); };
-  const labels = draft.action_type === "BOT" ? BOT_LABELS : BOA_LABELS;
+  // MNRL has no BOA/BOT split — one flat code table, and no remarks field.
+  const isMnrl = module === "MNRL";
+  const labels = isMnrl ? MNRL_LABELS : (draft.action_type === "BOT" ? BOT_LABELS : BOA_LABELS);
+  const maxInvestigation = isMnrl ? 250 : 500;
 
   return (
     <div className="rounded-xl border border-slate-200 p-4 bg-white">
@@ -1240,37 +1275,46 @@ const DefaultsCard = ({ module, def, onSave, saving }) => {
         <span className="text-xs text-slate-400">{module}</span>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 mb-3">
-        <SegmentedControl label="Type" value={draft.action_type}
-          onChange={(v) => { set("action_type", v); set("action_taken", v === "BOT" ? "5" : "2"); }}
-          options={[{ value: "BOA", label: "BOA" }, { value: "BOT", label: "BOT" }]} />
+      <div className={`grid ${isMnrl ? "grid-cols-1" : "grid-cols-2"} gap-3 mb-3`}>
+        {!isMnrl && (
+          <SegmentedControl label="Type" value={draft.action_type}
+            onChange={(v) => { set("action_type", v); set("action_taken", v === "BOT" ? "5" : "2"); }}
+            options={[{ value: "BOA", label: "BOA" }, { value: "BOT", label: "BOT" }]} />
+        )}
         <SearchableSelect label="Action taken" value={String(draft.action_taken)}
           onChange={(v) => set("action_taken", v)}
           options={Object.entries(labels).map(([code, text]) => ({ value: code, label: `${code} · ${text}` }))} />
       </div>
 
       <div className="flex flex-col gap-1.5 mb-3">
-        <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Investigation details</label>
-        <textarea rows={2} maxLength={500} value={draft.investigation_details || ""}
+        <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">
+          Investigation details {isMnrl && <span className="text-rose-500 normal-case">· required</span>}
+        </label>
+        <textarea rows={2} maxLength={maxInvestigation} value={draft.investigation_details || ""}
           onChange={(e) => set("investigation_details", e.target.value)}
           className="px-3 py-2 rounded-lg border border-slate-200 text-sm text-slate-700 resize-none
             focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent" />
+        <span className="text-xs text-slate-400 self-end">
+          {(draft.investigation_details || "").length}/{maxInvestigation}
+        </span>
       </div>
 
       <div className="grid grid-cols-2 gap-3 mb-3">
         <SegmentedControl label="Grievance received" value={draft.grievance_received || "No"}
           onChange={(v) => set("grievance_received", v)}
           options={[{ value: "No", label: "No" }, { value: "Yes", label: "Yes" }]} />
-        <div className="flex flex-col gap-1.5">
-          <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Remarks</label>
-          <input type="text" maxLength={100} value={draft.remarks || ""}
-            onChange={(e) => set("remarks", e.target.value)}
-            className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm text-slate-700
-              focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent" />
-        </div>
+        {!isMnrl && (
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Remarks</label>
+            <input type="text" maxLength={100} value={draft.remarks || ""}
+              onChange={(e) => set("remarks", e.target.value)}
+              className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm text-slate-700
+                focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent" />
+          </div>
+        )}
       </div>
 
-      {draft.action_type === "BOT" && (
+      {!isMnrl && draft.action_type === "BOT" && (
         <div className="grid grid-cols-2 gap-3 mb-3">
           <div className="flex flex-col gap-1.5">
             <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Money saved (₹)</label>
@@ -1348,6 +1392,9 @@ const ATRModule = () => {
   const [events, setEvents] = useState(null);
   const [schedule, setSchedule] = useState(null);
   const [savingSched, setSavingSched] = useState(false);
+  const [reportJob, setReportJob] = useState(null);
+  const [reportFile, setReportFile] = useState(null);
+  const [buildingReport, setBuildingReport] = useState(false);
   const [alert, setAlert]     = useState(null);
 
   const showAlert = (type, message) => {
@@ -1421,6 +1468,19 @@ const ATRModule = () => {
     finally { setSavingSched(false); }
   };
 
+  // Full submission report: one row per number per attempt, with everything
+  // sent to C-DOT and the response received.
+  const handleBuildReport = async (runId) => {
+    setBuildingReport(true); setReportFile(null); setAlert(null);
+    try {
+      const job = await api.buildAtrReport(
+        runId ? { run_id: runId } : { type: module }
+      );
+      setReportJob(job.job_id);
+    } catch (e) { showAlert("error", e.message); }
+    finally { setBuildingReport(false); }
+  };
+
   const handleRetry = async () => {
     try {
       const r = await api.retryAtr({ type: module, date: mDate === "ALL" ? null : mDate, segment });
@@ -1428,6 +1488,18 @@ const ATRModule = () => {
       showAlert("success", `${fmt(r.requeued)} number(s) put back in the queue.`);
     } catch (e) { showAlert("error", e.message); }
   };
+
+  useJobPoller({
+    jobId: reportJob, recordCount: 0,
+    onDone: (result) => {
+      setReportJob(null);
+      if (result.status === "empty") { showAlert("info", result.message); return; }
+      setReportFile(result);
+      triggerBlobDownload(result.sas_url, result.file_name);
+      showAlert("success", `Report ready — ${fmt(result.record_count)} entries.`);
+    },
+    onFailed: (e) => { setReportJob(null); showAlert("error", e); },
+  });
 
   useJobPoller({
     jobId, recordCount: preview?.total_eligible || 0,
@@ -1506,8 +1578,11 @@ const ATRModule = () => {
                 <span className="font-semibold text-slate-700">{segLabel(b.segment)}</span>
                 <span className="text-slate-500">
                   {b.defaults
-                    ? `${b.defaults.action_type} · ${b.defaults.action_taken} — ${
-                        (b.defaults.action_type === "BOT" ? BOT_LABELS : BOA_LABELS)[String(b.defaults.action_taken)] || "custom"
+                    ? `${b.defaults.action_type ? b.defaults.action_type + " · " : ""}${b.defaults.action_taken} — ${
+                        (module === "MNRL"
+                          ? MNRL_LABELS
+                          : (b.defaults.action_type === "BOT" ? BOT_LABELS : BOA_LABELS)
+                        )[String(b.defaults.action_taken)] || "custom"
                       }`
                     : "No defaults set"}
                 </span>
@@ -1554,10 +1629,20 @@ const ATRModule = () => {
       <SectionCard icon={ListChecks} iconBg="bg-slate-600" title="Submission log"
         subtitle={`${runs.length} run${runs.length === 1 ? "" : "s"}`}
         action={
-          <button onClick={loadRuns} disabled={loadingRuns}
-            className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-800 font-medium px-3 py-1.5 hover:bg-slate-100 rounded-lg transition-colors">
-            <RefreshCw size={13} className={loadingRuns ? "animate-spin" : ""} /> Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={() => handleBuildReport(null)} disabled={buildingReport || !!reportJob}
+              className="flex items-center gap-1.5 text-xs font-semibold text-emerald-600
+                bg-emerald-50 hover:bg-emerald-600 hover:text-white px-3 py-1.5 rounded-lg
+                transition-colors disabled:opacity-40">
+              {reportJob
+                ? <><Loader2 size={13} className="animate-spin" /> Building…</>
+                : <><Download size={13} /> Full {module} report</>}
+            </button>
+            <button onClick={loadRuns} disabled={loadingRuns}
+              className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-800 font-medium px-3 py-1.5 hover:bg-slate-100 rounded-lg transition-colors">
+              <RefreshCw size={13} className={loadingRuns ? "animate-spin" : ""} /> Refresh
+            </button>
+          </div>
         }>
         <Paginated items={runs} loading={loadingRuns} accent="amber"
           emptyTitle="Nothing sent yet"
@@ -1573,7 +1658,7 @@ const ATRModule = () => {
               <td className="px-4 py-3.5 text-xs text-slate-600">{run.segment ? segLabel(run.segment) : "Both"}</td>
               <td className="px-4 py-3.5 text-xs font-mono text-slate-500">{run.feed_date || "All"}</td>
               <td className="px-4 py-3.5 text-xs text-slate-600 whitespace-nowrap">
-                {run.action_type} · {run.action_taken}
+                {run.action_type ? `${run.action_type} · ` : ""}{run.action_taken}
               </td>
               <td className="px-4 py-3.5">
                 <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded-full text-xs font-semibold tabular-nums">
@@ -1597,13 +1682,21 @@ const ATRModule = () => {
               </td>
               <td className="px-4 py-3.5 text-slate-400 text-xs whitespace-nowrap">{fmtDateTime(run.started_at)}</td>
               <td className="px-4 py-3.5">
-                <button onClick={async () => {
-                  try { setEvents({ run, rows: (await api.fetchAtrEvents(run.id)).events }); }
-                  catch (e) { showAlert("error", e.message); }
-                }}
-                  className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-700 hover:text-white rounded-lg transition-all whitespace-nowrap">
-                  Audit
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button onClick={async () => {
+                    try { setEvents({ run, rows: (await api.fetchAtrEvents(run.id)).events }); }
+                    catch (e) { showAlert("error", e.message); }
+                  }}
+                    className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-700 hover:text-white rounded-lg transition-all whitespace-nowrap">
+                    View
+                  </button>
+                  <button onClick={() => handleBuildReport(run.id)} disabled={buildingReport || !!reportJob}
+                    className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-emerald-600
+                      bg-emerald-50 hover:bg-emerald-600 hover:text-white rounded-lg transition-all
+                      whitespace-nowrap disabled:opacity-40">
+                    <Download size={12} /> Excel
+                  </button>
+                </div>
               </td>
             </tr>
           )} />
@@ -1657,7 +1750,7 @@ const ATRModule = () => {
                         )}
                       </td>
                       <td className="px-4 py-2.5 text-xs text-slate-600 whitespace-nowrap">
-                        {e.action_type} · {e.action_taken}
+                        {e.action_type ? `${e.action_type} · ` : ""}{e.action_taken}
                       </td>
                       <td className="px-4 py-2.5 text-xs max-w-[220px]">
                         <span className={e.outcome === "sent" ? "text-slate-500" : "text-rose-600"}>
@@ -1672,7 +1765,8 @@ const ATRModule = () => {
             <div className="px-6 py-3 border-t border-slate-200 bg-slate-50">
               <p className="text-xs text-slate-400">
                 Every attempt is kept, including the exact payload sent to C-DOT.
-                Query one number's full history at <code className="font-mono">/api/atr/history/&lt;mobile&gt;</code>.
+                Use <strong>Excel</strong> on any run for the full report, or
+                <code className="font-mono ml-1">/api/atr/history/&lt;mobile&gt;</code> for one number.
               </p>
             </div>
           </div>

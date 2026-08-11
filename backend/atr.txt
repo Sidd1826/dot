@@ -42,7 +42,7 @@ import os
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 import uuid
 
 import psycopg2
@@ -61,27 +61,39 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 PG_DSN = os.environ["AZURE_POSTGRES_DSN"]
 
+# ── PER-MODULE API CONTRACT ──────────────────────────────────────────────────
+#
+# FRI and MNRL share the encryption and the batching, and differ in almost
+# everything else. Rather than sprinkling `if module == "MNRL"` through the
+# code, every difference is declared here once.
+#
+#   payload id key    FRI sends client_id, MNRL sends bank_id
+#   action_type       FRI splits BOA / BOT; MNRL has no such concept
+#   action codes      completely different tables — see ACTION_TEXT below
+#   extra fields      MNRL requires disconnectionreason_id PER NUMBER
+#   headers           MNRL requires Source: API
+#   limits            MNRL caps 3000 entries/request, 120 requests/10 min
+#
+# ── KEY CONFIG — read this before setting the env vars ───────────────────────
+# ATR_KEY_ID holds a key *NAME*, not a key. crypto_utils.load_public_key(key_id)
+# looks up the env var f"{key_id}_PUBLIC_KEY", so:
+#
+#     MNRL_ATR_KEY_ID=MNRL_ATR                <- short name
+#     MNRL_ATR_PUBLIC_KEY=LS0tLS1CRUdJTi...   <- the base64 key itself
+#
+# C-DOT issues a SEPARATE RSA key for ATR — this is not the data-fetch key.
+
 ATR_URL = {
     "FRI": os.getenv(
         "FRI_ATR_URL",
         "https://fritestgateway.sancharsaathi.gov.in/friatr/v2/atr",
     ),
-    # PLACEHOLDER — replace when C-DOT publishes the MNRL ATR endpoint
-    "MNRL": os.getenv("MNRL_ATR_URL", "https://REPLACE-ME.example.gov.in/mnrlatr/v2/atr"),
+    "MNRL": os.getenv(
+        "MNRL_ATR_URL",
+        "https://mnrlbankapitestgateway.sancharsaathi.gov.in/mnrlbankapiatr/v2/atr",
+    ),
 }
 
-# ── KEY CONFIG — read this before setting the env vars ───────────────────────
-# These hold a key *NAME*, not a key. crypto_utils.load_public_key(key_id) looks
-# up the env var f"{key_id}_PUBLIC_KEY", so:
-#
-#     FRI_ATR_KEY_ID=FRI_ATR                 <- short name
-#     FRI_ATR_PUBLIC_KEY=LS0tLS1CRUdJTi...   <- the base64 key itself
-#
-# Putting the key in FRI_ATR_KEY_ID makes the loader search for an env var
-# called "LS0tLS1CRUdJTi..._PUBLIC_KEY", which will never exist. _key_id()
-# catches that and says so instead of echoing the key back in the error.
-#
-# C-DOT issues a SEPARATE RSA key for ATR — this is not the data-fetch key.
 ATR_KEY_ID = {
     "FRI": os.getenv("FRI_ATR_KEY_ID", "FRI_ATR"),
     "MNRL": os.getenv("MNRL_ATR_KEY_ID", "MNRL_ATR"),
@@ -89,8 +101,112 @@ ATR_KEY_ID = {
 
 ATR_CLIENT_ID = {
     "FRI": os.getenv("FRI_CLIENT_ID"),
-    "MNRL": os.getenv("MNRL_CLIENT_ID") or os.getenv("BankId"),
+    "MNRL": os.getenv("MNRL_BANK_ID") or os.getenv("MNRL_CLIENT_ID") or os.getenv("BankId"),
 }
+
+# FRI: BOA and BOT have separate code tables and the type is sent explicitly.
+BOA_ACTION_CODES = {"1", "2", "3", "7", "8", "9", "10"}
+BOT_ACTION_CODES = {"5", "6"}
+VALID_ACTION_TYPES = {"BOA", "BOT"}
+
+# MNRL: one flat table 1-10, no action_type field at all.
+MNRL_ACTION_CODES = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
+
+# MNRL: disconnectionreason_id is mandatory on every record and comes from the
+# feed, not from the defaults. Anything outside 1-6 falls back to 6 (Others)
+# rather than failing the whole number.
+MNRL_DISCONNECTION_REASONS = {"1", "2", "3", "4", "5", "6"}
+MNRL_DEFAULT_DISCONNECTION_REASON = os.getenv("MNRL_DEFAULT_DISCONNECTION_REASON", "6")
+
+ACTION_TEXT = {
+    ("FRI", "BOA", "1"): "Account Freeze",
+    ("FRI", "BOA", "2"): "Credit and Debit Restriction",
+    ("FRI", "BOA", "3"): "Account Not Found / Suspicious after EDD",
+    ("FRI", "BOA", "7"): "User Denied Service",
+    ("FRI", "BOA", "8"): "Debit Restriction",
+    ("FRI", "BOA", "9"): "User Rejected at Onboarding",
+    ("FRI", "BOA", "10"): "User Blacklisted",
+    ("FRI", "BOT", "5"): "Transaction Declined",
+    ("FRI", "BOT", "6"): "User Blacklisted",
+    ("MNRL", None, "1"): "Bank/Wallet Account Frozen",
+    ("MNRL", None, "2"): "Debit/Credit Restrictions on Account",
+    ("MNRL", None, "3"): "Bank/Wallet Account found Compliant",
+    ("MNRL", None, "4"): "Others",
+    ("MNRL", None, "5"): "Transaction Decline",
+    ("MNRL", None, "6"): "Transaction Alert/Warning/Notification Generated",
+    ("MNRL", None, "7"): "User denied service (loan/insurance/credit card etc.)",
+    ("MNRL", None, "8"): "Debit Restriction",
+    ("MNRL", None, "9"): "User rejected at the time of onboarding",
+    ("MNRL", None, "10"): "User blacklisted",
+}
+
+DISCONNECTION_REASON_TEXT = {
+    "1": "Subscriber Verification Non-compliant Cases",
+    "2": "Disconnection due to Zero usage or Non payment",
+    "3": "LEAs Reported Cybercrime",
+    "4": "DoT Reported Fake or forged cases",
+    "5": "TSP Internal Analysis",
+    "6": "Others",
+}
+
+REACTIVATION_REASON_TEXT = {
+    "1": "Reactivation to same customer due to late reverification",
+    "2": "Activation after returning from MNP",
+    "3": "Reactivation to same customer due to grievance",
+    "4": "Reactivation to same customer due to request from LEA/DoT",
+    "5": "Reactivation to other customer due to other reason",
+}
+
+
+def action_text(module: str, action_type: str | None, action_taken: Any) -> str:
+    key = (module.upper(), action_type if module.upper() == "FRI" else None,
+           str(action_taken or ""))
+    return ACTION_TEXT.get(key, "")
+
+
+MODULE_SPEC: dict[str, dict] = {
+    "FRI": {
+        "id_field": "client_id",
+        "uses_action_type": True,
+        "action_codes": BOA_ACTION_CODES | BOT_ACTION_CODES,
+        "max_investigation": 500,
+        "investigation_required": False,
+        "max_remarks": 100,
+        "supports_remarks": True,
+        "supports_upi": True,
+        "max_batch": int(os.getenv("FRI_ATR_MAX_BATCH", "1000")),
+        "extra_headers": {},
+        # C-DOT published no request-frequency limit for FRI
+        "rate_limit": None,
+    },
+    "MNRL": {
+        "id_field": "bank_id",
+        "uses_action_type": False,
+        "action_codes": MNRL_ACTION_CODES,
+        # spec says max 250 characters, and it is mandatory
+        "max_investigation": 250,
+        "investigation_required": True,
+        "max_remarks": 0,
+        "supports_remarks": False,
+        "supports_upi": False,
+        # spec: max 3,000 entries per request
+        "max_batch": int(os.getenv("MNRL_ATR_MAX_BATCH", "3000")),
+        "extra_headers": {"Source": "API"},
+        # spec: max 120 requests per 10 minutes
+        "rate_limit": (
+            int(os.getenv("MNRL_ATR_RATE_CALLS", "120")),
+            int(os.getenv("MNRL_ATR_RATE_SECONDS", "600")),
+        ),
+    },
+}
+
+
+def spec(module: str) -> dict:
+    try:
+        return MODULE_SPEC[module.upper()]
+    except KeyError:
+        raise ValueError(f"Unknown module '{module}'. Expected FRI or MNRL.")
+
 
 ATR_BATCH_SIZE = int(os.getenv("ATR_BATCH_SIZE", "1000"))
 ATR_MIN_BATCH_SIZE = int(os.getenv("ATR_MIN_BATCH_SIZE", "100"))
@@ -103,14 +219,59 @@ ATR_THROTTLE_MS = int(os.getenv("ATR_THROTTLE_MS", "0"))
 # The interval itself lives in the atr_schedule table so it can be changed from
 # the UI. These only control the ticker that notices when a cycle is due.
 ATR_SCHEDULER_ENABLED = os.getenv("ATR_SCHEDULER_ENABLED", "1") == "1"
-ATR_SCHEDULER_TICK_SECONDS = int(os.getenv("ATR_SCHEDULER_TICK_SECONDS", "300"))  # pause between batches
+ATR_SCHEDULER_TICK_SECONDS = int(os.getenv("ATR_SCHEDULER_TICK_SECONDS", "300"))
 
-MAX_INVESTIGATION = 500
-MAX_REMARKS = 100
 
-VALID_ACTION_TYPES = {"BOA", "BOT"}
-BOA_ACTION_CODES = {"1", "2", "3", "7", "8", "9", "10"}
-BOT_ACTION_CODES = {"5", "6"}
+# ── RATE LIMITING ────────────────────────────────────────────────────────────
+class _RateLimiter:
+    """Sliding-window limiter, one per module.
+
+    MNRL allows 120 requests per 10 minutes. A 10 lakh cycle is ~334 requests at
+    3000 per batch, so the limit WILL be hit — roughly 28 minutes of pacing.
+    Blocking here is deliberate: sleeping is far cheaper than being throttled
+    mid-cycle and having to work out which batches landed.
+    """
+
+    def __init__(self, max_calls: int, per_seconds: int):
+        self.max_calls = max_calls
+        self.per_seconds = per_seconds
+        self._calls: list[float] = []
+        self._lock = threading.Lock()
+
+    def acquire(self) -> float:
+        waited = 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                cutoff = now - self.per_seconds
+                self._calls = [t for t in self._calls if t > cutoff]
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return waited
+                sleep_for = self._calls[0] - cutoff + 0.05
+            print(f"[ATR] rate limit reached, pausing {sleep_for:.0f}s")
+            time.sleep(sleep_for)
+            waited += sleep_for
+
+
+_limiters: dict[str, _RateLimiter] = {}
+_limiter_lock = threading.Lock()
+
+
+def _limiter(module: str) -> _RateLimiter | None:
+    cfg = spec(module)["rate_limit"]
+    if not cfg:
+        return None
+    with _limiter_lock:
+        if module.upper() not in _limiters:
+            _limiters[module.upper()] = _RateLimiter(*cfg)
+        return _limiters[module.upper()]
+
+
+def effective_batch_size(module: str, requested: int | None = None) -> int:
+    """Never exceed the module's published per-request cap."""
+    cap = spec(module)["max_batch"]
+    return max(1, min(requested or ATR_BATCH_SIZE, cap))
 
 
 # ── DB ───────────────────────────────────────────────────────────────────────
@@ -216,11 +377,28 @@ def preflight(module: str) -> dict:
         key_id = None
         problems.append(str(exc))
 
+    cfg = spec(module)
     if not ATR_CLIENT_ID.get(module):
         problems.append(
-            f"{module} client id is not set "
-            f"({'FRI_CLIENT_ID' if module == 'FRI' else 'MNRL_CLIENT_ID'})."
+            f"{module} {cfg['id_field']} is not set "
+            f"({'FRI_CLIENT_ID' if module == 'FRI' else 'MNRL_BANK_ID'})."
         )
+
+    # MNRL requires investigation_details on every record, and it comes from the
+    # per-classification defaults. Missing it fails every number in the batch,
+    # so catch it here rather than at send time.
+    if cfg["investigation_required"]:
+        for row in get_defaults(module):
+            if not row.get("investigation_details"):
+                problems.append(
+                    f"investigation_details is empty for {module} / "
+                    f"{row['segment']} — it is mandatory on every MNRL record."
+                )
+            elif len(str(row["investigation_details"])) > cfg["max_investigation"]:
+                problems.append(
+                    f"investigation_details for {module} / {row['segment']} is "
+                    f"longer than the {cfg['max_investigation']} characters MNRL allows."
+                )
 
     url = ATR_URL.get(module) or ""
     if not url:
@@ -237,6 +415,9 @@ def preflight(module: str) -> dict:
         "key_id": key_id,
         "key_present": bool(key_id and os.getenv(f"{key_id}_PUBLIC_KEY")),
         "client_id_present": bool(ATR_CLIENT_ID.get(module)),
+        "id_field": cfg["id_field"],
+        "max_batch": cfg["max_batch"],
+        "rate_limit": cfg["rate_limit"],
         "url": url,
         "problems": problems,
     }
@@ -298,27 +479,51 @@ def get_defaults(module: str, segment: str | None = None) -> list[dict]:
 def save_defaults(module: str, segment: str, payload: dict, updated_by: str | None = None) -> dict:
     """Upsert one (module, segment) default set. Validates against the spec."""
     module = module.upper()
-    action_type = str(payload.get("action_type", "")).strip().upper()
+    cfg = spec(module)
     action_taken = str(payload.get("action_taken", "")).strip()
+    action_type = str(payload.get("action_type", "")).strip().upper() or None
 
-    if action_type not in VALID_ACTION_TYPES:
-        raise ValueError("action_type must be BOA or BOT")
-
-    allowed = BOA_ACTION_CODES if action_type == "BOA" else BOT_ACTION_CODES
-    if action_taken not in allowed:
-        raise ValueError(
-            f"action_taken '{action_taken}' is not valid for {action_type}. "
-            f"Allowed: {', '.join(sorted(allowed, key=int))}"
-        )
+    if cfg["uses_action_type"]:
+        if action_type not in VALID_ACTION_TYPES:
+            raise ValueError("action_type must be BOA or BOT")
+        allowed = BOA_ACTION_CODES if action_type == "BOA" else BOT_ACTION_CODES
+        if action_taken not in allowed:
+            raise ValueError(
+                f"action_taken '{action_taken}' is not valid for {action_type}. "
+                f"Allowed: {', '.join(sorted(allowed, key=int))}"
+            )
+    else:
+        # MNRL has no action_type; one flat table of codes 1-10
+        action_type = None
+        if action_taken not in cfg["action_codes"]:
+            raise ValueError(
+                f"action_taken '{action_taken}' is not a valid MNRL code. "
+                f"Allowed: {', '.join(sorted(cfg['action_codes'], key=int))}"
+            )
 
     grievance = str(payload.get("grievance_received", "No")).strip().title()
     if grievance not in ("Yes", "No"):
         raise ValueError("grievance_received must be Yes or No")
 
+    investigation = payload.get("investigation_details") or None
+    if cfg["investigation_required"] and not investigation:
+        raise ValueError(
+            "investigation_details is mandatory for MNRL and must be at most "
+            f"{cfg['max_investigation']} characters"
+        )
+    if investigation and len(str(investigation)) > cfg["max_investigation"]:
+        raise ValueError(
+            f"investigation_details must be at most {cfg['max_investigation']} "
+            f"characters for {module}"
+        )
+
     money = payload.get("total_money_saved")
     declined = payload.get("transaction_declined")
     if action_type == "BOT" and (money is None or declined is None):
         raise ValueError("BOT requires total_money_saved and transaction_declined")
+
+    if not cfg["supports_remarks"]:
+        payload = {**payload, "remarks": None}
 
     with _cursor() as cur:
         cur.execute(
@@ -367,27 +572,67 @@ def _atr_mobile(value: Any) -> str | None:
     return None
 
 
-def build_record(row: dict, defaults: dict, date_of_action: str) -> dict:
-    """One atr_data entry. Raises ValueError if the row can't be represented."""
+def _mnrl_reason(row: dict) -> str:
+    """disconnectionreason_id for one number.
+
+    Mandatory on every MNRL record and sourced from the feed, not the defaults —
+    it is a property of why THAT number was revoked. Values outside 1-6 fall
+    back to 6 (Others) rather than failing the number, since a rejected record
+    helps nobody and the reason is descriptive rather than an instruction.
+    """
+    raw = str(row.get("disconnection_reason_id") or "").strip()
+    return raw if raw in MNRL_DISCONNECTION_REASONS else MNRL_DEFAULT_DISCONNECTION_REASON
+
+
+def build_record(row: dict, defaults: dict, date_of_action: str,
+                 module: str = "FRI") -> dict:
+    """One atr_data entry, shaped to the module's contract.
+
+    Raises ValueError if the row cannot be represented; the caller records that
+    as a skipped number with the reason attached.
+    """
+    module = module.upper()
+    cfg = spec(module)
+
     mobile = _atr_mobile(row.get("mobile_no"))
     if not mobile:
         raise ValueError(f"Invalid mobile_no format: {row.get('mobile_no')!r}")
 
+    action_taken = str(defaults["action_taken"])
+    grievance = defaults.get("grievance_received") or "No"
+    investigation = defaults.get("investigation_details")
+
+    if module == "MNRL":
+        # MNRL: flat action table, no action_type, and investigation_details
+        # plus disconnectionreason_id are both mandatory.
+        if not investigation:
+            raise ValueError(
+                "investigation_details is mandatory for MNRL — set it in the "
+                "ATR defaults for this classification"
+            )
+        return {
+            "mobile_no": mobile,
+            "action_taken": action_taken,
+            "investigation_details": str(investigation)[: cfg["max_investigation"]],
+            "date_of_action": date_of_action,
+            "disconnectionreason_id": _mnrl_reason(row),
+            "grievance_received": grievance,
+        }
+
+    # FRI: action_type drives which fields apply
     record = {
         "mobile_no": mobile,
         "action_type": defaults["action_type"],
-        "action_taken": str(defaults["action_taken"]),
+        "action_taken": action_taken,
         "date_of_action": date_of_action,
-        "grievance_received": defaults.get("grievance_received") or "No",
+        "grievance_received": grievance,
     }
-
-    investigation = defaults.get("investigation_details")
     if investigation:
-        record["investigation_details"] = str(investigation)[:MAX_INVESTIGATION]
+        record["investigation_details"] = str(investigation)[: cfg["max_investigation"]]
 
     remarks = defaults.get("remarks")
     if remarks:
-        record["remarks"] = str(remarks)[:MAX_REMARKS]
+        record["remarks"] = str(remarks)[: cfg["max_remarks"]]
 
     upi = row.get("upi_id") or defaults.get("upi_id")
     if upi:
@@ -424,10 +669,16 @@ def submit_batch(module: str, records: list[dict]) -> dict:
 
     for attempt in range(1, ATR_MAX_RETRIES + 1):
         token = _token(module, force_refresh=(attempt > 1))
+        headers = {"Content-Type": "application/json", "Authorization": token}
+        headers.update(cfg["extra_headers"])  # MNRL requires Source: API
+
+        if limiter:
+            limiter.acquire()
+
         resp = session.post(
             url,
             json=encrypted,
-            headers={"Content-Type": "application/json", "Authorization": token},
+            headers=headers,
             timeout=ATR_TIMEOUT,
             verify=ATR_VERIFY_SSL,
         )
@@ -450,10 +701,15 @@ def submit_batch(module: str, records: list[dict]) -> dict:
         except ValueError:
             body = {"message": (resp.text or "")[:300]}
 
-        code = str(body.get("response_code") or resp.status_code)
-        errors = {str(k): str(v) for k, v in (body.get("errorIn") or {}).items()}
-        request_id = body.get("requestId")
-        message = str(body.get("message") or "")
+        # The two gateways disagree on capitalisation: FRI documents
+        # requestId / errorIn, MNRL documents RequestId / Errorin. Matching
+        # case-insensitively means neither spelling silently loses the
+        # per-number rejection reasons.
+        lower = {str(k).lower(): v for k, v in body.items()} if isinstance(body, dict) else {}
+        code = str(lower.get("response_code") or resp.status_code)
+        errors = {str(k): str(v) for k, v in (lower.get("errorin") or {}).items()}
+        request_id = lower.get("requestid")
+        message = str(lower.get("message") or "")
 
         if resp.status_code == 200 and code == "200":
             return {"outcome": "ok", "errors": {}, "request_id": request_id,
@@ -634,6 +890,17 @@ def get_schedule(module: str | None = None) -> list[dict]:
     return rows
 
 
+def run_now(module: str) -> dict:
+    """Bring the next cycle forward to now. The ticker picks it up within
+    ATR_SCHEDULER_TICK_SECONDS; pressing Send does the same thing immediately."""
+    with _cursor() as cur:
+        cur.execute(
+            "UPDATE atr_schedule SET next_run_at = NOW(), updated_at = NOW() WHERE module = %s",
+            (module.upper(),),
+        )
+    return get_schedule(module)[0]
+
+
 def save_schedule(module: str, enabled: bool | None = None,
                   interval_days: int | None = None,
                   run_at_hour: int | None = None,
@@ -653,6 +920,13 @@ def save_schedule(module: str, enabled: bool | None = None,
         if not 0 <= int(run_at_hour) <= 23:
             raise ValueError("Hour must be between 0 and 23.")
         sets.append("run_at_hour = %s")
+        params.append(int(run_at_hour))
+        # Re-anchor the pending run to the new hour, otherwise changing it has
+        # no effect until after the next cycle has already fired.
+        sets.append("""next_run_at = (
+            date_trunc('day', (next_run_at AT TIME ZONE timezone))
+            + (%s || ' hours')::interval
+        ) AT TIME ZONE timezone""")
         params.append(int(run_at_hour))
     if next_run_at:
         sets.append("next_run_at = %s")
@@ -675,8 +949,13 @@ def _advance_schedule(module: str, run_id: str | None, status: str) -> None:
             """
             UPDATE atr_schedule
             SET last_run_at = NOW(), last_run_id = %s, last_status = %s,
-                next_run_at = date_trunc('day', NOW() + (interval_days || ' days')::interval)
-                              + (run_at_hour || ' hours')::interval,
+                -- run_at_hour is a LOCAL hour. Computing this in the server
+                -- timezone would mean "2 AM" fired at 07:30 IST on a UTC server.
+                next_run_at = (
+                    date_trunc('day', (NOW() AT TIME ZONE timezone))
+                    + (interval_days || ' days')::interval
+                    + (run_at_hour || ' hours')::interval
+                ) AT TIME ZONE timezone,
                 updated_at  = NOW()
             WHERE module = %s
             """,
@@ -821,6 +1100,7 @@ def run_atr(
 
     action_type = defaults["action_type"]
     action_taken = str(defaults["action_taken"])
+    batch_size = effective_batch_size(module, batch_size)
 
     # Free anything a crashed run left claimed, or it would sit stuck forever
     released = ms.release_stuck_claims(module)
@@ -890,7 +1170,7 @@ def run_atr(
                 } if row.get("atr_state_hash") else None
 
                 try:
-                    record = build_record(row, defaults, date_of_action)
+                    record = build_record(row, defaults, date_of_action, module)
                 except ValueError as exc:
                     failed[row["id"]] = ("skipped", str(exc))
                     events.append((
@@ -1008,3 +1288,165 @@ def run_atr(
     }
     print(f"[ATR] Done: {summary}")
     return summary
+
+
+# ── ATR REPORT EXPORT ────────────────────────────────────────────────────────
+# Columns of the downloadable report. Deliberately flattens the request payload
+# so every field actually sent to C-DOT is its own column — the same detail
+# /api/atr/history/<mobile> returns, for a whole run at once.
+REPORT_COLUMNS: list[str] = [
+    "mobile_no", "cust_id", "segment", "outcome", "trigger",
+    "action_type", "action_taken", "action_description",
+    "date_of_action", "grievance_received",
+    "disconnection_reason_id", "disconnection_reason", "investigation_details",
+    "remarks", "upi_id", "total_money_saved", "transaction_declined",
+    "response_code", "response_message", "request_id",
+    "attempt_no", "previous_action", "sent_at",
+]
+
+REPORT_LABELS: dict[str, str] = {
+    "mobile_no": "Mobile Number",
+    "cust_id": "Customer Id",
+    "segment": "Classification",
+    "outcome": "Outcome",
+    "trigger": "Why Sent",
+    "action_type": "Action Type",
+    "action_taken": "Action Code",
+    "action_description": "Action Description",
+    "date_of_action": "Date Of Action",
+    "grievance_received": "Grievance Received",
+    "disconnection_reason_id": "Disconnection Reason Code",
+    "disconnection_reason": "Disconnection Reason",
+    "investigation_details": "Investigation Details",
+    "remarks": "Remarks",
+    "upi_id": "UPI Id",
+    "total_money_saved": "Money Saved",
+    "transaction_declined": "Transactions Declined",
+    "response_code": "Response Code",
+    "response_message": "Response Message",
+    "request_id": "C-DOT Request Id",
+    "attempt_no": "Attempt",
+    "previous_action": "Previous Action",
+    "sent_at": "Sent At",
+}
+
+_TRIGGER_TEXT = {
+    "first_send": "First report",
+    "status_change": "Status changed since last report",
+    "action_config_change": "Action code changed",
+    "retry_after_reject": "Retry after rejection",
+    "manual": "Sent manually",
+}
+
+
+
+
+def _report_row(event: dict) -> dict:
+    """Flatten one audit row into report columns."""
+    payload = event.get("request_payload") or {}
+    prev = event.get("previous_state") or {}
+    module = (event.get("module") or "FRI").upper()
+    action_type = event.get("action_type") or ""
+    action_taken = str(event.get("action_taken") or "")
+    reason = str(payload.get("disconnectionreason_id") or "")
+
+    prev_action = ""
+    if prev.get("action_type"):
+        prev_action = f"{prev.get('action_type')} · {prev.get('action_taken')}"
+
+    return {
+        "mobile_no": event.get("mobile_no") or "",
+        "cust_id": event.get("cust_id") or "",
+        "segment": event.get("segment") or "",
+        "outcome": event.get("outcome") or "",
+        "trigger": _TRIGGER_TEXT.get(event.get("trigger"), event.get("trigger") or ""),
+        "action_type": action_type,
+        "action_taken": action_taken,
+        "action_description": action_text(module, action_type, action_taken),
+        "date_of_action": payload.get("date_of_action", ""),
+        "grievance_received": payload.get("grievance_received", ""),
+        "disconnection_reason_id": reason,
+        "disconnection_reason": DISCONNECTION_REASON_TEXT.get(reason, ""),
+        "investigation_details": payload.get("investigation_details", ""),
+        "remarks": payload.get("remarks", ""),
+        "upi_id": payload.get("upi_id", ""),
+        "total_money_saved": payload.get("total_money_saved", ""),
+        "transaction_declined": payload.get("transaction_declined", ""),
+        "response_code": event.get("response_code") or "",
+        "response_message": event.get("response_message") or "",
+        "request_id": event.get("request_id") or "",
+        "attempt_no": event.get("attempt_no") or 1,
+        "previous_action": prev_action,
+        "sent_at": event["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+                   if hasattr(event.get("created_at"), "strftime") else "",
+    }
+
+
+def count_report_rows(run_id: str | None = None, module: str | None = None,
+                      date_from: Any = None, date_to: Any = None,
+                      outcome: str | None = None) -> int:
+    where, params = _report_filter(run_id, module, date_from, date_to, outcome)
+    with _cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM atr_events WHERE {where}", params)
+        return int(cur.fetchone()[0])
+
+
+def _report_filter(run_id, module, date_from, date_to, outcome) -> tuple[str, list]:
+    clauses, params = [], []
+    if run_id:
+        clauses.append("run_id = %s")
+        params.append(run_id)
+    if module:
+        clauses.append("module = %s")
+        params.append(module.upper())
+    if outcome and outcome.lower() != "all":
+        clauses.append("outcome = %s")
+        params.append(outcome)
+    if date_from:
+        clauses.append("created_at >= %s")
+        params.append(ms._to_date(date_from))
+    if date_to:
+        clauses.append("created_at < (%s::date + 1)")
+        params.append(ms._to_date(date_to))
+    return (" AND ".join(clauses) or "TRUE"), params
+
+
+def iter_report_rows(run_id: str | None = None, module: str | None = None,
+                     date_from: Any = None, date_to: Any = None,
+                     outcome: str | None = None) -> Iterator[dict]:
+    """Stream audit rows as report rows.
+
+    Server-side cursor, same as the master export: a fortnightly run covering
+    10 lakh numbers produces 10 lakh audit rows, and the report must not build
+    that as a list.
+    """
+    where, params = _report_filter(run_id, module, date_from, date_to, outcome)
+    conn = _get_pool().getconn()
+    try:
+        cur = conn.cursor(name=f"atr_report_{os.getpid()}_{id(params)}",
+                          cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.itersize = 5000
+        cur.execute(
+            f"""SELECT module, mobile_no, cust_id, segment, outcome, trigger,
+                       action_type, action_taken, request_payload, response_code,
+                       response_message, request_id, attempt_no, previous_state,
+                       created_at
+                FROM atr_events WHERE {where}
+                ORDER BY created_at DESC, id DESC""",
+            params,
+        )
+        for row in cur:
+            yield _report_row(dict(row))
+        cur.close()
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            _get_pool().putconn(conn)
+        except Exception:
+            pass
