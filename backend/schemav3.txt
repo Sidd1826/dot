@@ -252,6 +252,19 @@ CREATE TABLE IF NOT EXISTS atr_defaults (
 --        onboarding | 10 Blacklisted
 --   BOT: 5 Transaction Declined | 6 User Blacklisted
 -- ─────────────────────────────────────────────────────────────────────────────
+-- An earlier version of this file created action_type as NOT NULL. CREATE TABLE
+-- IF NOT EXISTS above is a no-op on that database, so the column must be
+-- relaxed HERE — before the seed below inserts MNRL rows with a NULL
+-- action_type. Doing it later (v3.4) is too late: the seed fails first.
+ALTER TABLE atr_defaults ALTER COLUMN action_type DROP NOT NULL;
+ALTER TABLE atr_defaults DROP CONSTRAINT IF EXISTS atr_defaults_action_type_check;
+ALTER TABLE atr_defaults ADD CONSTRAINT atr_defaults_action_type_check
+    CHECK (action_type IS NULL OR action_type IN ('BOA', 'BOT'));
+
+-- Likewise investigation_details: MNRL needs 250+ chars of it and the column
+-- may predate that requirement on an older database.
+ALTER TABLE atr_defaults ALTER COLUMN investigation_details TYPE VARCHAR(500);
+
 INSERT INTO atr_defaults
     (module, segment, action_type, action_taken, investigation_details, grievance_received, remarks)
 VALUES
@@ -677,11 +690,7 @@ CREATE OR REPLACE VIEW v_mnrl_daily_report AS
 --     so it is not stored here at all
 -- =============================================================================
 
--- action_type must be nullable: MNRL has no such concept
-ALTER TABLE atr_defaults ALTER COLUMN action_type DROP NOT NULL;
-ALTER TABLE atr_defaults DROP CONSTRAINT IF EXISTS atr_defaults_action_type_check;
-ALTER TABLE atr_defaults ADD CONSTRAINT atr_defaults_action_type_check
-    CHECK (action_type IS NULL OR action_type IN ('BOA', 'BOT'));
+-- action_type nullability was already relaxed above, before the seed insert.
 
 -- atr_runs records whatever was in force; MNRL rows simply have no action_type
 ALTER TABLE atr_runs ALTER COLUMN action_type DROP NOT NULL;
