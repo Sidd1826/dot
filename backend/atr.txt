@@ -227,9 +227,25 @@ class _RateLimiter:
     """Sliding-window limiter, one per module.
 
     MNRL allows 120 requests per 10 minutes. A 10 lakh cycle is ~334 requests at
-    3000 per batch, so the limit WILL be hit — roughly 28 minutes of pacing.
-    Blocking here is deliberate: sleeping is far cheaper than being throttled
-    mid-cycle and having to work out which batches landed.
+    3000 per batch, so a large run genuinely does need pacing. A small run must
+    never pause: 112 records is a single request and cannot exhaust the budget.
+
+    Two properties matter and both were wrong in an earlier version:
+
+    1. TIMESTAMPS ARE WALL-CLOCK, NOT PROCESS-RELATIVE. time.monotonic() has an
+       arbitrary origin, so entries could not be reasoned about or reset
+       sensibly. time.time() lets a stale window be recognised and dropped.
+
+    2. THE WINDOW SELF-HEALS. If every recorded call is older than the window,
+       the list is cleared outright rather than trimmed. A crashed or abandoned
+       run therefore cannot leave a long-lived process believing the budget is
+       spent — which is what made a 112-record run pause for 443 seconds.
+
+    A deliberate non-goal: this does not try to account for retries that urllib3
+    performs inside session.post(). Those are invisible here, so the session
+    used for ATR mounts no automatic retry — see _get_session(). Retries are
+    driven by the explicit attempt loop in submit_batch(), which does pass
+    through acquire().
     """
 
     def __init__(self, max_calls: int, per_seconds: int):
@@ -238,20 +254,50 @@ class _RateLimiter:
         self._calls: list[float] = []
         self._lock = threading.Lock()
 
+    def _prune(self, now: float) -> None:
+        """Drop calls that have fallen out of the window. Caller holds the lock."""
+        cutoff = now - self.per_seconds
+        if self._calls and self._calls[-1] <= cutoff:
+            # Every entry is stale: clear rather than trim, so an abandoned run
+            # cannot leave a phantom budget behind.
+            self._calls.clear()
+        else:
+            self._calls = [t for t in self._calls if t > cutoff]
+
     def acquire(self) -> float:
         waited = 0.0
         while True:
             with self._lock:
-                now = time.monotonic()
-                cutoff = now - self.per_seconds
-                self._calls = [t for t in self._calls if t > cutoff]
+                now = time.time()
+                self._prune(now)
                 if len(self._calls) < self.max_calls:
                     self._calls.append(now)
                     return waited
-                sleep_for = self._calls[0] - cutoff + 0.05
-            print(f"[ATR] rate limit reached, pausing {sleep_for:.0f}s")
+                # Wait only until the OLDEST call leaves the window
+                sleep_for = max(0.0, self._calls[0] + self.per_seconds - now) + 0.05
+            print(
+                f"[ATR] rate limit reached ({len(self._calls)}/{self.max_calls} "
+                f"requests in the last {self.per_seconds}s) — pausing {sleep_for:.0f}s"
+            )
             time.sleep(sleep_for)
             waited += sleep_for
+
+    def reset(self) -> None:
+        """Forget the window. Called at the start of each run so a crashed or
+        abandoned earlier run cannot make a fresh one wait."""
+        with self._lock:
+            self._calls.clear()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            now = time.time()
+            self._prune(now)
+            return {
+                "used": len(self._calls),
+                "max_calls": self.max_calls,
+                "per_seconds": self.per_seconds,
+                "oldest_age_seconds": round(now - self._calls[0], 1) if self._calls else None,
+            }
 
 
 _limiters: dict[str, _RateLimiter] = {}
@@ -268,10 +314,30 @@ def _limiter(module: str) -> _RateLimiter | None:
         return _limiters[module.upper()]
 
 
+def reset_rate_limiter(module: str) -> None:
+    """Clear a module's window. Used at run start."""
+    lim = _limiter(module)
+    if lim:
+        lim.reset()
+
+
+def rate_limit_status(module: str) -> dict | None:
+    lim = _limiter(module)
+    return lim.snapshot() if lim else None
+
+
 def effective_batch_size(module: str, requested: int | None = None) -> int:
-    """Never exceed the module's published per-request cap."""
+    """Batch size for a module: its published cap unless explicitly overridden.
+
+    Defaulting to the cap rather than a generic 1000 matters for MNRL, which
+    allows 3000 entries per request but only 120 requests per 10 minutes. At
+    1000 per batch a 10 lakh cycle needs ~1000 requests and spends most of its
+    time paused; at 3000 it needs ~334.
+    """
     cap = spec(module)["max_batch"]
-    return max(1, min(requested or ATR_BATCH_SIZE, cap))
+    if requested:
+        return max(1, min(requested, cap))
+    return cap
 
 
 # ── DB ───────────────────────────────────────────────────────────────────────
@@ -432,12 +498,17 @@ def _get_session() -> requests.Session:
     if _session is not None:
         return _session
     session = requests.Session()
-    retry = Retry(
-        total=2,
-        backoff_factor=1,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["POST"],
-    )
+    # NO automatic retry on the ATR session, deliberately.
+    #
+    # urllib3 retries happen INSIDE session.post(), so they reach the gateway
+    # without passing through the rate limiter. That makes the limiter's count
+    # diverge from the number of requests actually sent — the cause of a
+    # 112-record run pausing for 443 seconds.
+    #
+    # Retries are instead driven by the explicit attempt loop in submit_batch(),
+    # which calls limiter.acquire() before each one. Connection-level failures
+    # are retried there too, so nothing is lost.
+    retry = Retry(total=0, read=0, connect=0, status=0, backoff_factor=0)
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -455,14 +526,34 @@ def _token(module: str, force_refresh: bool = False) -> str:
 
 
 # ── DEFAULTS ─────────────────────────────────────────────────────────────────
-def get_defaults(module: str, segment: str | None = None) -> list[dict]:
-    """ATR defaults for a module, optionally one segment."""
+CASE_OPEN = "open"
+CASE_CLEARED = "cleared"
+CASE_TYPES = (CASE_OPEN, CASE_CLEARED)
+
+CASE_LABEL = {
+    ("FRI", CASE_OPEN): "Flagged for reverification",
+    ("FRI", CASE_CLEARED): "Found compliant",
+    ("MNRL", CASE_OPEN): "Disconnected",
+    ("MNRL", CASE_CLEARED): "Reactivated / reverified",
+}
+
+
+def get_defaults(module: str, segment: str | None = None,
+                 case_type: str | None = None) -> list[dict]:
+    """ATR defaults, keyed by (module, segment, case_type).
+
+    A compliant number needs a different action code from an open one, so both
+    sets live here and a run picks the one matching what it is reporting.
+    """
     sql = "SELECT * FROM atr_defaults WHERE module = %s"
     params: list[Any] = [module.upper()]
     if segment:
         sql += " AND segment = %s"
         params.append(segment)
-    sql += " ORDER BY segment"
+    if case_type:
+        sql += " AND case_type = %s"
+        params.append(case_type)
+    sql += " ORDER BY case_type, segment"
 
     with _cursor(dict_cursor=True) as cur:
         cur.execute(sql, params)
@@ -476,8 +567,9 @@ def get_defaults(module: str, segment: str | None = None) -> list[dict]:
     return rows
 
 
-def save_defaults(module: str, segment: str, payload: dict, updated_by: str | None = None) -> dict:
-    """Upsert one (module, segment) default set. Validates against the spec."""
+def save_defaults(module: str, segment: str, payload: dict,
+                  updated_by: str | None = None, case_type: str = CASE_OPEN) -> dict:
+    """Upsert one (module, segment, case_type) default set."""
     module = module.upper()
     cfg = spec(module)
     action_taken = str(payload.get("action_taken", "")).strip()
@@ -529,12 +621,13 @@ def save_defaults(module: str, segment: str, payload: dict, updated_by: str | No
         cur.execute(
             """
             INSERT INTO atr_defaults (
-                module, segment, action_type, action_taken, investigation_details,
-                grievance_received, remarks, total_money_saved, transaction_declined,
+                module, segment, case_type, action_type, action_taken,
+                investigation_details, grievance_received, remarks,
+                total_money_saved, transaction_declined,
                 is_active, updated_by, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (module, segment) DO UPDATE SET
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (module, segment, case_type) DO UPDATE SET
                 action_type           = EXCLUDED.action_type,
                 action_taken          = EXCLUDED.action_taken,
                 investigation_details = EXCLUDED.investigation_details,
@@ -547,7 +640,7 @@ def save_defaults(module: str, segment: str, payload: dict, updated_by: str | No
                 updated_at            = NOW()
             """,
             (
-                module, segment, action_type, action_taken,
+                module, segment, case_type, action_type, action_taken,
                 (payload.get("investigation_details") or None),
                 grievance,
                 (payload.get("remarks") or None),
@@ -556,7 +649,7 @@ def save_defaults(module: str, segment: str, payload: dict, updated_by: str | No
                 updated_by,
             ),
         )
-    return get_defaults(module, segment)[0]
+    return get_defaults(module, segment, case_type)[0]
 
 
 # ── RECORD BUILDING ──────────────────────────────────────────────────────────
@@ -658,14 +751,28 @@ def submit_batch(module: str, records: list[dict]) -> dict:
          "http_status": int, "message": str}
     """
     module = module.upper()
+    cfg = spec(module)
     url = ATR_URL[module]
     client_id = ATR_CLIENT_ID[module]
     if not client_id:
-        raise ValueError(f"{module} client_id is not configured")
+        raise ValueError(
+            f"{module} {cfg['id_field']} is not configured — set "
+            f"{'FRI_CLIENT_ID' if module == 'FRI' else 'MNRL_BANK_ID'}"
+        )
 
-    payload = {"client_id": str(client_id), "atr_data": records}
+    if len(records) > cfg["max_batch"]:
+        raise ValueError(
+            f"{module} allows at most {cfg['max_batch']} entries per request, "
+            f"got {len(records)}"
+        )
+
+    # FRI sends client_id, MNRL sends bank_id
+    payload = {cfg["id_field"]: str(client_id), "atr_data": records}
     encrypted = encrypt_data(payload, _key_id(module))
     session = _get_session()
+
+    # None for FRI, which publishes no request-frequency limit
+    limiter = _limiter(module)
 
     for attempt in range(1, ATR_MAX_RETRIES + 1):
         token = _token(module, force_refresh=(attempt > 1))
@@ -675,13 +782,24 @@ def submit_batch(module: str, records: list[dict]) -> dict:
         if limiter:
             limiter.acquire()
 
-        resp = session.post(
-            url,
-            json=encrypted,
-            headers=headers,
-            timeout=ATR_TIMEOUT,
-            verify=ATR_VERIFY_SSL,
-        )
+        try:
+            resp = session.post(
+                url,
+                json=encrypted,
+                headers=headers,
+                timeout=ATR_TIMEOUT,
+                verify=ATR_VERIFY_SSL,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            # The session performs no automatic retry (see _get_session), so
+            # transport failures are handled here, where the limiter sees them.
+            if attempt < ATR_MAX_RETRIES:
+                wait = min(2 ** attempt, 20)
+                print(f"[ATR] connection error, retrying in {wait}s: {exc}")
+                time.sleep(wait)
+                continue
+            return {"outcome": "failed", "errors": {}, "request_id": None,
+                    "http_status": 0, "message": f"Connection failed: {exc}"}
 
         if resp.status_code == 413:
             raise PayloadTooLarge(f"{len(records)} records rejected as too large")
@@ -734,18 +852,25 @@ def submit_batch(module: str, records: list[dict]) -> dict:
 
 # ── RUN LOGGING ──────────────────────────────────────────────────────────────
 def _create_run(module, segment, feed_date, defaults, total, batch_size,
-                trigger_source="manual") -> str:
+                trigger_source="manual", date_to=None, case_type=None) -> str:
+    """Open a run row. Records the DATE RANGE covered and how many days that is,
+    so the audit shows a fortnight was sent in one go rather than 15 times."""
     run_id = str(uuid.uuid4())
+    dfrom = ms._to_date(feed_date)
+    dto = ms._to_date(date_to) or dfrom
+    days = (dto - dfrom).days + 1 if dfrom and dto else None
+
     with _cursor() as cur:
         cur.execute(
             """
             INSERT INTO atr_runs (
-                id, module, segment, feed_date, action_type, action_taken,
+                id, module, segment, feed_date, date_from, date_to, days_covered,
+                case_type, action_type, action_taken,
                 total_selected, batch_size, status, trigger_source, started_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'running', %s, NOW())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'running', %s, NOW())
             """,
-            (run_id, module.upper(), segment, ms._to_date(feed_date),
+            (run_id, module.upper(), segment, dfrom, dfrom, dto, days, case_type,
              (defaults or {}).get("action_type"), (defaults or {}).get("action_taken"),
              total, batch_size, trigger_source),
         )
@@ -785,11 +910,11 @@ def _log_events(rows: list[tuple]) -> None:
                    run_id, module, mobile_no, cust_id, segment, outcome, trigger,
                    action_type, action_taken, request_payload, response_code,
                    response_message, request_id, state_hash, previous_state,
-                   current_state, attempt_no, batch_no
+                   current_state, attempt_no, batch_no, case_type, feed_date
                ) VALUES %s""",
             rows,
             template=("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, "
-                      "%s, %s::jsonb, %s::jsonb, %s, %s)"),
+                      "%s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::date)"),
             page_size=1000,
         )
 
@@ -837,7 +962,8 @@ def list_events(run_id: str | None = None, module: str | None = None,
 
     with _cursor(dict_cursor=True) as cur:
         cur.execute(
-            f"""SELECT id, run_id, module, mobile_no, cust_id, segment, outcome,
+            f"""SELECT id, run_id, module, mobile_no, cust_id, segment, case_type,
+                       feed_date, outcome,
                        trigger, action_type, action_taken, request_payload,
                        response_code, response_message, request_id,
                        previous_state, current_state, attempt_no, batch_no, created_at
@@ -850,6 +976,9 @@ def list_events(run_id: str | None = None, module: str | None = None,
     for row in rows:
         row["run_id"] = str(row["run_id"])
         row["created_at"] = row["created_at"].isoformat()
+        row["feed_date"] = str(row["feed_date"]) if row.get("feed_date") else None
+        row["case_label"] = CASE_LABEL.get(
+            (row.get("module"), row.get("case_type")), row.get("case_type"))
     return rows
 
 
@@ -1048,9 +1177,11 @@ def run_atr(
     module: str,
     feed_date: Any = None,
     segment: str | None = None,
-    batch_size: int = ATR_BATCH_SIZE,
+    batch_size: int | None = None,
     limit: int | None = None,
     trigger_source: str = "manual",
+    date_to: Any = None,
+    case_type: str | None = None,
 ) -> dict:
     """Send reports for every number whose state differs from the last one sent.
 
@@ -1059,17 +1190,27 @@ def run_atr(
     """
     module = module.upper()
 
-    if not segment or str(segment).upper() == "ALL":
+    # A run is scoped to one (segment, case_type) because the action code
+    # differs for each. Anything unspecified fans out over the combinations
+    # that actually have work.
+    if not segment or str(segment).upper() == "ALL" or not case_type:
         results = []
-        for seg in (ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB):
-            defaults = get_defaults(module, seg)
-            if not defaults:
-                continue
-            d = defaults[0]
-            if ms.count_atr_eligible(module, feed_date, seg,
-                                     d["action_type"], str(d["action_taken"])):
-                results.append(run_atr(module, feed_date, seg, batch_size,
-                                       limit, trigger_source))
+        segs = ([segment] if segment and str(segment).upper() != "ALL"
+                else [ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB])
+        cases = [case_type] if case_type else list(CASE_TYPES)
+        for ct in cases:
+            for seg in segs:
+                defaults = get_defaults(module, seg, ct)
+                if not defaults:
+                    continue
+                d = defaults[0]
+                if not d.get("is_active", True):
+                    continue
+                if ms.count_atr_eligible(module, feed_date, seg,
+                                         d["action_type"], str(d["action_taken"]),
+                                         case_type=ct, date_to=date_to):
+                    results.append(run_atr(module, feed_date, seg, batch_size,
+                                           limit, trigger_source, date_to, ct))
         if not results:
             return {
                 "status": "nothing_to_send",
@@ -1089,11 +1230,16 @@ def run_atr(
             "sent": sum(r.get("sent", 0) for r in results),
             "rejected": sum(r.get("rejected", 0) for r in results),
             "resent": sum(r.get("resent", 0) for r in results),
+            "date_from": str(ms._to_date(feed_date)) if feed_date else None,
+            "date_to": str(ms._to_date(date_to) or ms._to_date(feed_date)) if feed_date else None,
         }
 
-    defaults_list = get_defaults(module, segment)
+    case_type = case_type or CASE_OPEN
+    defaults_list = get_defaults(module, segment, case_type)
     if not defaults_list:
-        raise ValueError(f"No ATR defaults are configured for {module} / {segment}.")
+        raise ValueError(
+            f"No ATR defaults are configured for {module} / {segment} / {case_type}."
+        )
     defaults = defaults_list[0]
     if not defaults.get("is_active", True):
         raise ValueError(f"ATR defaults for {module} / {segment} are switched off.")
@@ -1102,12 +1248,18 @@ def run_atr(
     action_taken = str(defaults["action_taken"])
     batch_size = effective_batch_size(module, batch_size)
 
+    # A previous run in this process may have left entries in the rate-limit
+    # window — including one that crashed. Clearing it means a small run never
+    # inherits a phantom budget and pauses for no reason.
+    reset_rate_limiter(module)
+
     # Free anything a crashed run left claimed, or it would sit stuck forever
     released = ms.release_stuck_claims(module)
     if released:
         print(f"[ATR] released {released} stuck claim(s) from an earlier run")
 
-    eligible = ms.count_atr_eligible(module, feed_date, segment, action_type, action_taken)
+    eligible = ms.count_atr_eligible(module, feed_date, segment, action_type,
+                                     action_taken, case_type=case_type, date_to=date_to)
     cleared = ms.count_cleared_in_window(module, feed_date, segment)
 
     if eligible == 0:
@@ -1126,7 +1278,8 @@ def run_atr(
         }
 
     run_id = _create_run(module, segment, feed_date, defaults, eligible,
-                         batch_size, trigger_source)
+                         batch_size, trigger_source, date_to=date_to,
+                         case_type=case_type)
 
     date_of_action = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sent = rejected = skipped = resent = batches = 0
@@ -1138,9 +1291,23 @@ def run_atr(
         f"action={action_type}/{action_taken} source={trigger_source}"
     )
 
+    # Safety net. Each pass must consume rows, so the number of passes cannot
+    # exceed the number of eligible rows. If it ever does, something is wrong
+    # with the claim predicate and stopping beats hammering C-DOT.
+    max_passes = max(1, -(-eligible // max(1, batch_size))) + 5
+    aborted_reason: str | None = None
+
     try:
         while True:
             if limit is not None and sent + rejected >= limit:
+                break
+
+            if batches >= max_passes:
+                aborted_reason = (
+                    f"Stopped after {batches} batches, more than the "
+                    f"{max_passes} this queue should need. No further requests sent."
+                )
+                print(f"[ATR] X {aborted_reason}")
                 break
 
             take = batch_size
@@ -1148,7 +1315,8 @@ def run_atr(
                 take = min(batch_size, limit - (sent + rejected))
 
             rows = ms.claim_atr_batch(module, run_id, action_type, action_taken,
-                                      feed_date, segment, take)
+                                      feed_date, segment, take,
+                                      case_type=case_type, date_to=date_to)
             if not rows:
                 break
             batches += 1
@@ -1180,6 +1348,7 @@ def run_atr(
                         None, json.dumps(row["_previous"]) if row["_previous"] else None,
                         json.dumps(row["_current"]),
                         int(row.get("atr_send_count", 0)) + 1, batches,
+                        case_type, row.get("cleared_on") or row.get("last_reported_on"),
                     ))
                     continue
                 records.append(record)
@@ -1221,6 +1390,11 @@ def run_atr(
                     cur_state = json.dumps(row["_current"])
 
                     if result["outcome"] == "failed":
+                        # Not a per-number rejection: the gateway refused the
+                        # whole batch (auth, config, malformed payload). Every
+                        # other batch would fail the same way, so the run stops
+                        # after this one rather than sending the queue into a
+                        # wall — and the numbers stay eligible for a retry.
                         outcome, message = "failed", result["message"]
                         failed[row["id"]] = ("rejected", message)
                         rejected += 1
@@ -1244,6 +1418,7 @@ def run_atr(
                         result.get("request_id"),
                         row["new_hash"] if outcome == "sent" else None,
                         prev, cur_state, attempt, batches,
+                        case_type, row.get("cleared_on") or row.get("last_reported_on"),
                     ))
 
                 ms.complete_atr_batch(module, run_id, action_type, action_taken,
@@ -1252,6 +1427,14 @@ def run_atr(
 
             _log_events(events)
             skipped += sum(1 for e in events if e[5] == "skipped")
+
+            if fatal_error:
+                aborted_reason = (
+                    f"C-DOT refused the batch: {fatal_error}. Stopped after "
+                    f"{batches} batch(es); the remaining numbers are untouched."
+                )
+                print(f"[ATR] X {aborted_reason}")
+                break
 
             if ATR_THROTTLE_MS:
                 time.sleep(ATR_THROTTLE_MS / 1000)
@@ -1264,10 +1447,15 @@ def run_atr(
         print(f"[ATR] X run {run_id} failed: {exc}")
         raise
 
-    status = "done" if rejected == 0 and not fatal_error else "partial"
+    if fatal_error and sent == 0:
+        status = "failed"
+    elif rejected or fatal_error:
+        status = "partial"
+    else:
+        status = "done"
     _finish_run(run_id, status, sent=sent, rejected=rejected, skipped=skipped,
                 resent=resent, cleared=cleared, batches=batches,
-                request_ids=request_ids, error=fatal_error)
+                request_ids=request_ids, error=aborted_reason or fatal_error)
 
     summary = {
         "status": status,
@@ -1275,6 +1463,10 @@ def run_atr(
         "module": module,
         "segment": segment,
         "feed_date": str(ms._to_date(feed_date)) if feed_date else None,
+        "date_from": str(ms._to_date(feed_date)) if feed_date else None,
+        "date_to": str(ms._to_date(date_to) or ms._to_date(feed_date)) if feed_date else None,
+        "case_type": case_type,
+        "case_label": CASE_LABEL.get((module, case_type), case_type),
         "action_type": action_type,
         "action_taken": action_taken,
         "selected": eligible,
@@ -1285,6 +1477,7 @@ def run_atr(
         "cleared_skipped": cleared,
         "batches": batches,
         "trigger_source": trigger_source,
+        "message": aborted_reason,
     }
     print(f"[ATR] Done: {summary}")
     return summary
@@ -1295,7 +1488,7 @@ def run_atr(
 # so every field actually sent to C-DOT is its own column — the same detail
 # /api/atr/history/<mobile> returns, for a whole run at once.
 REPORT_COLUMNS: list[str] = [
-    "mobile_no", "cust_id", "segment", "outcome", "trigger",
+    "mobile_no", "cust_id", "segment", "case_label", "feed_date", "outcome", "trigger",
     "action_type", "action_taken", "action_description",
     "date_of_action", "grievance_received",
     "disconnection_reason_id", "disconnection_reason", "investigation_details",
@@ -1308,6 +1501,8 @@ REPORT_LABELS: dict[str, str] = {
     "mobile_no": "Mobile Number",
     "cust_id": "Customer Id",
     "segment": "Classification",
+    "case_label": "Case Type",
+    "feed_date": "Data Date",
     "outcome": "Outcome",
     "trigger": "Why Sent",
     "action_type": "Action Type",
@@ -1354,7 +1549,10 @@ def _report_row(event: dict) -> dict:
     if prev.get("action_type"):
         prev_action = f"{prev.get('action_type')} · {prev.get('action_taken')}"
 
+    ct = event.get("case_type") or ""
     return {
+        "case_label": CASE_LABEL.get((module, ct), ct),
+        "feed_date": str(event["feed_date"]) if event.get("feed_date") else "",
         "mobile_no": event.get("mobile_no") or "",
         "cust_id": event.get("cust_id") or "",
         "segment": event.get("segment") or "",
@@ -1427,10 +1625,10 @@ def iter_report_rows(run_id: str | None = None, module: str | None = None,
                           cursor_factory=psycopg2.extras.RealDictCursor)
         cur.itersize = 5000
         cur.execute(
-            f"""SELECT module, mobile_no, cust_id, segment, outcome, trigger,
-                       action_type, action_taken, request_payload, response_code,
-                       response_message, request_id, attempt_no, previous_state,
-                       created_at
+            f"""SELECT module, mobile_no, cust_id, segment, case_type, feed_date,
+                       outcome, trigger, action_type, action_taken, request_payload,
+                       response_code, response_message, request_id, attempt_no,
+                       previous_state, created_at
                 FROM atr_events WHERE {where}
                 ORDER BY created_at DESC, id DESC""",
             params,

@@ -275,7 +275,10 @@ VALUES
     ('FRI',  'Non-IWPB', 'BOA', '8', 'Debit restriction applied after internal review',            'No', 'Auto-submitted by DOT platform'),
     ('MNRL', 'IWPB',     NULL,  '2', 'Debit and credit restrictions applied after internal review','No', NULL),
     ('MNRL', 'Non-IWPB', NULL,  '8', 'Debit restriction applied after internal review',            'No', NULL)
-ON CONFLICT (module, segment) DO NOTHING;
+-- No conflict target on purpose. v3.5 widens the primary key to include
+-- case_type, so naming (module, segment) here would fail on any database that
+-- has already been migrated. A bare DO NOTHING matches whichever key is in force.
+ON CONFLICT DO NOTHING;
 
 
 -- =============================================================================
@@ -774,6 +777,157 @@ INSERT INTO atr_code_reference (module, code_type, code, action_type, descriptio
     ('MNRL','reactivation_reason','4',NULL,'Reactivation to same customer due to request from LEA/DoT'),
     ('MNRL','reactivation_reason','5',NULL,'Reactivation to other customer due to other reason')
 ON CONFLICT DO NOTHING;
+
+
+-- =============================================================================
+-- v3.5 — FULL LIFECYCLE HISTORY, ATR FOR CLEARED CASES, DATE-RANGE CYCLES
+-- =============================================================================
+
+-- ── 1. master_history — every state a number has ever been in ───────────────
+-- The master row holds CURRENT state. This holds the timeline: reported on the
+-- 10th as flagged, compliant on the 14th, and so on. Nothing is overwritten, so
+-- the disconnection record survives the number becoming compliant.
+--
+-- feed_date is the DATA date (the date folder being reconciled), never the day
+-- the job happened to run.
+CREATE TABLE IF NOT EXISTS master_history (
+    id           BIGSERIAL PRIMARY KEY,
+    module       VARCHAR(10) NOT NULL CHECK (module IN ('FRI', 'MNRL')),
+    mobile_no    VARCHAR(20) NOT NULL,
+    cust_id      VARCHAR(100),
+    segment      VARCHAR(15),
+
+    event_type   VARCHAR(16) NOT NULL CHECK (event_type IN (
+                     'reported',      -- appeared on the risk/revocation feed
+                     'compliant',     -- FRI: cleared
+                     'reactivated',   -- MNRL: cleared
+                     'reopened'       -- reappeared after having been cleared
+                 )),
+    feed_date    DATE        NOT NULL,
+    status_value TEXT,                    -- fri_status / disconnection reason
+    source_file  TEXT,
+    recorded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- One row per number per event per data date: re-reconciling the same file
+    -- does not duplicate history.
+    CONSTRAINT uq_master_history UNIQUE (module, mobile_no, event_type, feed_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_master_history_number
+    ON master_history (module, mobile_no, feed_date DESC);
+CREATE INDEX IF NOT EXISTS idx_master_history_date
+    ON master_history (module, feed_date DESC, event_type);
+
+-- Seed history from the master rows that already exist, so numbers reconciled
+-- before this table existed still have a timeline.
+INSERT INTO master_history (module, mobile_no, cust_id, segment, event_type, feed_date, status_value)
+SELECT 'FRI', mobile_no, cust_id, segment, 'reported', first_reported_on, fri_status
+FROM fri_master
+ON CONFLICT DO NOTHING;
+
+INSERT INTO master_history (module, mobile_no, cust_id, segment, event_type, feed_date, status_value)
+SELECT 'FRI', mobile_no, cust_id, segment, 'compliant', cleared_on, 'compliant'
+FROM fri_master WHERE status = 'cleared' AND cleared_on IS NOT NULL
+ON CONFLICT DO NOTHING;
+
+INSERT INTO master_history (module, mobile_no, cust_id, segment, event_type, feed_date, status_value)
+SELECT 'MNRL', mobile_no, cust_id, segment, 'reported', first_reported_on, disconnection_reason_id
+FROM mnrl_master
+ON CONFLICT DO NOTHING;
+
+INSERT INTO master_history (module, mobile_no, cust_id, segment, event_type, feed_date, status_value)
+SELECT 'MNRL', mobile_no, cust_id, segment, 'reactivated', cleared_on, 'reactivated'
+FROM mnrl_master WHERE status = 'cleared' AND cleared_on IS NOT NULL
+ON CONFLICT DO NOTHING;
+
+
+-- ── 2. ATR defaults per CASE TYPE ───────────────────────────────────────────
+-- A compliant number needs a different action code from an open one, so the
+-- defaults key gains case_type:
+--   'open'    still requiring action  (flagged / disconnected)
+--   'cleared' FRI compliant / MNRL reactivated
+ALTER TABLE atr_defaults ADD COLUMN IF NOT EXISTS case_type VARCHAR(10)
+    NOT NULL DEFAULT 'open' CHECK (case_type IN ('open', 'cleared'));
+
+DO $$ BEGIN
+    ALTER TABLE atr_defaults DROP CONSTRAINT atr_defaults_pkey;
+EXCEPTION WHEN undefined_object THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE atr_defaults ADD PRIMARY KEY (module, segment, case_type);
+EXCEPTION WHEN invalid_table_definition THEN NULL; END $$;
+
+-- Seed the cleared-case defaults.
+--   MNRL code 3 = "Bank/Wallet Account found Compliant" — the natural fit.
+--   FRI has no explicit compliant code; 3 = "Account Not Found Suspicious after
+--   EDD" is the closest and is a PLACEHOLDER. Confirm with compliance.
+INSERT INTO atr_defaults
+    (module, segment, case_type, action_type, action_taken,
+     investigation_details, grievance_received, remarks)
+VALUES
+    ('FRI',  'IWPB',     'cleared', 'BOA', '3',
+     'Account reviewed and found compliant; restrictions lifted', 'No', 'Auto-submitted by DOT platform'),
+    ('FRI',  'Non-IWPB', 'cleared', 'BOA', '3',
+     'Account reviewed and found compliant; restrictions lifted', 'No', 'Auto-submitted by DOT platform'),
+    ('MNRL', 'IWPB',     'cleared', NULL,  '3',
+     'Bank account found compliant after reverification', 'No', NULL),
+    ('MNRL', 'Non-IWPB', 'cleared', NULL,  '3',
+     'Bank account found compliant after reverification', 'No', NULL)
+ON CONFLICT (module, segment, case_type) DO NOTHING;
+
+
+-- ── 3. ATR state on cleared rows ────────────────────────────────────────────
+-- 'not_required' was applied to every row that cleared before its first report.
+-- That is right only when the number was never reported; a number reported as
+-- open and later compliant owes a SECOND report saying so.
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['fri_master', 'mnrl_master'] LOOP
+        EXECUTE format($f$
+            UPDATE %I SET atr_status = 'pending'
+            WHERE status = 'cleared' AND atr_send_count > 0 AND atr_status = 'not_required'
+        $f$, t);
+        -- Claim queries need to reach cleared rows now, so the partial indexes
+        -- that assumed status='active' are replaced.
+        EXECUTE format('DROP INDEX IF EXISTS idx_%s_atr_claim', split_part(t, '_', 1) || '_master');
+        EXECUTE format($f$
+            CREATE INDEX IF NOT EXISTS idx_%s_atr_claim_all
+            ON %I (segment, status, id) WHERE atr_status <> 'sending'
+        $f$, split_part(t, '_', 1) || '_master', t);
+    END LOOP;
+END $$;
+
+
+-- ── 4. atr_runs over a DATE RANGE ───────────────────────────────────────────
+-- Sending one day at a time means 15 selections per fortnight. A run now covers
+-- a range, and records it so the audit shows exactly which days were included.
+ALTER TABLE atr_runs ADD COLUMN IF NOT EXISTS date_from    DATE;
+ALTER TABLE atr_runs ADD COLUMN IF NOT EXISTS date_to      DATE;
+ALTER TABLE atr_runs ADD COLUMN IF NOT EXISTS days_covered INTEGER;
+ALTER TABLE atr_runs ADD COLUMN IF NOT EXISTS case_type    VARCHAR(10)
+    CHECK (case_type IS NULL OR case_type IN ('open', 'cleared'));
+
+-- Existing single-date runs become a one-day range
+UPDATE atr_runs SET date_from = feed_date, date_to = feed_date, days_covered = 1
+WHERE feed_date IS NOT NULL AND date_from IS NULL;
+
+ALTER TABLE atr_events ADD COLUMN IF NOT EXISTS case_type VARCHAR(10);
+ALTER TABLE atr_events ADD COLUMN IF NOT EXISTS feed_date DATE;
+
+CREATE INDEX IF NOT EXISTS idx_atr_runs_range ON atr_runs (module, date_from, date_to);
+
+
+-- ── 5. Lifecycle view — the full picture per number ─────────────────────────
+CREATE OR REPLACE VIEW v_number_lifecycle AS
+    SELECT h.module, h.mobile_no, h.cust_id, h.segment,
+           MIN(h.feed_date) FILTER (WHERE h.event_type = 'reported')     AS first_reported_on,
+           MAX(h.feed_date) FILTER (WHERE h.event_type = 'reported')     AS last_reported_on,
+           MAX(h.feed_date) FILTER (WHERE h.event_type = 'compliant')    AS compliant_on,
+           MAX(h.feed_date) FILTER (WHERE h.event_type = 'reactivated')  AS reactivated_on,
+           MAX(h.feed_date) FILTER (WHERE h.event_type = 'reopened')     AS reopened_on,
+           COUNT(*)                                                      AS event_count
+    FROM master_history h
+    GROUP BY h.module, h.mobile_no, h.cust_id, h.segment;
 
 
 -- =============================================================================

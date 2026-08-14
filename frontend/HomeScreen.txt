@@ -1162,73 +1162,18 @@ const ReconcileModule = () => {
 
 // ─────────────────────────────────────────────
 // TAB 4 — ATR
+//
+// Layout follows the order the work happens in, so the page reads top to
+// bottom instead of presenting every control at once:
+//
+//   1. WHAT      module + date range (presets, not 15 single dates)
+//   2. REVIEW    what will be sent, split by case type and classification
+//   3. SEND      one primary action
+//   then         schedule strip, and the log
+//
+// Action-code settings live in a slide-over, not inline: they are changed once
+// a quarter and were the main source of clutter.
 // ─────────────────────────────────────────────
-const ScheduleCard = ({ schedule, onSave, saving }) => {
-  if (!schedule) return null;
-  const next = schedule.next_run_at ? new Date(schedule.next_run_at) : null;
-  const daysAway = next ? Math.max(0, Math.ceil((next - Date.now()) / 86400000)) : null;
-
-  return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4">
-      <div className="flex items-start justify-between gap-4">
-        <div className="flex items-center gap-2">
-          <CalendarClock size={16} className={schedule.enabled ? "text-emerald-600" : "text-slate-400"} />
-          <div>
-            <p className="text-sm font-semibold text-slate-800">
-              Automatic {schedule.interval_days === 14 ? "fortnightly" : `${schedule.interval_days}-day`} cycle
-            </p>
-            <p className="text-xs text-slate-400 mt-0.5">
-              {schedule.enabled
-                ? next
-                  ? `Next run ${fmtDateTime(schedule.next_run_at)}${daysAway !== null ? ` · in ${daysAway} day${daysAway === 1 ? "" : "s"}` : ""}`
-                  : "Scheduled"
-                : "Paused — reports only go when you press Send"}
-            </p>
-          </div>
-        </div>
-        <button onClick={() => onSave({ enabled: !schedule.enabled })} disabled={saving}
-          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all shrink-0 ${
-            schedule.enabled
-              ? "bg-slate-100 text-slate-600 hover:bg-slate-200"
-              : "bg-emerald-600 text-white hover:bg-emerald-700"
-          } disabled:opacity-40`}>
-          {schedule.enabled ? "Pause" : "Resume"}
-        </button>
-      </div>
-
-      <div className="flex items-center gap-3 mt-3 pt-3 border-t border-slate-100">
-        <label className="text-xs text-slate-500">Every</label>
-        <select value={schedule.interval_days} disabled={saving}
-          onChange={(e) => onSave({ interval_days: Number(e.target.value) })}
-          className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white">
-          {[7, 14, 21, 30].map((d) => <option key={d} value={d}>{d} days</option>)}
-        </select>
-        <label className="text-xs text-slate-500 ml-2">at</label>
-        <select value={schedule.run_at_hour} disabled={saving}
-          onChange={(e) => onSave({ run_at_hour: Number(e.target.value) })}
-          className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white">
-          {Array.from({ length: 24 }, (_, h) => (
-            <option key={h} value={h}>{String(h).padStart(2, "0")}:00</option>
-          ))}
-        </select>
-        {schedule.last_run_at && (
-          <span className="text-xs text-slate-400 ml-auto">
-            Last ran {fmtDateTime(schedule.last_run_at)}
-          </span>
-        )}
-      </div>
-    </div>
-  );
-};
-
-const TRIGGER_LABELS = {
-  first_send: "First report",
-  status_change: "Status changed",
-  action_config_change: "Action code changed",
-  retry_after_reject: "Retry after rejection",
-  manual: "Sent manually",
-};
-
 const MNRL_LABELS = {
   "1": "Bank/Wallet account frozen",
   "2": "Debit/credit restrictions on account",
@@ -1253,26 +1198,206 @@ const BOA_LABELS = {
 };
 const BOT_LABELS = { "5": "Transaction declined", "6": "User blacklisted" };
 
-const DefaultsCard = ({ module, def, onSave, saving }) => {
+const TRIGGER_LABELS = {
+  first_send: "First report",
+  status_change: "Status changed",
+  action_config_change: "Action code changed",
+  retry_after_reject: "Retry after rejection",
+  manual: "Sent manually",
+};
+
+const codeLabels = (module, actionType) =>
+  module === "MNRL" ? MNRL_LABELS : (actionType === "BOT" ? BOT_LABELS : BOA_LABELS);
+
+// ── Date range with presets ──────────────────────────────────────────────────
+// A fortnight is one click. Sending day by day meant 15 selections and 15 sends.
+const rangeFor = (days) => {
+  const to = new Date();
+  const from = new Date();
+  from.setDate(to.getDate() - (days - 1));
+  const iso = (d) => d.toISOString().split("T")[0];
+  return { from: iso(from), to: iso(to) };
+};
+
+const DateRangePicker = ({ from, to, onChange, disabled, days }) => {
+  const presets = [
+    { label: "Last 14 days", days: 14 },
+    { label: "Last 30 days", days: 30 },
+    { label: "Last 90 days", days: 90 },
+  ];
+  const activePreset = presets.find((p) => {
+    const r = rangeFor(p.days);
+    return r.from === from && r.to === to;
+  });
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        {presets.map((p) => (
+          <button key={p.days} type="button" disabled={disabled}
+            onClick={() => { const r = rangeFor(p.days); onChange(r.from, r.to); }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all
+              disabled:opacity-40 disabled:cursor-not-allowed ${
+              activePreset?.days === p.days
+                ? "bg-slate-800 text-white"
+                : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+            }`}>
+            {p.label}
+          </button>
+        ))}
+        <button type="button" disabled={disabled}
+          onClick={() => onChange("", "")}
+          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all
+            disabled:opacity-40 ${
+            !from && !to ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+          }`}>
+          Everything
+        </button>
+      </div>
+
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">From</label>
+          <input type="date" value={from} max={to || today()} disabled={disabled}
+            onChange={(e) => onChange(e.target.value, to)}
+            className="px-3 py-2.5 rounded-xl border border-slate-200 bg-white text-slate-800
+              font-medium text-sm focus:outline-none focus:ring-2 focus:ring-amber-500
+              disabled:opacity-50" />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">To</label>
+          <input type="date" value={to} min={from} max={today()} disabled={disabled}
+            onChange={(e) => onChange(from, e.target.value)}
+            className="px-3 py-2.5 rounded-xl border border-slate-200 bg-white text-slate-800
+              font-medium text-sm focus:outline-none focus:ring-2 focus:ring-amber-500
+              disabled:opacity-50" />
+        </div>
+        {days ? (
+          <span className="px-2.5 py-1 mb-2 bg-amber-100 text-amber-700 rounded-full text-xs font-semibold">
+            {days} day{days === 1 ? "" : "s"}
+          </span>
+        ) : (
+          <span className="px-2.5 py-1 mb-2 bg-slate-100 text-slate-500 rounded-full text-xs font-semibold">
+            All dates
+          </span>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ── Schedule strip ───────────────────────────────────────────────────────────
+const ScheduleStrip = ({ schedule, onSave, saving }) => {
+  if (!schedule) return null;
+  const next = schedule.next_run_at ? new Date(schedule.next_run_at) : null;
+  const daysAway = next ? Math.max(0, Math.ceil((next - Date.now()) / 86400000)) : null;
+
+  return (
+    <div className="flex flex-wrap items-center gap-3 px-4 py-3 rounded-xl border border-slate-200 bg-slate-50">
+      <CalendarClock size={15} className={schedule.enabled ? "text-emerald-600" : "text-slate-400"} />
+      <div className="flex-1 min-w-[200px]">
+        <p className="text-sm font-semibold text-slate-700">
+          {schedule.enabled
+            ? `Runs automatically every ${schedule.interval_days} days`
+            : "Automatic sending is paused"}
+        </p>
+        <p className="text-xs text-slate-400 mt-0.5">
+          {schedule.enabled && next
+            ? `Next ${fmtDateTime(schedule.next_run_at)}${daysAway !== null ? ` · in ${daysAway} day${daysAway === 1 ? "" : "s"}` : ""}`
+            : "Reports only go when you press Send"}
+        </p>
+      </div>
+      <select value={schedule.interval_days} disabled={saving || !schedule.enabled}
+        onChange={(e) => onSave({ interval_days: Number(e.target.value) })}
+        className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white disabled:opacity-50">
+        {[7, 14, 21, 30].map((d) => <option key={d} value={d}>every {d} days</option>)}
+      </select>
+      <select value={schedule.run_at_hour} disabled={saving || !schedule.enabled}
+        onChange={(e) => onSave({ run_at_hour: Number(e.target.value) })}
+        className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white disabled:opacity-50">
+        {Array.from({ length: 24 }, (_, h) => (
+          <option key={h} value={h}>at {String(h).padStart(2, "0")}:00</option>
+        ))}
+      </select>
+      <button onClick={() => onSave({ enabled: !schedule.enabled })} disabled={saving}
+        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+          schedule.enabled
+            ? "bg-white border border-slate-300 text-slate-600 hover:bg-slate-100"
+            : "bg-emerald-600 text-white hover:bg-emerald-700"
+        } disabled:opacity-40`}>
+        {schedule.enabled ? "Pause" : "Resume"}
+      </button>
+    </div>
+  );
+};
+
+// ── Review rows: one per case type × classification ──────────────────────────
+const ReviewGroup = ({ title, subtitle, rows, module, tone }) => {
+  const total = rows.reduce((n, r) => n + (r.eligible || 0), 0);
+  const tones = {
+    amber: { bg: "bg-amber-50", border: "border-amber-200", text: "text-amber-800", pill: "bg-amber-100 text-amber-700" },
+    green: { bg: "bg-emerald-50", border: "border-emerald-200", text: "text-emerald-800", pill: "bg-emerald-100 text-emerald-700" },
+  }[tone];
+
+  return (
+    <div className={`rounded-xl border ${tones.border} ${tones.bg} p-4`}>
+      <div className="flex items-baseline justify-between mb-1">
+        <p className={`text-sm font-bold ${tones.text}`}>{title}</p>
+        <span className={`px-2.5 py-1 rounded-full text-sm font-bold tabular-nums ${tones.pill}`}>
+          {fmt(total)}
+        </span>
+      </div>
+      <p className="text-xs text-slate-500 mb-3">{subtitle}</p>
+
+      <div className="space-y-1.5">
+        {rows.map((r) => {
+          const d = r.defaults;
+          const label = d
+            ? codeLabels(module, d.action_type)[String(d.action_taken)] || "custom code"
+            : null;
+          return (
+            <div key={`${r.case_type}-${r.segment}`}
+              className="flex items-center justify-between gap-3 bg-white rounded-lg px-3 py-2 border border-white/60">
+              <span className="text-xs font-semibold text-slate-700 w-20 shrink-0">
+                {SEGMENT_LABEL[r.segment] || r.segment}
+              </span>
+              <span className="text-xs text-slate-500 flex-1 truncate">
+                {d ? <>
+                  <span className="font-mono text-slate-600">
+                    {d.action_type ? `${d.action_type}·` : ""}{d.action_taken}
+                  </span>
+                  {" — "}{label}
+                </> : <span className="text-rose-500">No action code set</span>}
+              </span>
+              <span className="text-xs font-bold tabular-nums text-slate-700 w-14 text-right">
+                {fmt(r.eligible)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+// ── Settings slide-over ──────────────────────────────────────────────────────
+const DefaultsEditor = ({ module, def, onSave, saving }) => {
   const [draft, setDraft] = useState(def);
   const [dirty, setDirty] = useState(false);
-
   useEffect(() => { setDraft(def); setDirty(false); }, [def]);
 
   const set = (k, v) => { setDraft((d) => ({ ...d, [k]: v })); setDirty(true); };
-  // MNRL has no BOA/BOT split — one flat code table, and no remarks field.
   const isMnrl = module === "MNRL";
-  const labels = isMnrl ? MNRL_LABELS : (draft.action_type === "BOT" ? BOT_LABELS : BOA_LABELS);
+  const labels = codeLabels(module, draft.action_type);
   const maxInvestigation = isMnrl ? 250 : 500;
 
   return (
     <div className="rounded-xl border border-slate-200 p-4 bg-white">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <Users size={15} className={draft.segment === "IWPB" ? "text-indigo-600" : "text-slate-500"} />
-          <h4 className="font-bold text-slate-800 text-sm">{segLabel(draft.segment)}</h4>
-        </div>
-        <span className="text-xs text-slate-400">{module}</span>
+      <div className="flex items-center justify-between mb-3">
+        <h4 className="font-bold text-slate-800 text-sm">
+          {SEGMENT_LABEL[draft.segment] || draft.segment}
+        </h4>
+        {dirty && <span className="text-xs text-amber-600 font-semibold">unsaved</span>}
       </div>
 
       <div className={`grid ${isMnrl ? "grid-cols-1" : "grid-cols-2"} gap-3 mb-3`}>
@@ -1281,9 +1406,9 @@ const DefaultsCard = ({ module, def, onSave, saving }) => {
             onChange={(v) => { set("action_type", v); set("action_taken", v === "BOT" ? "5" : "2"); }}
             options={[{ value: "BOA", label: "BOA" }, { value: "BOT", label: "BOT" }]} />
         )}
-        <SearchableSelect label="Action taken" value={String(draft.action_taken)}
+        <SearchableSelect label="Action code" value={String(draft.action_taken)}
           onChange={(v) => set("action_taken", v)}
-          options={Object.entries(labels).map(([code, text]) => ({ value: code, label: `${code} · ${text}` }))} />
+          options={Object.entries(labels).map(([c, t]) => ({ value: c, label: `${c} · ${t}` }))} />
       </div>
 
       <div className="flex flex-col gap-1.5 mb-3">
@@ -1293,13 +1418,13 @@ const DefaultsCard = ({ module, def, onSave, saving }) => {
         <textarea rows={2} maxLength={maxInvestigation} value={draft.investigation_details || ""}
           onChange={(e) => set("investigation_details", e.target.value)}
           className="px-3 py-2 rounded-lg border border-slate-200 text-sm text-slate-700 resize-none
-            focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent" />
+            focus:outline-none focus:ring-2 focus:ring-amber-500" />
         <span className="text-xs text-slate-400 self-end">
           {(draft.investigation_details || "").length}/{maxInvestigation}
         </span>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 mb-3">
+      <div className={`grid ${isMnrl ? "grid-cols-1" : "grid-cols-2"} gap-3 mb-3`}>
         <SegmentedControl label="Grievance received" value={draft.grievance_received || "No"}
           onChange={(v) => set("grievance_received", v)}
           options={[{ value: "No", label: "No" }, { value: "Yes", label: "Yes" }]} />
@@ -1309,7 +1434,7 @@ const DefaultsCard = ({ module, def, onSave, saving }) => {
             <input type="text" maxLength={100} value={draft.remarks || ""}
               onChange={(e) => set("remarks", e.target.value)}
               className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm text-slate-700
-                focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent" />
+                focus:outline-none focus:ring-2 focus:ring-amber-500" />
           </div>
         )}
       </div>
@@ -1320,21 +1445,19 @@ const DefaultsCard = ({ module, def, onSave, saving }) => {
             <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Money saved (₹)</label>
             <input type="number" value={draft.total_money_saved ?? ""}
               onChange={(e) => set("total_money_saved", e.target.value)}
-              className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm text-slate-700
-                focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm" />
           </div>
           <div className="flex flex-col gap-1.5">
             <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Transactions declined</label>
             <input type="number" value={draft.transaction_declined ?? ""}
               onChange={(e) => set("transaction_declined", e.target.value)}
-              className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm text-slate-700
-                focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              className="px-3 py-2.5 rounded-lg border border-slate-200 text-sm" />
           </div>
         </div>
       )}
 
       <button onClick={() => onSave(draft)} disabled={!dirty || saving}
-        className="w-full mt-1 px-4 py-2.5 rounded-lg text-sm font-semibold transition-all
+        className="w-full px-4 py-2.5 rounded-lg text-sm font-semibold transition-all
           disabled:opacity-40 disabled:cursor-not-allowed bg-slate-800 hover:bg-slate-900 text-white">
         {saving ? "Saving…" : dirty ? "Save changes" : "Saved"}
       </button>
@@ -1342,26 +1465,54 @@ const DefaultsCard = ({ module, def, onSave, saving }) => {
   );
 };
 
-// Shown when the ATR credentials aren't wired up. Catching this here means the
-// operator sees the problem before pressing Send, not as a failed run.
-const ConfigWarning = ({ config, module }) => {
-  if (!config || config.ready) return null;
+const SettingsDrawer = ({ open, onClose, module, defaults, onSave, saving }) => {
+  const [tab, setTab] = useState("open");
+  if (!open) return null;
+
+  const shown = defaults.filter((d) => d.case_type === tab);
+  const caption = tab === "open"
+    ? (module === "FRI"
+        ? "Sent for numbers still flagged for reverification."
+        : "Sent for numbers still on the revocation list.")
+    : (module === "FRI"
+        ? "Sent once a number has been found compliant."
+        : "Sent once a number has been reverified or reactivated.");
+
   return (
-    <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 mb-5">
-      <div className="flex items-start gap-2.5">
-        <AlertCircle size={16} className="text-rose-500 shrink-0 mt-0.5" />
-        <div className="flex-1">
-          <p className="text-sm font-semibold text-rose-800">
-            {module} reports aren't configured yet
-          </p>
-          <ul className="mt-2 space-y-1">
-            {(config.problems || []).map((p, i) => (
-              <li key={i} className="text-xs text-rose-700 leading-relaxed">• {p}</li>
-            ))}
-          </ul>
-          <p className="text-xs text-rose-500 mt-2">
-            Reports stay queued until this is sorted — nothing is lost.
-          </p>
+    <div className="fixed inset-0 bg-slate-900/40 flex justify-end z-50" onClick={onClose}>
+      <div className="bg-slate-50 w-full max-w-lg h-full overflow-y-auto shadow-2xl"
+        onClick={(e) => e.stopPropagation()}>
+        <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between z-10">
+          <div>
+            <h3 className="font-bold text-slate-800">{module} action codes</h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              What gets sent to C-DOT for each case
+            </p>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="px-6 py-4 space-y-4">
+          <SegmentedControl value={tab} onChange={setTab}
+            options={[
+              { value: "open", label: module === "FRI" ? "Flagged" : "Disconnected" },
+              { value: "cleared", label: module === "FRI" ? "Compliant" : "Reactivated" },
+            ]} />
+          <p className="text-xs text-slate-500">{caption}</p>
+
+          <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">
+            <p className="text-xs text-amber-800">
+              Confirm these codes with compliance before the first live send.
+            </p>
+          </div>
+
+          {shown.map((d) => (
+            <DefaultsEditor key={`${d.case_type}-${d.segment}`} module={module} def={d}
+              onSave={(draft) => onSave({ ...draft, case_type: tab })}
+              saving={saving === `${tab}-${d.segment}`} />
+          ))}
         </div>
       </div>
     </div>
@@ -1371,135 +1522,113 @@ const ConfigWarning = ({ config, module }) => {
 const ATRModule = () => {
   const [module, setModule]   = useState("FRI");
   const [segment, setSegment] = useState("ALL");
-  const [mDate, setMDate]     = useState("ALL");
+  const initial = rangeFor(14);
+  const [dateFrom, setDateFrom] = useState(initial.from);
+  const [dateTo, setDateTo]     = useState(initial.to);
 
-  const [dates, setDates]     = useState([]);
-  const [segCounts, setSegC]  = useState(null);
-  const [loadingMeta, setLM]  = useState(false);
-
-  const [config, setConfig]     = useState(null);
   const [defaults, setDefaults] = useState([]);
   const [savingSeg, setSaving]  = useState(null);
   const [showSettings, setShow] = useState(false);
 
-  const [preview, setPreview] = useState(null);
+  const [preview, setPreview]   = useState(null);
+  const [loadingPreview, setLP] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [jobId, setJobId]     = useState(null);
-  const [lastRun, setLastRun] = useState(null);
+  const [jobId, setJobId]       = useState(null);
+  const [lastRun, setLastRun]   = useState(null);
 
-  const [runs, setRuns]       = useState([]);
-  const [loadingRuns, setLR]  = useState(true);
-  const [events, setEvents] = useState(null);
-  const [schedule, setSchedule] = useState(null);
-  const [savingSched, setSavingSched] = useState(false);
-  const [reportJob, setReportJob] = useState(null);
-  const [reportFile, setReportFile] = useState(null);
-  const [buildingReport, setBuildingReport] = useState(false);
-  const [alert, setAlert]     = useState(null);
+  const [schedule, setSchedule]     = useState(null);
+  const [savingSched, setSavingSch] = useState(false);
+
+  const [runs, setRuns]         = useState([]);
+  const [loadingRuns, setLR]    = useState(true);
+  const [events, setEvents]     = useState(null);
+  const [reportJob, setRepJob]  = useState(null);
+  const [buildingRep, setBuildingRep] = useState(false);
+  const [alert, setAlert]       = useState(null);
 
   const showAlert = (type, message) => {
     setAlert({ type, message });
-    if (type === "success") setTimeout(() => setAlert(null), 9000);
+    if (type !== "error") setTimeout(() => setAlert(null), 9000);
   };
 
   const loadMeta = useCallback(async (mod) => {
-    setLM(true);
     try {
-      const [d, g, df, cfg] = await Promise.all([
-        api.fetchMasterDates(mod), api.fetchMasterSegments(mod),
-        api.fetchAtrDefaults(mod), api.fetchAtrConfig(mod),
+      const [df, sc] = await Promise.all([
+        api.fetchAtrDefaults(mod), api.fetchAtrSchedule(mod),
       ]);
-      setConfig(cfg);
-      setDates(d.dates || []);
-      setSegC(g);
       setDefaults(df.defaults || []);
+      setSchedule((sc.schedule || [])[0] || null);
     } catch (e) { showAlert("error", `Couldn't load settings: ${e.message}`); }
-    finally { setLM(false); }
   }, []);
 
   const loadRuns = useCallback(async () => {
     setLR(true);
     try { setRuns((await api.fetchAtrRuns()).runs || []); }
-    catch (e) { showAlert("error", `Couldn't load run history: ${e.message}`); }
+    catch (e) { showAlert("error", `Couldn't load the log: ${e.message}`); }
     finally { setLR(false); }
   }, []);
 
   const refreshPreview = useCallback(async () => {
+    setLP(true);
     try {
       setPreview(await api.fetchAtrPreview({
-        type: module, date: mDate === "ALL" ? "" : mDate, segment,
+        type: module, date_from: dateFrom, date_to: dateTo, segment,
       }));
     } catch { setPreview(null); }
-  }, [module, mDate, segment]);
+    finally { setLP(false); }
+  }, [module, dateFrom, dateTo, segment]);
 
-  useEffect(() => { setMDate("ALL"); setSegment("ALL"); loadMeta(module); }, [module, loadMeta]);
+  useEffect(() => { loadMeta(module); }, [module, loadMeta]);
   useEffect(() => { loadRuns(); }, [loadRuns]);
   useEffect(() => { refreshPreview(); }, [refreshPreview]);
 
   const handleSaveDefaults = async (draft) => {
-    setSaving(draft.segment);
+    setSaving(`${draft.case_type}-${draft.segment}`);
     try {
       await api.saveAtrDefaults({ ...draft, type: module });
       await loadMeta(module);
       await refreshPreview();
-      showAlert("success", `${segLabel(draft.segment)} defaults saved.`);
+      showAlert("success", "Action code saved.");
     } catch (e) { showAlert("error", e.message); }
     finally { setSaving(null); }
   };
 
-  const handleSubmit = async () => {
+  const handleSaveSchedule = async (patch) => {
+    setSavingSch(true);
+    try { setSchedule((await api.saveAtrSchedule({ type: module, ...patch })).saved); }
+    catch (e) { showAlert("error", e.message); }
+    finally { setSavingSch(false); }
+  };
+
+  const handleSend = async () => {
     setStarting(true); setAlert(null); setLastRun(null);
     try {
       const job = await api.submitAtr({
-        type: module, date: mDate === "ALL" ? null : mDate,
-        segment,
+        type: module, date_from: dateFrom || null, date_to: dateTo || null, segment,
       });
       setJobId(job.job_id);
     } catch (e) { showAlert("error", e.message); }
     finally { setStarting(false); }
   };
 
-  const handleSaveSchedule = async (patch) => {
-    setSavingSched(true);
-    try {
-      const r = await api.saveAtrSchedule({ type: module, ...patch });
-      setSchedule(r.saved);
-    } catch (e) { showAlert("error", e.message); }
-    finally { setSavingSched(false); }
-  };
-
-  // Full submission report: one row per number per attempt, with everything
-  // sent to C-DOT and the response received.
   const handleBuildReport = async (runId) => {
-    setBuildingReport(true); setReportFile(null); setAlert(null);
+    setBuildingRep(true); setAlert(null);
     try {
-      const job = await api.buildAtrReport(
-        runId ? { run_id: runId } : { type: module }
-      );
-      setReportJob(job.job_id);
+      const job = await api.buildAtrReport(runId ? { run_id: runId } : { type: module });
+      setRepJob(job.job_id);
     } catch (e) { showAlert("error", e.message); }
-    finally { setBuildingReport(false); }
+    finally { setBuildingRep(false); }
   };
 
   const handleRetry = async () => {
     try {
-      const r = await api.retryAtr({ type: module, date: mDate === "ALL" ? null : mDate, segment });
+      const r = await api.retryAtr({
+        type: module, date_from: dateFrom || null, date_to: dateTo || null, segment,
+      });
       await refreshPreview();
       showAlert("success", `${fmt(r.requeued)} number(s) put back in the queue.`);
     } catch (e) { showAlert("error", e.message); }
   };
-
-  useJobPoller({
-    jobId: reportJob, recordCount: 0,
-    onDone: (result) => {
-      setReportJob(null);
-      if (result.status === "empty") { showAlert("info", result.message); return; }
-      setReportFile(result);
-      triggerBlobDownload(result.sas_url, result.file_name);
-      showAlert("success", `Report ready — ${fmt(result.record_count)} entries.`);
-    },
-    onFailed: (e) => { setReportJob(null); showAlert("error", e); },
-  });
 
   useJobPoller({
     jobId, recordCount: preview?.total_eligible || 0,
@@ -1508,129 +1637,126 @@ const ATRModule = () => {
       await Promise.all([loadRuns(), refreshPreview()]);
       const sent = result.total_sent ?? result.sent ?? 0;
       const rej  = result.total_rejected ?? result.rejected ?? 0;
-      showAlert(rej > 0 ? "warning" : "success",
-        rej > 0
-          ? `Sent ${fmt(sent)}, ${fmt(rej)} rejected by C-DOT. Open the run to see why.`
-          : `Sent ${fmt(sent)} action taken reports.`);
+      if (result.status === "nothing_to_send") showAlert("info", result.message);
+      else showAlert(rej > 0 ? "warning" : "success",
+        rej > 0 ? `Sent ${fmt(sent)}, ${fmt(rej)} rejected by C-DOT.`
+                : `Sent ${fmt(sent)} action taken reports.`);
     },
     onFailed: (e) => { setJobId(null); showAlert("error", e); },
   });
 
+  useJobPoller({
+    jobId: reportJob, recordCount: 0,
+    onDone: (result) => {
+      setRepJob(null);
+      if (result.status === "empty") { showAlert("info", result.message); return; }
+      triggerBlobDownload(result.sas_url, result.file_name);
+      showAlert("success", `Report ready — ${fmt(result.record_count)} entries.`);
+    },
+    onFailed: (e) => { setRepJob(null); showAlert("error", e); },
+  });
+
   const running = starting || !!jobId;
-  const dateOptions = [
-    { value: "ALL", label: "All dates in the window" },
-    ...dates.map((d) => ({ value: d.feed_date, label: `${d.feed_date} · ${fmt(d.record_count)}` })),
-  ];
+  const openRows    = (preview?.breakdown || []).filter((b) => b.case_type === "open");
+  const clearedRows = (preview?.breakdown || []).filter((b) => b.case_type === "cleared");
+  const total = preview?.total_eligible ?? 0;
 
   return (
     <div className="space-y-6">
+      {/* ── Step 1 + 2: what, and what will go ── */}
       <SectionCard icon={Send} iconBg="bg-amber-600" title="Action taken reports"
-        subtitle="Send the action your team applied back to C-DOT, per classification"
+        subtitle="Tell C-DOT what your team did — and what has since been cleared"
         action={
-          <button onClick={() => setShow((s) => !s)}
-            className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-900 font-medium px-3 py-1.5 hover:bg-slate-100 rounded-lg transition-colors">
-            <Settings2 size={13} /> {showSettings ? "Hide" : "Edit"} defaults
+          <button onClick={() => setShow(true)}
+            className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-900
+              font-medium px-3 py-1.5 hover:bg-slate-100 rounded-lg transition-colors">
+            <Settings2 size={13} /> Action codes
           </button>
         }>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
           <SegmentedControl label="Source" value={module} onChange={setModule} disabled={running}
             options={[{ value: "FRI", label: "FRI" }, { value: "MNRL", label: "MNRL" }]} />
-          <SearchableSelect label="Data date" value={mDate} onChange={setMDate}
-            options={dateOptions} loading={loadingMeta} disabled={running}
-            emptyText="Nothing reconciled yet — use the Reconcile tab first" />
-          <SegmentedControl label="Classification" value={segment} disabled={running}
-            onChange={setSegment} options={classificationOptions(segCounts)} />
-          <UnclassifiedNote count={segCounts?.unclassified} module={module} />
+          <SegmentedControl label="Classification" value={segment} onChange={setSegment}
+            disabled={running}
+            options={[
+              { value: "ALL", label: "Both" },
+              { value: "IWPB", label: "IWPB" },
+              { value: "Non-IWPB", label: "CIB" },
+            ]} />
         </div>
 
-        {showSettings && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5 p-4 bg-slate-50 rounded-xl border border-slate-200">
-            <div className="md:col-span-2">
-              <p className="text-xs text-slate-500 mb-1">
-                These values go into every report for that classification. Confirm the action
-                codes with compliance before the first live send.
-              </p>
-            </div>
-            {defaults.map((d) => (
-              <DefaultsCard key={d.segment} module={module} def={d}
-                onSave={handleSaveDefaults} saving={savingSeg === d.segment} />
-            ))}
-          </div>
-        )}
-
-        <ConfigWarning config={config} module={module} />
-
-        <div className="mb-5">
-          <ScheduleCard schedule={schedule} onSave={handleSaveSchedule} saving={savingSched} />
+        <div className="mb-5 p-4 rounded-xl border border-slate-200 bg-slate-50">
+          <p className="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3">
+            Data dates to cover
+          </p>
+          <DateRangePicker from={dateFrom} to={dateTo} days={preview?.days_covered}
+            disabled={running}
+            onChange={(f, t) => { setDateFrom(f); setDateTo(t); }} />
         </div>
 
-        {/* What will be sent */}
-        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 mb-5">
-          <div className="flex items-center justify-between mb-3">
-            <p className="text-sm font-semibold text-amber-800">Ready to send</p>
-            <span className="text-2xl font-bold text-amber-900 tabular-nums">
-              {fmt(preview?.total_eligible ?? 0)}
-            </span>
-          </div>
-          <div className="space-y-2">
-            {(preview?.breakdown || []).map((b) => (
-              <div key={b.segment} className="flex items-center justify-between text-xs bg-white rounded-lg px-3 py-2 border border-amber-100">
-                <span className="font-semibold text-slate-700">{segLabel(b.segment)}</span>
-                <span className="text-slate-500">
-                  {b.defaults
-                    ? `${b.defaults.action_type ? b.defaults.action_type + " · " : ""}${b.defaults.action_taken} — ${
-                        (module === "MNRL"
-                          ? MNRL_LABELS
-                          : (b.defaults.action_type === "BOT" ? BOT_LABELS : BOA_LABELS)
-                        )[String(b.defaults.action_taken)] || "custom"
-                      }`
-                    : "No defaults set"}
-                </span>
-                <span className="font-semibold tabular-nums text-amber-700">{fmt(b.pending)}</span>
-              </div>
-            ))}
-          </div>
+        {/* Review */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
+          <ReviewGroup tone="amber" rows={openRows} module={module}
+            title={module === "FRI" ? "Still flagged" : "Still disconnected"}
+            subtitle="Action your team applied" />
+          <ReviewGroup tone="green" rows={clearedRows} module={module}
+            title={module === "FRI" ? "Now compliant" : "Now reactivated"}
+            subtitle="Cleared since the last report" />
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="flex items-center justify-between px-4 py-3 rounded-xl bg-slate-800 text-white mb-4">
+          <div>
+            <p className="text-sm font-semibold">Ready to send</p>
+            <p className="text-xs text-slate-300 mt-0.5">
+              {loadingPreview ? "Checking…"
+                : total === 0
+                  ? "Everything here has already been reported in its current state"
+                  : `${preview?.days_covered ? `${preview.days_covered} days` : "All dates"} · already-sent numbers are skipped automatically`}
+            </p>
+          </div>
+          <span className="text-3xl font-bold tabular-nums">{fmt(total)}</span>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
           <button onClick={handleRetry} disabled={running}
             className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold
               border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 transition-all
               disabled:opacity-40 disabled:cursor-not-allowed">
             <RotateCcw size={15} /> Requeue rejected
           </button>
-          <PrimaryBtn onClick={handleSubmit} loading={starting} Icon={Send}
-            disabled={running || !preview?.total_eligible || (config && !config.ready)}
-            gradient="linear-gradient(135deg, #d97706, #b45309)" label="Send now" />
+          <div className="md:col-span-2">
+            <PrimaryBtn onClick={handleSend} loading={starting} Icon={Send}
+              disabled={running || !total}
+              gradient="linear-gradient(135deg, #d97706, #b45309)"
+              label={total ? `Send ${fmt(total)} reports` : "Nothing to send"} />
+          </div>
         </div>
 
         {jobId && <RunningBanner tone="amber" title="Sending to C-DOT…"
-          subtitle="Encrypted batches; failures are logged per number" />}
+          subtitle="Encrypted batches; every attempt is logged per number" />}
 
         {lastRun && !jobId && (
-          <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
-            <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
-              <StatChip label="Sent" value={lastRun.total_sent ?? lastRun.sent} tone="green" />
-              <StatChip label="Rejected" value={lastRun.total_rejected ?? lastRun.rejected} tone="rose" />
-              {(lastRun.skipped ?? 0) > 0 && <StatChip label="Skipped" value={lastRun.skipped} tone="amber" />}
-              {(lastRun.resent ?? 0) > 0 && (
-                <StatChip label="Re-sent after a status change" value={lastRun.resent} tone="indigo" />
-              )}
-              {(lastRun.cleared_skipped ?? 0) > 0 && (
-                <StatChip label="Left out (already compliant)" value={lastRun.cleared_skipped} tone="slate" />
-              )}
-            </div>
+          <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4 flex flex-wrap gap-x-5 gap-y-2">
+            <StatChip label="Sent" value={lastRun.total_sent ?? lastRun.sent} tone="green" />
+            <StatChip label="Rejected" value={lastRun.total_rejected ?? lastRun.rejected} tone="rose" />
+            {(lastRun.resent ?? 0) > 0 &&
+              <StatChip label="Re-sent after a status change" value={lastRun.resent} tone="indigo" />}
           </div>
         )}
 
         {alert && <Alert {...alert} onClose={() => setAlert(null)} />}
       </SectionCard>
 
+      {/* ── Schedule ── */}
+      <ScheduleStrip schedule={schedule} onSave={handleSaveSchedule} saving={savingSched} />
+
+      {/* ── Log ── */}
       <SectionCard icon={ListChecks} iconBg="bg-slate-600" title="Submission log"
         subtitle={`${runs.length} run${runs.length === 1 ? "" : "s"}`}
         action={
           <div className="flex items-center gap-2">
-            <button onClick={() => handleBuildReport(null)} disabled={buildingReport || !!reportJob}
+            <button onClick={() => handleBuildReport(null)} disabled={buildingRep || !!reportJob}
               className="flex items-center gap-1.5 text-xs font-semibold text-emerald-600
                 bg-emerald-50 hover:bg-emerald-600 hover:text-white px-3 py-1.5 rounded-lg
                 transition-colors disabled:opacity-40">
@@ -1639,7 +1765,8 @@ const ATRModule = () => {
                 : <><Download size={13} /> Full {module} report</>}
             </button>
             <button onClick={loadRuns} disabled={loadingRuns}
-              className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-800 font-medium px-3 py-1.5 hover:bg-slate-100 rounded-lg transition-colors">
+              className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-800
+                font-medium px-3 py-1.5 hover:bg-slate-100 rounded-lg transition-colors">
               <RefreshCw size={13} className={loadingRuns ? "animate-spin" : ""} /> Refresh
             </button>
           </div>
@@ -1647,18 +1774,38 @@ const ATRModule = () => {
         <Paginated items={runs} loading={loadingRuns} accent="amber"
           emptyTitle="Nothing sent yet"
           emptyHint="Reconcile some data, then send the reports"
-          columns={["Module", "Classification", "Date", "Action", "Sent", "Rejected", "Status", "Started", ""]}
+          columns={["Module", "Case", "Dates covered", "Action", "Sent", "Rejected", "Status", "Started", ""]}
           renderRow={(run) => (
             <tr key={run.id} className="hover:bg-amber-50/30 transition-colors">
               <td className="px-4 py-3.5">
                 <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
                   run.module === "FRI" ? "bg-blue-100 text-blue-700" : "bg-teal-100 text-teal-700"
                 }`}>{run.module}</span>
+                <span className="ml-1.5 text-xs text-slate-400">
+                  {SEGMENT_LABEL[run.segment] || run.segment || "Both"}
+                </span>
               </td>
-              <td className="px-4 py-3.5 text-xs text-slate-600">{run.segment ? segLabel(run.segment) : "Both"}</td>
-              <td className="px-4 py-3.5 text-xs font-mono text-slate-500">{run.feed_date || "All"}</td>
+              <td className="px-4 py-3.5">
+                <span className={`px-2 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap ${
+                  run.case_type === "cleared"
+                    ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"
+                }`}>{run.case_label || run.case_type || "—"}</span>
+              </td>
               <td className="px-4 py-3.5 text-xs text-slate-600 whitespace-nowrap">
-                {run.action_type ? `${run.action_type} · ` : ""}{run.action_taken}
+                {run.date_from
+                  ? <>
+                      <span className="font-mono">{run.date_from}</span>
+                      {run.date_to && run.date_to !== run.date_from &&
+                        <> → <span className="font-mono">{run.date_to}</span></>}
+                      {run.days_covered > 1 &&
+                        <span className="ml-1.5 px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-xs">
+                          {run.days_covered}d
+                        </span>}
+                    </>
+                  : <span className="text-slate-400">All dates</span>}
+              </td>
+              <td className="px-4 py-3.5 text-xs text-slate-600 whitespace-nowrap font-mono">
+                {run.action_type ? `${run.action_type}·` : ""}{run.action_taken}
               </td>
               <td className="px-4 py-3.5">
                 <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded-full text-xs font-semibold tabular-nums">
@@ -1666,11 +1813,11 @@ const ATRModule = () => {
                 </span>
               </td>
               <td className="px-4 py-3.5">
-                {run.total_rejected > 0 ? (
-                  <span className="px-2 py-0.5 bg-rose-100 text-rose-700 rounded-full text-xs font-semibold tabular-nums">
-                    {fmt(run.total_rejected)}
-                  </span>
-                ) : <span className="text-slate-300 text-xs">—</span>}
+                {run.total_rejected > 0
+                  ? <span className="px-2 py-0.5 bg-rose-100 text-rose-700 rounded-full text-xs font-semibold tabular-nums">
+                      {fmt(run.total_rejected)}
+                    </span>
+                  : <span className="text-slate-300 text-xs">—</span>}
               </td>
               <td className="px-4 py-3.5">
                 <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
@@ -1680,20 +1827,23 @@ const ATRModule = () => {
                     : "bg-slate-100 text-slate-600"
                 }`}>{run.status}</span>
               </td>
-              <td className="px-4 py-3.5 text-slate-400 text-xs whitespace-nowrap">{fmtDateTime(run.started_at)}</td>
+              <td className="px-4 py-3.5 text-slate-400 text-xs whitespace-nowrap">
+                {fmtDateTime(run.started_at)}
+              </td>
               <td className="px-4 py-3.5">
                 <div className="flex items-center gap-1.5">
                   <button onClick={async () => {
                     try { setEvents({ run, rows: (await api.fetchAtrEvents(run.id)).events }); }
                     catch (e) { showAlert("error", e.message); }
                   }}
-                    className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-700 hover:text-white rounded-lg transition-all whitespace-nowrap">
+                    className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100
+                      hover:bg-slate-700 hover:text-white rounded-lg transition-all">
                     View
                   </button>
-                  <button onClick={() => handleBuildReport(run.id)} disabled={buildingReport || !!reportJob}
+                  <button onClick={() => handleBuildReport(run.id)} disabled={buildingRep || !!reportJob}
                     className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-emerald-600
                       bg-emerald-50 hover:bg-emerald-600 hover:text-white rounded-lg transition-all
-                      whitespace-nowrap disabled:opacity-40">
+                      disabled:opacity-40">
                     <Download size={12} /> Excel
                   </button>
                 </div>
@@ -1702,7 +1852,10 @@ const ATRModule = () => {
           )} />
       </SectionCard>
 
-      {/* Audit drawer — every attempt in the run, not just the failures */}
+      <SettingsDrawer open={showSettings} onClose={() => setShow(false)}
+        module={module} defaults={defaults} onSave={handleSaveDefaults} saving={savingSeg} />
+
+      {/* Audit drawer */}
       {events && (
         <div className="fixed inset-0 bg-slate-900/40 flex items-end md:items-center justify-center z-50 p-4"
           onClick={() => setEvents(null)}>
@@ -1712,8 +1865,10 @@ const ATRModule = () => {
               <div>
                 <h3 className="font-bold text-slate-800">Report audit</h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  {events.run.module} · {events.run.segment ? segLabel(events.run.segment) : "Both"} ·
-                  {" "}{fmtDateTime(events.run.started_at)} · {fmt(events.rows.length)} entries
+                  {events.run.module} · {events.run.case_label} ·{" "}
+                  {events.run.date_from}
+                  {events.run.date_to !== events.run.date_from && ` → ${events.run.date_to}`}
+                  {" "}· {fmt(events.rows.length)} entries
                 </p>
               </div>
               <button onClick={() => setEvents(null)} className="text-slate-400 hover:text-slate-600">
@@ -1724,7 +1879,7 @@ const ATRModule = () => {
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-slate-50">
                   <tr className="border-b border-slate-200">
-                    {["Mobile", "Customer", "Outcome", "Why sent", "Action", "Response"].map((h) => (
+                    {["Mobile", "Data date", "Outcome", "Why sent", "Action", "Response"].map((h) => (
                       <th key={h} className="text-left px-4 py-2.5 text-xs font-semibold text-slate-500 uppercase">
                         {h}
                       </th>
@@ -1735,7 +1890,7 @@ const ATRModule = () => {
                   {events.rows.map((e) => (
                     <tr key={e.id} className="hover:bg-slate-50/60">
                       <td className="px-4 py-2.5 font-mono text-xs text-slate-700">{e.mobile_no}</td>
-                      <td className="px-4 py-2.5 text-xs text-slate-500">{e.cust_id || "—"}</td>
+                      <td className="px-4 py-2.5 font-mono text-xs text-slate-500">{e.feed_date || "—"}</td>
                       <td className="px-4 py-2.5">
                         <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
                           e.outcome === "sent" ? "bg-green-100 text-green-700"
@@ -1745,12 +1900,10 @@ const ATRModule = () => {
                       </td>
                       <td className="px-4 py-2.5 text-xs text-slate-600">
                         {TRIGGER_LABELS[e.trigger] || e.trigger}
-                        {e.attempt_no > 1 && (
-                          <span className="ml-1 text-slate-400">· attempt {e.attempt_no}</span>
-                        )}
+                        {e.attempt_no > 1 && <span className="ml-1 text-slate-400">· #{e.attempt_no}</span>}
                       </td>
-                      <td className="px-4 py-2.5 text-xs text-slate-600 whitespace-nowrap">
-                        {e.action_type ? `${e.action_type} · ` : ""}{e.action_taken}
+                      <td className="px-4 py-2.5 text-xs text-slate-600 whitespace-nowrap font-mono">
+                        {e.action_type ? `${e.action_type}·` : ""}{e.action_taken}
                       </td>
                       <td className="px-4 py-2.5 text-xs max-w-[220px]">
                         <span className={e.outcome === "sent" ? "text-slate-500" : "text-rose-600"}>
@@ -1764,9 +1917,8 @@ const ATRModule = () => {
             </div>
             <div className="px-6 py-3 border-t border-slate-200 bg-slate-50">
               <p className="text-xs text-slate-400">
-                Every attempt is kept, including the exact payload sent to C-DOT.
-                Use <strong>Excel</strong> on any run for the full report, or
-                <code className="font-mono ml-1">/api/atr/history/&lt;mobile&gt;</code> for one number.
+                Every attempt is kept, with the exact payload sent to C-DOT.
+                Use <strong>Excel</strong> for the full report.
               </p>
             </div>
           </div>

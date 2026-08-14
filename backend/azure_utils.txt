@@ -876,6 +876,7 @@ def export_master(
     feed_date: str | None = None,
     segment: str | None = None,
     record_status: str = "all",
+    date_to: str | None = None,
 ) -> dict:
     """Stream the filtered master straight into workbook parts and upload each.
 
@@ -889,7 +890,7 @@ def export_master(
     module = module.upper()
     container = _get_container_name(module)
 
-    total = ms.count_active(module, feed_date, segment, record_status)
+    total = ms.count_active(module, feed_date, segment, record_status, date_to)
     if total == 0:
         # An empty selection is a normal answer, not a failure. Returning a
         # result lets the UI say "nothing here" instead of showing a red error.
@@ -913,10 +914,11 @@ def export_master(
     label_date = feed_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     seg_label = (segment or "all").replace("-", "").lower()
     status_label = "" if record_status == "all" else f"_{record_status}"
-    base_name = f"{module.lower()}_{seg_label}{status_label}_{label_date}_{total}_records.xlsx"
+    span = f"{feed_date}_to_{date_to}" if date_to and date_to != feed_date else label_date
+    base_name = f"{module.lower()}_{seg_label}{status_label}_{span}_{total}_records.xlsx"
 
     row_iter = ms.iter_active(module, feed_date, segment, columns=columns,
-                              record_status=record_status)
+                              record_status=record_status, date_to=date_to)
 
     parts_meta = []
     exported = 0

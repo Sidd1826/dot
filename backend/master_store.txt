@@ -473,6 +473,54 @@ def _ledger_conflicts(module, feed_date, mobiles) -> set[str]:
         return {r[0] for r in cur.fetchall()}
 
 
+_HISTORY_SQL = """
+INSERT INTO master_history
+    (module, mobile_no, cust_id, segment, event_type, feed_date, status_value, source_file)
+VALUES %s
+ON CONFLICT (module, mobile_no, event_type, feed_date) DO NOTHING
+"""
+
+
+def _record_history(module: str, rows: list[tuple]) -> int:
+    """Append lifecycle events. Append-only and idempotent.
+
+    The master row holds current state; this holds the timeline. When a number
+    flagged on the 10th turns compliant on the 14th, the master row is updated
+    but BOTH events survive here, so "when was this disconnected, when did it
+    become compliant" is always answerable.
+
+    feed_date is the DATA date, never the day the reconcile happened to run.
+    """
+    if not rows:
+        return 0
+    with _cursor() as cur:
+        psycopg2.extras.execute_values(cur, _HISTORY_SQL, rows, page_size=PAGE_SIZE)
+    return len(rows)
+
+
+def number_timeline(mobile_no: str, module: str | None = None) -> list[dict]:
+    """Every recorded state for one number, oldest first."""
+    mobile = _norm_mobile(mobile_no)
+    if not mobile:
+        return []
+    sql = """SELECT module, mobile_no, cust_id, segment, event_type, feed_date,
+                    status_value, source_file, recorded_at
+             FROM master_history WHERE mobile_no = %s"""
+    params: list[Any] = [mobile]
+    if module:
+        sql += " AND module = %s"
+        params.append(module.upper())
+    sql += " ORDER BY feed_date, id"
+
+    with _cursor(dict_cursor=True) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        r["feed_date"] = str(r["feed_date"])
+        r["recorded_at"] = r["recorded_at"].isoformat()
+    return rows
+
+
 def _upsert(module: str, rows: list[tuple]) -> dict:
     if not rows:
         return {"received": 0, "inserted": 0, "updated": 0}
@@ -731,6 +779,7 @@ def ingest_fri_reconciled(
 
     # reconcile gate
     reconciled_rows, unreconciled = [], 0
+    reported_history: list[tuple] = []
     segment_counts = {s: 0 for s in SEGMENTS}
     for mobile, record in add_records.items():
         hsbc = matched.get(mobile)
@@ -740,6 +789,11 @@ def ingest_fri_reconciled(
         gho = _txt(hsbc.get(gho_key), 20)
         seg = segment_for(gho)
         segment_counts[seg] += 1
+        # Timeline entry, built from named values rather than tuple positions
+        reported_history.append((
+            MODULE_FRI, mobile, _txt(hsbc.get(cust_id_key), 100), seg,
+            "reported", fdate, _txt(_pick(record, hmap, "status"), 50), source_file,
+        ))
         reconciled_rows.append((
             mobile,
             _txt(hsbc.get(cust_id_key), 100),
@@ -756,10 +810,14 @@ def ingest_fri_reconciled(
 
     upsert_stats = _upsert(MODULE_FRI, _dedupe_rows(reconciled_rows))
 
+    # Timeline: this number was on the risk feed on this DATA date.
+    _record_history(MODULE_FRI, reported_history)
+
     # Compliant numbers. Those that reconcile with HSBC are inserted-or-updated
     # as cleared rows so the report can list what turned compliant today; the
     # rest can only update a row that already exists.
     cleared_rows, unmatched_clears = [], []
+    cleared_history: list[tuple] = []
     for mobile, clear_date in clear_dates.items():
         hsbc = matched.get(mobile)
         if hsbc is None:
@@ -774,9 +832,17 @@ def ingest_fri_reconciled(
             *_customer_values(hsbc),
             clear_date, clear_date, clear_date,
         ))
+        cleared_history.append((
+            MODULE_FRI, mobile, _txt(hsbc.get(cust_id_key), 100), segment_for(gho),
+            "compliant", clear_date, "compliant", source_file,
+        ))
 
     cleared_stats = _upsert_cleared(MODULE_FRI, _dedupe_rows(cleared_rows),
                                     fdate, source_file)
+
+    # Timeline: and this number became compliant on this DATA date. The earlier
+    # 'reported' row is untouched, so the disconnection record survives.
+    _record_history(MODULE_FRI, cleared_history)
     clear_stats = _clear(MODULE_FRI, unmatched_clears, fdate, source_file)
     retract_stats = _retract(MODULE_FRI, sorted(conflicted), fdate, source_file)
     purged = purge_expired()
@@ -850,6 +916,7 @@ def ingest_mnrl_reconciled(
         # Same as FRI compliance: a reconciled reactivated number is written to
         # the master as a cleared row so it shows up in the day's report.
         cleared_rows, unmatched = [], []
+        cleared_history: list[tuple] = []
         for mobile, record in feed.items():
             clear_date = _to_date(_pick(record, hmap, "date_of_reactivation"), fdate)
             react_id = _txt(_pick(record, hmap, "reactivation_id"), 50)
@@ -858,6 +925,11 @@ def ingest_mnrl_reconciled(
                 unmatched.append((mobile, clear_date, react_id))
                 continue
             gho = _txt(hsbc.get(gho_key), 20)
+            cleared_history.append((
+                MODULE_MNRL, mobile, _txt(hsbc.get(cust_id_key), 100),
+                segment_for(gho), "reactivated", clear_date,
+                react_id or "reactivated", source_file,
+            ))
             cleared_rows.append((
                 mobile,
                 _txt(hsbc.get(cust_id_key), 100),
@@ -869,9 +941,11 @@ def ingest_mnrl_reconciled(
             ))
         cleared_stats = _upsert_cleared(MODULE_MNRL, _dedupe_rows(cleared_rows),
                                         fdate, source_file)
+        _record_history(MODULE_MNRL, cleared_history)
         clear_stats = _clear(MODULE_MNRL, unmatched, fdate, source_file)
     else:
         reconciled_rows = []
+        reported_history: list[tuple] = []
         for mobile, record in feed.items():
             hsbc = matched.get(mobile)
             if hsbc is None:
@@ -880,6 +954,13 @@ def ingest_mnrl_reconciled(
             gho = _txt(hsbc.get(gho_key), 20)
             seg = segment_for(gho)
             segment_counts[seg] += 1
+            reported_history.append((
+                MODULE_MNRL, mobile, _txt(hsbc.get(cust_id_key), 100), seg,
+                "reported", fdate,
+                _txt(_pick(record, hmap, "disconnectionreason_id",
+                           "disconnection_reason_id"), 20),
+                source_file,
+            ))
             reconciled_rows.append((
                 mobile,
                 _txt(hsbc.get(cust_id_key), 100),
@@ -895,6 +976,7 @@ def ingest_mnrl_reconciled(
                 _payload(record),
             ))
         upsert_stats = _upsert(MODULE_MNRL, _dedupe_rows(reconciled_rows))
+        _record_history(MODULE_MNRL, reported_history)
 
     retract_stats = _retract(MODULE_MNRL, sorted(conflicted), fdate, source_file)
     purged = purge_expired()
@@ -928,18 +1010,20 @@ def ingest_mnrl_reconciled(
 # ── FILTERED READS ───────────────────────────────────────────────────────────
 def _filter_clause(feed_date: Any = None, segment: str | None = None,
                    include_cleared: bool = False,
-                   record_status: str = "active") -> tuple[str, list]:
+                   record_status: str = "active",
+                   date_to: Any = None) -> tuple[str, list]:
     """Shared WHERE for download / ATR / count.
 
     record_status
-        'active'   only numbers still requiring action  (the ATR queue)
+        'active'   only numbers still requiring action
         'cleared'  only numbers that turned compliant / were reactivated
-        'all'      both — what the reconciled report for a date shows
+        'all'      both
 
-    Date matching follows the status. For 'active' a row belongs to a date if it
-    was reported that day; for cleared rows the meaningful date is the day it
-    cleared, so 'all' matches EITHER. That is what puts "numbers that turned
-    compliant today" into today's report alongside the ones still outstanding.
+    Dates. `feed_date` alone matches a single day; `feed_date` + `date_to`
+    matches an inclusive range, which is what a fortnightly cycle needs — one
+    selection instead of fifteen. Date matching follows the status: an active
+    row belongs to the day it was REPORTED, a cleared row to the day it
+    CLEARED, and 'all' matches either.
     """
     clauses: list[str] = []
     params: list[Any] = []
@@ -949,17 +1033,21 @@ def _filter_clause(feed_date: Any = None, segment: str | None = None,
     elif record_status == "cleared":
         clauses.append("status = 'cleared'")
 
-    fdate = _to_date(feed_date)
-    if fdate:
+    dfrom = _to_date(feed_date)
+    dto = _to_date(date_to) or dfrom
+
+    if dfrom:
         if record_status == "active":
-            clauses.append("last_reported_on = %s")
-            params.append(fdate)
+            clauses.append("last_reported_on BETWEEN %s AND %s")
+            params.extend([dfrom, dto])
         elif record_status == "cleared":
-            clauses.append("cleared_on = %s")
-            params.append(fdate)
+            clauses.append("cleared_on BETWEEN %s AND %s")
+            params.extend([dfrom, dto])
         else:
-            clauses.append("(last_reported_on = %s OR cleared_on = %s)")
-            params.extend([fdate, fdate])
+            clauses.append(
+                "(last_reported_on BETWEEN %s AND %s OR cleared_on BETWEEN %s AND %s)"
+            )
+            params.extend([dfrom, dto, dfrom, dto])
 
     if segment and segment.upper() not in ("ALL", ""):
         clauses.append("segment = %s")
@@ -969,9 +1057,10 @@ def _filter_clause(feed_date: Any = None, segment: str | None = None,
 
 
 def count_active(module: str, feed_date: Any = None, segment: str | None = None,
-                 record_status: str = "active") -> int:
+                 record_status: str = "active", date_to: Any = None) -> int:
     table = _TABLES[module.upper()]
-    where, params = _filter_clause(feed_date, segment, record_status=record_status)
+    where, params = _filter_clause(feed_date, segment, record_status=record_status,
+                                   date_to=date_to)
     with _cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", params)
         return int(cur.fetchone()[0])
@@ -979,7 +1068,7 @@ def count_active(module: str, feed_date: Any = None, segment: str | None = None,
 
 def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
                 columns: list[str] | None = None,
-                record_status: str = "active") -> Iterator[dict]:
+                record_status: str = "active", date_to: Any = None) -> Iterator[dict]:
     """Stream master rows for export.
 
     Uses a NAMED (server-side) cursor: Postgres holds the result set and ships
@@ -990,7 +1079,8 @@ def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
     module = module.upper()
     table = _TABLES[module]
     cols = columns or EXPORT_COLUMNS[module]
-    where, params = _filter_clause(feed_date, segment, record_status=record_status)
+    where, params = _filter_clause(feed_date, segment, record_status=record_status,
+                                   date_to=date_to)
 
     conn = _get_pool().getconn()
     name = f"stream_{module.lower()}_{os.getpid()}_{id(params)}"
@@ -1142,16 +1232,23 @@ _STATUS_COL = {MODULE_FRI: "fri_status", MODULE_MNRL: "disconnection_reason_id"}
 ATR_STUCK_MINUTES = int(os.environ.get("ATR_STUCK_MINUTES", "30"))
 
 
-def _hash_expr(module: str) -> str:
+def _hash_expr(module: str, prefix: str = "") -> str:
     """SQL computing a row's current state fingerprint.
 
-    Deliberately excludes dates and report_count: a number re-reported with an
+    INCLUDES status and clear_reason. A number flagged on the 10th and compliant
+    on the 14th keeps the same fri_status ('flagged_for_reverification') — only
+    `status` flips to 'cleared'. Fingerprinting the feed status alone therefore
+    made compliance invisible and the follow-up report was never sent. That is
+    the whole point of the second report, so both columns are in the hash.
+
+    Still EXCLUDES dates and report_count: a number re-reported with an
     unchanged status is not a new state and must not trigger a second report.
     """
     status_col = _STATUS_COL[module]
+    p = f"{prefix}." if prefix else ""
     return (
-        "md5(concat_ws('|', segment, "
-        f"coalesce({status_col}, ''), "
+        f"md5(concat_ws('|', {p}segment, {p}status, coalesce({p}clear_reason, ''), "
+        f"coalesce({p}{status_col}, ''), "
         "%s::text, %s::text))"
     )
 
@@ -1160,7 +1257,9 @@ def state_snapshot(row: dict, module: str, action_type: str, action_taken: str) 
     """The human-readable form of what the fingerprint covers."""
     return {
         "segment": row.get("segment"),
-        "status": row.get(_STATUS_COL[module]),
+        "record_status": row.get("status"),
+        "clear_reason": row.get("clear_reason"),
+        "feed_status": row.get(_STATUS_COL[module]),
         "action_type": action_type,
         "action_taken": str(action_taken),
     }
@@ -1181,7 +1280,8 @@ def release_stuck_claims(module: str, minutes: int = ATR_STUCK_MINUTES) -> int:
 
 
 def count_atr_eligible(module: str, feed_date: Any = None, segment: str | None = None,
-                       action_type: str = "", action_taken: str = "") -> int:
+                       action_type: str = "", action_taken: str = "",
+                       case_type: str = "open", date_to: Any = None) -> int:
     """How many numbers would actually be reported right now.
 
     Counts rows whose state differs from the one last reported — not rows
@@ -1190,7 +1290,11 @@ def count_atr_eligible(module: str, feed_date: Any = None, segment: str | None =
     """
     module = module.upper()
     table = _TABLES[module]
-    where, params = _filter_clause(feed_date, segment)
+    # 'open' cases are the active rows; 'cleared' cases are the compliant /
+    # reactivated ones, which need their own report with a different action code.
+    record_status = "cleared" if case_type == "cleared" else "active"
+    where, params = _filter_clause(feed_date, segment, record_status=record_status,
+                                   date_to=date_to)
     with _cursor() as cur:
         cur.execute(
             f"""SELECT COUNT(*) FROM {table}
@@ -1202,10 +1306,13 @@ def count_atr_eligible(module: str, feed_date: Any = None, segment: str | None =
         return int(cur.fetchone()[0])
 
 
-def count_atr_pending(module: str, feed_date: Any = None, segment: str | None = None) -> int:
+def count_atr_pending(module: str, feed_date: Any = None, segment: str | None = None,
+                      case_type: str = "open", date_to: Any = None) -> int:
     """Rows never successfully reported. Used for dashboard display only."""
     table = _TABLES[module.upper()]
-    where, params = _filter_clause(feed_date, segment)
+    record_status = "cleared" if case_type == "cleared" else "active"
+    where, params = _filter_clause(feed_date, segment, record_status=record_status,
+                                   date_to=date_to)
     with _cursor() as cur:
         cur.execute(
             f"""SELECT COUNT(*) FROM {table}
@@ -1236,7 +1343,8 @@ def count_cleared_in_window(module: str, feed_date: Any = None,
 
 def claim_atr_batch(module: str, run_id: str, action_type: str, action_taken: str,
                     feed_date: Any = None, segment: str | None = None,
-                    batch_size: int = 1000) -> list[dict]:
+                    batch_size: int = 1000, case_type: str = "open",
+                    date_to: Any = None) -> list[dict]:
     """Atomically take the next batch of eligible rows and mark them 'sending'.
 
     SKIP LOCKED means a concurrent run steps over anything this one holds rather
@@ -1245,12 +1353,15 @@ def claim_atr_batch(module: str, run_id: str, action_type: str, action_taken: st
     """
     module = module.upper()
     table = _TABLES[module]
-    where, params = _filter_clause(feed_date, segment)
+    record_status = "cleared" if case_type == "cleared" else "active"
+    where, params = _filter_clause(feed_date, segment, record_status=record_status,
+                                   date_to=date_to)
     hash_expr = _hash_expr(module)
     status_col = _STATUS_COL[module]
 
     select_cols = ", ".join(
         ["id", "mobile_no", "cust_id", "segment", "gho_code", status_col,
+         "status", "clear_reason", "cleared_on", "last_reported_on",
          "atr_state_hash", "atr_send_count", "atr_status", "atr_action_type",
          "atr_action_taken"]
     )
@@ -1263,6 +1374,14 @@ def claim_atr_batch(module: str, run_id: str, action_type: str, action_taken: st
                 WHERE {where}
                   AND atr_status <> 'sending'
                   AND atr_state_hash IS DISTINCT FROM {hash_expr}
+                  -- Never re-claim a row this run has already attempted.
+                  --
+                  -- A rejected row deliberately keeps a NULL hash so the NEXT
+                  -- cycle retries it. Without this predicate the CURRENT run
+                  -- immediately re-claims it: every batch that fails comes
+                  -- straight back, and the loop only ends when the process is
+                  -- killed. That is how 112 numbers became 13,320 attempts.
+                  AND atr_run_id IS DISTINCT FROM %s::uuid
                 ORDER BY id
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
@@ -1272,9 +1391,9 @@ def claim_atr_batch(module: str, run_id: str, action_type: str, action_taken: st
             FROM claimed c
             WHERE m.id = c.id
             RETURNING {", ".join("m." + c for c in select_cols.split(", "))},
-                      {hash_expr.replace("segment", "m.segment").replace(f"coalesce({status_col}", f"coalesce(m.{status_col}")} AS new_hash
+                      {_hash_expr(module, "m")} AS new_hash
             """,
-            params + [action_type, action_taken, batch_size, run_id,
+            params + [action_type, action_taken, run_id, batch_size, run_id,
                       action_type, action_taken],
         )
         return [dict(r) for r in cur.fetchall()]
@@ -1349,14 +1468,16 @@ def classify_trigger(row: dict, action_type: str, action_taken: str) -> str:
 
 
 def reset_atr_status(module: str, feed_date: Any = None, segment: str | None = None,
-                     only_failed: bool = True) -> int:
+                     only_failed: bool = True, date_to: Any = None,
+                     record_status: str = "all") -> int:
     """Put numbers back in the queue so failures can be retried.
 
     Clears the fingerprint too — otherwise the row would be marked pending but
     still filtered out as unchanged.
     """
     table = _TABLES[module.upper()]
-    where, params = _filter_clause(feed_date, segment)
+    where, params = _filter_clause(feed_date, segment, record_status=record_status,
+                                   date_to=date_to)
     extra = "AND atr_status IN ('rejected', 'skipped')" if only_failed else ""
     with _cursor() as cur:
         cur.execute(

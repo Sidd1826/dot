@@ -150,9 +150,9 @@ def _do_reconcile(container, date_folder, file_name, mob_col) -> dict:
     )
 
 
-def _do_master_export(module, feed_date, segment, record_status) -> dict:
+def _do_master_export(module, feed_date, segment, record_status, date_to=None) -> dict:
     return export_master(module=module, feed_date=feed_date, segment=segment,
-                         record_status=record_status)
+                         record_status=record_status, date_to=date_to)
 
 
 def _do_atr_report(run_id, module, date_from, date_to, outcome) -> dict:
@@ -160,10 +160,12 @@ def _do_atr_report(run_id, module, date_from, date_to, outcome) -> dict:
                              date_to=date_to, outcome=outcome)
 
 
-def _do_atr_run(module, feed_date, segment, batch_size, limit) -> dict:
+def _do_atr_run(module, feed_date, segment, batch_size, limit,
+                date_to=None, case_type=None) -> dict:
     return atr_service.run_atr(
         module=module, feed_date=feed_date, segment=segment,
         batch_size=batch_size, limit=limit, trigger_source="manual",
+        date_to=date_to, case_type=case_type,
     )
 
 
@@ -488,7 +490,8 @@ def route_master_download():
     req = request.get_json(silent=True) or {}
     try:
         module = _validate_module(req.get("type", "FRI"))
-        feed_date = _optional_date(req.get("date"))
+        feed_date = _optional_date(req.get("date_from") or req.get("date"))
+        date_to = _optional_date(req.get("date_to")) or feed_date
         segment = _validate_segment(req.get("segment"))
         record_status = (req.get("record_status") or "all").lower()
         if record_status not in ("active", "cleared", "all"):
@@ -497,7 +500,8 @@ def route_master_download():
         return jsonify({"error": str(e)}), 400
 
     try:
-        job_id = start_job(_do_master_export, module, feed_date, segment, record_status)
+        job_id = start_job(_do_master_export, module, feed_date, segment,
+                           record_status, date_to)
         return jsonify({"job_id": job_id, "status": "pending"}), 202
     except Exception as e:
         return _fail(e)
@@ -551,6 +555,10 @@ def route_atr_defaults():
         return jsonify({
             "module": module,
             "defaults": atr_service.get_defaults(module),
+            "case_types": [
+                {"value": c, "label": atr_service.CASE_LABEL.get((module, c), c)}
+                for c in atr_service.CASE_TYPES
+            ],
             "boa_codes": sorted(atr_service.BOA_ACTION_CODES, key=int),
             "bot_codes": sorted(atr_service.BOT_ACTION_CODES, key=int),
         })
@@ -569,8 +577,11 @@ def route_atr_defaults_save():
         segment = req.get("segment")
         if segment not in (ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB):
             raise ValueError("Classification must be IWPB or Non-IWPB.")
+        case_type = req.get("case_type", atr_service.CASE_OPEN)
+        if case_type not in atr_service.CASE_TYPES:
+            raise ValueError("case_type must be open or cleared")
         saved = atr_service.save_defaults(
-            module, segment, req, updated_by=req.get("updated_by")
+            module, segment, req, updated_by=req.get("updated_by"), case_type=case_type
         )
         return jsonify({"saved": saved})
     except ValueError as e:
@@ -593,38 +604,51 @@ def route_atr_config():
 
 @routes.route("/atr/preview", methods=["GET"])
 def route_atr_preview():
-    """GET /atr/preview?type=FRI&date=...&segment=IWPB
+    """GET /atr/preview?type=FRI&date_from=…&date_to=…&segment=IWPB
 
+    Breaks the queue down by classification AND case type, because an open case
+    and a compliant one carry different action codes and are sent separately.
     'eligible' is what a run would actually send: numbers whose state differs
-    from the one already reported. It drops to zero straight after a send, which
-    is what stops a second click doing anything.
+    from the one already reported.
     """
     try:
         module = _validate_module(request.args.get("type", "FRI"))
-        feed_date = _optional_date(request.args.get("date"))
+        date_from = _optional_date(request.args.get("date_from") or request.args.get("date"))
+        date_to = _optional_date(request.args.get("date_to")) or date_from
         segment = _validate_segment(request.args.get("segment"))
 
+        segs = [segment] if segment else [ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB]
         breakdown = []
-        for seg in ([segment] if segment else [ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB]):
-            defaults = atr_service.get_defaults(module, seg)
-            d = defaults[0] if defaults else None
-            eligible = ms.count_atr_eligible(
-                module, feed_date, seg,
-                d["action_type"] if d else "", str(d["action_taken"]) if d else "",
-            ) if d else 0
-            breakdown.append({
-                "segment": seg,
-                "eligible": eligible,
-                "never_sent": ms.count_atr_pending(module, feed_date, seg),
-                "cleared_skipped": ms.count_cleared_in_window(module, feed_date, seg),
-                "defaults": d,
-            })
+        for case_type in atr_service.CASE_TYPES:
+            for seg in segs:
+                defaults = atr_service.get_defaults(module, seg, case_type)
+                d = defaults[0] if defaults else None
+                eligible = ms.count_atr_eligible(
+                    module, date_from, seg,
+                    d["action_type"] if d else "", str(d["action_taken"]) if d else "",
+                    case_type=case_type, date_to=date_to,
+                ) if d else 0
+                breakdown.append({
+                    "segment": seg,
+                    "case_type": case_type,
+                    "case_label": atr_service.CASE_LABEL.get((module, case_type), case_type),
+                    "eligible": eligible,
+                    "never_sent": ms.count_atr_pending(module, date_from, seg,
+                                                       case_type=case_type, date_to=date_to),
+                    "defaults": d,
+                })
+
+        days = None
+        if date_from and date_to:
+            days = (datetime.strptime(date_to, "%Y-%m-%d")
+                    - datetime.strptime(date_from, "%Y-%m-%d")).days + 1
 
         return jsonify({
             "module": module,
-            "date": feed_date,
+            "date_from": date_from,
+            "date_to": date_to,
+            "days_covered": days,
             "total_eligible": sum(b["eligible"] for b in breakdown),
-            "total_cleared_skipped": sum(b["cleared_skipped"] for b in breakdown),
             "breakdown": breakdown,
             "schedule": atr_service.get_schedule(module),
         })
@@ -644,16 +668,22 @@ def route_atr_submit():
     req = request.get_json(silent=True) or {}
     try:
         module = _validate_module(req.get("type", "FRI"))
-        feed_date = _optional_date(req.get("date"))
+        feed_date = _optional_date(req.get("date_from") or req.get("date"))
+        date_to = _optional_date(req.get("date_to")) or feed_date
         segment = _validate_segment(req.get("segment"))
-        batch_size = int(req.get("batch_size") or atr_service.ATR_BATCH_SIZE)
+        case_type = req.get("case_type")
+        if case_type and case_type not in atr_service.CASE_TYPES:
+            raise ValueError("case_type must be open or cleared")
+        # None means "use the module's published cap"
+        batch_size = int(req["batch_size"]) if req.get("batch_size") else None
         limit = int(req["limit"]) if req.get("limit") else None
     except (ValueError, TypeError) as e:
         return jsonify({"error": str(e)}), 400
 
     try:
         job_id = start_job(
-            _do_atr_run, module, feed_date, segment, batch_size, limit
+            _do_atr_run, module, feed_date, segment, batch_size, limit,
+            date_to, case_type
         )
         return jsonify({"job_id": job_id, "status": "pending"}), 202
     except Exception as e:
@@ -746,6 +776,20 @@ def route_atr_report():
         return _fail(e)
 
 
+@routes.route("/master/timeline/<mobile_no>", methods=["GET"])
+def route_master_timeline(mobile_no):
+    """Full lifecycle for one number: reported, compliant, reopened, with the
+    DATA date of each — not the day the job ran."""
+    try:
+        return jsonify({
+            "mobile_no": mobile_no,
+            "timeline": ms.number_timeline(mobile_no, request.args.get("type")),
+            "atr": atr_service.number_history(mobile_no),
+        })
+    except Exception as e:
+        return _fail(e)
+
+
 @routes.route("/atr/schedule", methods=["GET"])
 def route_atr_schedule():
     """The fortnightly cycle settings and when it next runs."""
@@ -797,9 +841,11 @@ def route_atr_retry():
     req = request.get_json(silent=True) or {}
     try:
         module = _validate_module(req.get("type", "FRI"))
-        feed_date = _optional_date(req.get("date"))
+        feed_date = _optional_date(req.get("date_from") or req.get("date"))
+        date_to = _optional_date(req.get("date_to")) or feed_date
         segment = _validate_segment(req.get("segment"))
-        requeued = ms.reset_atr_status(module, feed_date, segment, only_failed=True)
+        requeued = ms.reset_atr_status(module, feed_date, segment, only_failed=True,
+                                       date_to=date_to)
         return jsonify({"requeued": requeued})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
