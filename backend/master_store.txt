@@ -66,7 +66,7 @@ PURGE_GRACE_HOURS = int(os.environ.get("PURGE_GRACE_HOURS", "24"))
 
 PAGE_SIZE = int(os.environ.get("MASTER_UPSERT_PAGE", "5000"))
 STREAM_SIZE = int(os.environ.get("MASTER_STREAM_SIZE", "10000"))
-MAX_CONN = int(os.environ.get("MASTER_PG_MAXCONN", "6"))
+MAX_CONN = int(os.environ.get("MASTER_PG_MAXCONN", "12"))
 
 STORE_PAYLOAD = os.environ.get("MASTER_STORE_PAYLOAD", "1") == "1"
 FRI_COMPLIANT_STATUS = os.environ.get("FRI_COMPLIANT_STATUS", "compliant").strip().lower()
@@ -213,12 +213,27 @@ class _cursor:
         self._cur = None
 
     def __enter__(self):
+        # getconn() and cursor() are two steps. If the second one throws, the
+        # connection is already out of the pool and __exit__ will NOT run —
+        # Python only calls it when __enter__ returned. Without this guard each
+        # such failure permanently removed one connection from the pool, and a
+        # handful of them exhausted it until the process restarted.
         self._conn = _get_pool().getconn()
-        factory = psycopg2.extras.RealDictCursor if self.dict_cursor else None
-        self._cur = self._conn.cursor(cursor_factory=factory) if factory else self._conn.cursor()
+        try:
+            factory = psycopg2.extras.RealDictCursor if self.dict_cursor else None
+            self._cur = self._conn.cursor(cursor_factory=factory) if factory else self._conn.cursor()
+        except Exception:
+            try:
+                _get_pool().putconn(self._conn)
+            except Exception:
+                pass
+            self._conn = None
+            raise
         return self._cur
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._conn is None:
+            return False
         try:
             self._conn.rollback() if exc_type else self._conn.commit()
         except Exception:
@@ -232,6 +247,7 @@ class _cursor:
             _get_pool().putconn(self._conn)
         except Exception:
             pass
+        self._conn = self._cur = None
         return False
 
 
@@ -1590,3 +1606,70 @@ def lookup(mobile_no: str) -> dict:
         events = [dict(r) for r in cur.fetchall()]
 
     return {"mobile_no": mobile, "records": records, "events": events}
+
+
+def atr_preview_counts(module: str, feed_date: Any = None, segment: str | None = None,
+                       date_to: Any = None,
+                       defaults: dict[tuple[str, str], dict] | None = None) -> list[dict]:
+    """Eligible / never-sent counts for every (case_type, segment), in ONE query.
+
+    The Reports page previously issued a dozen separate queries to build this —
+    two per combination plus the defaults lookups — which is both slow and, on a
+    threaded server, a good way to exhaust the connection pool. A single grouped
+    scan does the same work on one connection.
+
+    `defaults` maps (case_type, segment) -> the action codes in force, which the
+    fingerprint depends on. Combinations with no configured defaults are still
+    returned, with zero counts.
+    """
+    module = module.upper()
+    table = _TABLES[module]
+    status_col = _STATUS_COL[module]
+    defaults = defaults or {}
+
+    segs = [segment] if segment and segment.upper() != "ALL" else [SEGMENT_IWPB, SEGMENT_NON_IWPB]
+
+    # The action codes vary per (case_type, segment), so they arrive as a small
+    # VALUES list joined to the master rather than as scalar parameters.
+    combos, params = [], []
+    for case_type in ("open", "cleared"):
+        for seg in segs:
+            d = defaults.get((case_type, seg)) or {}
+            combos.append("(%s, %s, %s, %s)")
+            params.extend([case_type, seg,
+                           str(d.get("action_type") or ""),
+                           str(d.get("action_taken") or "")])
+
+    dfrom = _to_date(feed_date)
+    dto = _to_date(date_to) or dfrom
+    date_params = [dfrom, dto, dfrom, dto] if dfrom else []
+    date_filter = (
+        """AND ((c.case_type = 'open'    AND m.last_reported_on BETWEEN %s AND %s)
+             OR (c.case_type = 'cleared' AND m.cleared_on        BETWEEN %s AND %s))"""
+        if dfrom else ""
+    )
+
+    sql = f"""
+        WITH combos(case_type, segment, action_type, action_taken) AS (VALUES {", ".join(combos)})
+        SELECT c.case_type, c.segment,
+               COUNT(m.id) FILTER (
+                   WHERE m.atr_status <> 'sending'
+                     AND m.atr_state_hash IS DISTINCT FROM
+                         md5(concat_ws('|', m.segment, m.status, coalesce(m.clear_reason, ''),
+                                       coalesce(m.{status_col}, ''),
+                                       c.action_type, c.action_taken))
+               ) AS eligible,
+               COUNT(m.id) FILTER (WHERE m.atr_status IN ('pending', 'rejected')) AS never_sent,
+               COUNT(m.id) AS in_window
+        FROM combos c
+        LEFT JOIN {table} m
+          ON m.segment = c.segment
+         AND m.status = CASE WHEN c.case_type = 'cleared' THEN 'cleared' ELSE 'active' END
+         {date_filter}
+        GROUP BY c.case_type, c.segment
+        ORDER BY c.case_type DESC, c.segment
+    """
+
+    with _cursor(dict_cursor=True) as cur:
+        cur.execute(sql, params + date_params)
+        return [dict(r) for r in cur.fetchall()]

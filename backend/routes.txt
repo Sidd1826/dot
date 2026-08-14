@@ -606,10 +606,14 @@ def route_atr_config():
 def route_atr_preview():
     """GET /atr/preview?type=FRI&date_from=…&date_to=…&segment=IWPB
 
-    Breaks the queue down by classification AND case type, because an open case
-    and a compliant one carry different action codes and are sent separately.
+    Broken down by classification AND case type, because an open case and a
+    compliant one carry different action codes and are sent separately.
     'eligible' is what a run would actually send: numbers whose state differs
     from the one already reported.
+
+    Deliberately three queries in total — all defaults, the counts, the
+    schedule — rather than one per combination. The per-combination version
+    issued a dozen and could exhaust the connection pool under load.
     """
     try:
         module = _validate_module(request.args.get("type", "FRI"))
@@ -617,26 +621,24 @@ def route_atr_preview():
         date_to = _optional_date(request.args.get("date_to")) or date_from
         segment = _validate_segment(request.args.get("segment"))
 
-        segs = [segment] if segment else [ms.SEGMENT_IWPB, ms.SEGMENT_NON_IWPB]
+        all_defaults = atr_service.get_defaults(module)
+        by_combo = {(d["case_type"], d["segment"]): d for d in all_defaults}
+
+        counts = ms.atr_preview_counts(module, date_from, segment, date_to, by_combo)
+
         breakdown = []
-        for case_type in atr_service.CASE_TYPES:
-            for seg in segs:
-                defaults = atr_service.get_defaults(module, seg, case_type)
-                d = defaults[0] if defaults else None
-                eligible = ms.count_atr_eligible(
-                    module, date_from, seg,
-                    d["action_type"] if d else "", str(d["action_taken"]) if d else "",
-                    case_type=case_type, date_to=date_to,
-                ) if d else 0
-                breakdown.append({
-                    "segment": seg,
-                    "case_type": case_type,
-                    "case_label": atr_service.CASE_LABEL.get((module, case_type), case_type),
-                    "eligible": eligible,
-                    "never_sent": ms.count_atr_pending(module, date_from, seg,
-                                                       case_type=case_type, date_to=date_to),
-                    "defaults": d,
-                })
+        for row in counts:
+            ct, seg = row["case_type"], row["segment"]
+            d = by_combo.get((ct, seg))
+            breakdown.append({
+                "segment": seg,
+                "case_type": ct,
+                "case_label": atr_service.CASE_LABEL.get((module, ct), ct),
+                "eligible": row["eligible"] if d and d.get("is_active", True) else 0,
+                "never_sent": row["never_sent"],
+                "in_window": row["in_window"],
+                "defaults": d,
+            })
 
         days = None
         if date_from and date_to:

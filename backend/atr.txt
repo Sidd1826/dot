@@ -221,6 +221,11 @@ ATR_THROTTLE_MS = int(os.getenv("ATR_THROTTLE_MS", "0"))
 ATR_SCHEDULER_ENABLED = os.getenv("ATR_SCHEDULER_ENABLED", "1") == "1"
 ATR_SCHEDULER_TICK_SECONDS = int(os.getenv("ATR_SCHEDULER_TICK_SECONDS", "300"))
 
+# Flask serves requests on threads, so one page can have several requests in
+# flight while a background job and the scheduler tick are also running. Four
+# was too few: the Reports page alone issues a dozen queries.
+ATR_PG_MAXCONN = int(os.getenv("ATR_PG_MAXCONN", "12"))
+
 
 # ── RATE LIMITING ────────────────────────────────────────────────────────────
 class _RateLimiter:
@@ -347,7 +352,9 @@ _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pool
     if _pool is None or _pool.closed:
-        _pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=4, dsn=PG_DSN)
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1, maxconn=ATR_PG_MAXCONN, dsn=PG_DSN
+        )
     return _pool
 
 
@@ -358,12 +365,27 @@ class _cursor:
         self._cur = None
 
     def __enter__(self):
+        # getconn() and cursor() are two steps. If the second one throws, the
+        # connection is already out of the pool and __exit__ will NOT run —
+        # Python only calls it when __enter__ returned. Without this guard each
+        # such failure permanently removed one connection from the pool, and a
+        # handful of them exhausted it until the process restarted.
         self._conn = _get_pool().getconn()
-        factory = psycopg2.extras.RealDictCursor if self.dict_cursor else None
-        self._cur = self._conn.cursor(cursor_factory=factory) if factory else self._conn.cursor()
+        try:
+            factory = psycopg2.extras.RealDictCursor if self.dict_cursor else None
+            self._cur = self._conn.cursor(cursor_factory=factory) if factory else self._conn.cursor()
+        except Exception:
+            try:
+                _get_pool().putconn(self._conn)
+            except Exception:
+                pass
+            self._conn = None
+            raise
         return self._cur
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._conn is None:
+            return False
         try:
             self._conn.rollback() if exc_type else self._conn.commit()
         except Exception:
@@ -377,6 +399,7 @@ class _cursor:
             _get_pool().putconn(self._conn)
         except Exception:
             pass
+        self._conn = self._cur = None
         return False
 
 
@@ -1108,7 +1131,17 @@ def run_due_cycles() -> list[dict]:
     """
     results = []
     for module in due_modules():
-        conn = _get_pool().getconn()
+        # A DEDICATED connection, not one from the pool.
+        #
+        # A session-level advisory lock lives on its connection, so it has to be
+        # held for the whole cycle — which for MNRL can be half an hour. Holding
+        # a pooled connection that long starves every web request behind it, so
+        # the lock gets its own short-lived connection instead.
+        try:
+            conn = psycopg2.connect(PG_DSN)
+        except Exception as exc:
+            print(f"[ATR] could not open a lock connection for {module}: {exc}")
+            continue
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_try_advisory_lock(%s)", (_lock_key(module),))
@@ -1125,11 +1158,17 @@ def run_due_cycles() -> list[dict]:
                 print(f"[ATR] scheduled {module} cycle failed: {exc}")
                 results.append({"module": module, "status": "failed", "error": str(exc)})
             finally:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT pg_advisory_unlock(%s)", (_lock_key(module),))
-                conn.commit()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT pg_advisory_unlock(%s)", (_lock_key(module),))
+                    conn.commit()
+                except Exception:
+                    pass  # closing the connection releases the lock anyway
         finally:
-            _get_pool().putconn(conn)
+            try:
+                conn.close()
+            except Exception:
+                pass
     return results
 
 
