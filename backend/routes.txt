@@ -467,16 +467,33 @@ def route_master_count():
         module = _validate_module(request.args.get("type", "FRI"))
         feed_date = _optional_date(request.args.get("date"))
         segment = _validate_segment(request.args.get("segment"))
+        date_to = _optional_date(request.args.get("date_to")) or feed_date
         record_status = (request.args.get("record_status") or "all").lower()
+
+        # All three counts every time, independent of the current selection.
+        # Returning only the selected one made "Everything" appear to change
+        # when the user picked "Still open" — it was the same field being
+        # rescoped, which read as the total moving.
+        active = ms.count_active(module, feed_date, segment, "active", date_to)
+        cleared = ms.count_active(module, feed_date, segment, "cleared", date_to)
+        selected = {"active": active, "cleared": cleared}.get(record_status, active + cleared)
+
         return jsonify({
             "module": module,
             "date": feed_date,
+            "date_to": date_to,
             "segment": segment or "All",
             "record_status": record_status,
-            "count": ms.count_active(module, feed_date, segment, record_status),
-            "active": ms.count_active(module, feed_date, segment, "active"),
-            "cleared": ms.count_active(module, feed_date, segment, "cleared"),
-            "atr_pending": ms.count_atr_pending(module, feed_date, segment),
+            "count": selected,          # what the current selection will download
+            "total": active + cleared,  # fixed
+            "active": active,           # fixed
+            "cleared": cleared,         # fixed
+            "atr_pending": (
+                ms.count_atr_pending(module, feed_date, segment, "open", date_to)
+                + ms.count_atr_pending(module, feed_date, segment, "cleared", date_to)
+            ),
+            "atr_pending_open": ms.count_atr_pending(module, feed_date, segment, "open", date_to),
+            "atr_pending_cleared": ms.count_atr_pending(module, feed_date, segment, "cleared", date_to),
         })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400

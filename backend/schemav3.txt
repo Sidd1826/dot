@@ -931,6 +931,19 @@ CREATE OR REPLACE VIEW v_number_lifecycle AS
 
 
 -- =============================================================================
+-- v3.6 — CLEARED CASES OWE A REPORT TOO
+--
+-- 'not_required' dates from before cleared cases had their own ATR. A compliant
+-- or reactivated number is now reported with its own action code, so every such
+-- row goes back in the queue. Nothing is re-sent that shouldn't be: the state
+-- fingerprint still decides, so a number already reported in its current state
+-- stays settled.
+-- =============================================================================
+UPDATE fri_master  SET atr_status = 'pending' WHERE atr_status = 'not_required';
+UPDATE mnrl_master SET atr_status = 'pending' WHERE atr_status = 'not_required';
+
+
+-- =============================================================================
 -- Done. Nothing above is applied unless every statement succeeded.
 -- =============================================================================
 COMMIT;

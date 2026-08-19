@@ -553,36 +553,51 @@ _CLEARED_UPSERT_CACHE: dict[str, tuple[str, str]] = {}
 
 
 def _cleared_upsert_sql(module: str) -> tuple[str, str]:
-    """Insert-or-update a number as CLEARED.
+    """Insert-or-update a number as CLEARED, without losing what it was before.
 
-    A number that reconciles with HSBC and arrives already compliant has never
-    been in the master, so there is nothing to update. It still belongs there:
-    the reconciled report has to be able to say "these turned compliant today".
-    This inserts it in the cleared state, and updates an existing row the same
-    way _clear would.
+    Two rules, both learned the hard way:
+
+    1. ON UPDATE, existing feed data WINS. A number flagged on the 10th and
+       compliant on the 14th keeps its fri_status, disconnection reason, LSA and
+       TSP — the compliance feed does not carry those, and overwriting them with
+       its blanks erased the very history the row exists to record. Hence
+       COALESCE(m.col, EXCLUDED.col): keep what we have, fill only the gaps.
+
+    2. ON INSERT, take whatever the clearing feed does carry. A number that
+       clears without ever having been reported still arrives with some fields
+       populated; leaving them NULL threw away data we were handed.
     """
     if module in _CLEARED_UPSERT_CACHE:
         return _CLEARED_UPSERT_CACHE[module]
 
     table = _TABLES[module]
     reason = _CLEAR_REASON[module]
+    mcols = _MODULE_COLS[module]
+
     extra_col = ", reactivation_id" if module == MODULE_MNRL else ""
     extra_val = ", %s" if module == MODULE_MNRL else ""
     extra_upd = ("\n    reactivation_id = COALESCE(EXCLUDED.reactivation_id, m.reactivation_id),"
                  if module == MODULE_MNRL else "")
 
     cols = (["mobile_no", "cust_id", "gho_code", "segment"] + CUSTOMER_COLS
+            + [c for c, _ in mcols] + ["payload"]
             + ["status", "clear_reason", "cleared_on", "cleared_at",
                "first_reported_on", "last_reported_on", "report_count", "atr_status"])
 
     template = (
         "(%s, %s, %s, %s, "
-        + ", ".join(["%s"] * len(CUSTOMER_COLS))
-        + f", 'cleared', '{reason}', %s::date, NOW(), %s::date, %s::date, 1, 'not_required'"
+        + ", ".join(["%s"] * len(CUSTOMER_COLS)) + ", "
+        + ", ".join(p for _, p in mcols) + ", %s"
+        + f", 'cleared', '{reason}', %s::date, NOW(), %s::date, %s::date, 1, 'pending'"
         + extra_val + ")"
     )
+
     customer_updates = "\n".join(
         f"    {c} = COALESCE(EXCLUDED.{c}, m.{c})," for c in CUSTOMER_COLS
+    )
+    # Existing value first: clearing must not blank out the earlier state.
+    feed_updates = "\n".join(
+        f"    {c} = COALESCE(m.{c}, EXCLUDED.{c})," for c, _ in mcols
     )
 
     sql = f"""
@@ -599,14 +614,18 @@ ON CONFLICT (mobile_no) DO UPDATE SET
                         THEN EXCLUDED.cleared_on ELSE m.cleared_on END,
     cleared_at   = CASE WHEN m.cleared_on IS NULL OR EXCLUDED.cleared_on > m.cleared_on
                         THEN NOW() ELSE m.cleared_at END,
-    -- A number already reported keeps its ATR history; one that cleared before
-    -- any report was due is marked so it never enters a cycle.
-    atr_status   = CASE WHEN m.atr_send_count > 0 THEN m.atr_status ELSE 'not_required' END,
+    -- Clearing is itself reportable: C-DOT is told the number is now compliant,
+    -- with a different action code. So the row goes back in the queue rather
+    -- than being written off as 'not_required'.
+    atr_status   = 'pending',
     first_reported_on = LEAST(m.first_reported_on, EXCLUDED.first_reported_on),
+    last_reported_on  = GREATEST(m.last_reported_on, EXCLUDED.last_reported_on),
     cust_id  = COALESCE(EXCLUDED.cust_id, m.cust_id),
     gho_code = COALESCE(EXCLUDED.gho_code, m.gho_code),
     segment  = CASE WHEN EXCLUDED.segment = 'UNKNOWN' THEN m.segment ELSE EXCLUDED.segment END,
-{customer_updates}{extra_upd}
+{customer_updates}
+{feed_updates}
+    payload  = COALESCE(m.payload, EXCLUDED.payload),{extra_upd}
     updated_at = NOW()
 RETURNING m.mobile_no, (xmax::text::bigint = 0) AS was_insert
 """
@@ -766,6 +785,7 @@ def ingest_fri_reconciled(
 
     add_records: dict[str, dict] = {}
     clear_dates: dict[str, date] = {}
+    compliant_records: dict[str, dict] = {}
     invalid = 0
 
     for record in rows:
@@ -776,6 +796,7 @@ def ingest_fri_reconciled(
         status = str(_pick(record, hmap, "status") or "").strip().lower()
         if status == FRI_COMPLIANT_STATUS:
             clear_dates[mobile] = fdate
+            compliant_records[mobile] = record
         else:
             add_records[mobile] = record
 
@@ -840,12 +861,21 @@ def ingest_fri_reconciled(
             unmatched_clears.append((mobile, clear_date))
             continue
         gho = _txt(hsbc.get(gho_key), 20)
+        record = compliant_records.get(mobile, {})
         cleared_rows.append((
             mobile,
             _txt(hsbc.get(cust_id_key), 100),
             gho,
             segment_for(gho),
             *_customer_values(hsbc),
+            # Feed columns, in _MODULE_COLS order. Present so a number that
+            # clears without ever having been reported still keeps what the
+            # clearing feed told us, instead of landing as a row of NULLs.
+            _txt(_pick(record, hmap, "fri"), 50),
+            _txt(_pick(record, hmap, "status"), 50),
+            _txt(_pick(record, hmap, "lsa_id"), 20),
+            _txt(_pick(record, hmap, "tsp_id"), 20),
+            _payload(record) if record else None,
             clear_date, clear_date, clear_date,
         ))
         cleared_history.append((
@@ -952,6 +982,13 @@ def ingest_mnrl_reconciled(
                 gho,
                 segment_for(gho),
                 *_customer_values(hsbc),
+                # Feed columns in _MODULE_COLS order
+                _to_date(_pick(record, hmap, "date_of_disconnection")),
+                _txt(_pick(record, hmap, "disconnectionreason_id",
+                           "disconnection_reason_id"), 20),
+                _txt(_pick(record, hmap, "lsa_id"), 20),
+                _txt(_pick(record, hmap, "tsp_id"), 20),
+                _payload(record),
                 clear_date, clear_date, clear_date,
                 react_id,
             ))
@@ -1329,10 +1366,14 @@ def count_atr_pending(module: str, feed_date: Any = None, segment: str | None = 
     record_status = "cleared" if case_type == "cleared" else "active"
     where, params = _filter_clause(feed_date, segment, record_status=record_status,
                                    date_to=date_to)
+    # 'not_required' is legacy: cleared numbers used to be written off. They now
+    # owe a report of their own (a different action code saying "compliant"), so
+    # anything not yet successfully sent counts as awaiting ATR.
     with _cursor() as cur:
         cur.execute(
             f"""SELECT COUNT(*) FROM {table}
-                WHERE {where} AND atr_status IN ('pending', 'rejected')""",
+                WHERE {where}
+                  AND atr_status IN ('pending', 'rejected', 'skipped', 'not_required')""",
             params,
         )
         return int(cur.fetchone()[0])
@@ -1659,7 +1700,9 @@ def atr_preview_counts(module: str, feed_date: Any = None, segment: str | None =
                                        coalesce(m.{status_col}, ''),
                                        c.action_type, c.action_taken))
                ) AS eligible,
-               COUNT(m.id) FILTER (WHERE m.atr_status IN ('pending', 'rejected')) AS never_sent,
+               COUNT(m.id) FILTER (
+                   WHERE m.atr_status IN ('pending', 'rejected', 'skipped', 'not_required')
+               ) AS never_sent,
                COUNT(m.id) AS in_window
         FROM combos c
         LEFT JOIN {table} m

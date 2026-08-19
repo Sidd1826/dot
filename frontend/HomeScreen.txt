@@ -139,12 +139,27 @@ function useJobPoller({ jobId, recordCount = 0, onDone, onFailed }) {
 // UTILITIES
 // ─────────────────────────────────────────────
 const fmt = (n) => (n != null ? Number(n).toLocaleString("en-IN") : "—");
+// Every timestamp is rendered in IST explicitly. The backend sends UTC with an
+// offset, so without a timeZone the browser's own zone decides — a machine set
+// to GMT showed times five and a half hours out.
+const IST = "Asia/Kolkata";
 const fmtDate = (d) =>
-  d ? new Date(d).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "—";
+  d ? new Date(d).toLocaleDateString("en-IN",
+    { day: "numeric", month: "short", year: "numeric", timeZone: IST }) : "—";
 const fmtDateTime = (d) =>
   d ? new Date(d).toLocaleString("en-IN", {
-    day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
+    day: "numeric", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit", timeZone: IST,
   }) : "—";
+// A plain YYYY-MM-DD data date. No parsing through Date(): these are calendar
+// dates, not instants, and putting them through a timezone can shift the day.
+const fmtDataDate = (d) => {
+  if (!d) return "—";
+  const [y, m, day] = String(d).split("T")[0].split("-");
+  if (!y || !m || !day) return String(d);
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  return `${Number(day)} ${months[Number(m) - 1]} ${y}`;
+};
 const today = () => new Date().toISOString().split("T")[0];
 const triggerBlobDownload = (url, filename) => {
   const a = document.createElement("a");
@@ -1006,24 +1021,33 @@ const ReconcileModule = () => {
           loading={loadingMeta} disabled={downloading}
         />
 
+        {/* Counts here are fixed totals: picking one does not change the others.
+            Each label says what it is, so "Everything" always reads as the sum. */}
         <div className="mt-4">
           <SegmentedControl label="Include" value={recStatus} onChange={setRecStatus}
             disabled={downloading}
             options={[
-              { value: "all", label: "Everything", count: preview?.count },
-              { value: "active", label: "Still open", count: preview?.active },
-              { value: "cleared", label: `Cleared${module === "FRI" ? " / compliant" : " / reactivated"}`, count: preview?.cleared },
+              { value: "all", label: "Everything", count: preview?.total },
+              { value: "active", label: module === "FRI" ? "Still flagged" : "Still disconnected",
+                count: preview?.active },
+              { value: "cleared", label: module === "FRI" ? "Now compliant" : "Now reactivated",
+                count: preview?.cleared },
             ]} />
           <p className="text-xs text-slate-400 mt-1.5">
-            {mDate === "ALL"
-              ? "Cleared numbers are matched on the day they cleared."
-              : `For ${mDate}: numbers reported that day plus numbers that cleared that day.`}
+            {preview
+              ? `${fmt(preview.total)} records in this window — ${fmt(preview.active)} still open, ${fmt(preview.cleared)} cleared.`
+              : "Loading…"}
+            {mDate !== "ALL" && " Cleared numbers are matched on the day they cleared."}
           </p>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 my-5">
-          <CountBadge label="Will download" count={preview?.count} color="slate" sub="records" />
-          <CountBadge label="Awaiting ATR" count={preview?.atr_pending} color="amber" sub="still open" />
+          <CountBadge label="Will download" count={preview?.count} color="slate"
+            sub={recStatus === "all" ? "records" : recStatus === "active" ? "still open" : "cleared"} />
+          <CountBadge label="Awaiting ATR" count={preview?.atr_pending} color="amber"
+            sub={preview
+              ? `${fmt(preview.atr_pending_open)} open · ${fmt(preview.atr_pending_cleared)} cleared`
+              : "open and cleared"} />
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 flex flex-col justify-center gap-1.5">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Selection</p>
             <p className="text-sm text-slate-700 font-medium">
@@ -1794,12 +1818,12 @@ const ATRModule = () => {
               <td className="px-4 py-3.5 text-xs text-slate-600 whitespace-nowrap">
                 {run.date_from
                   ? <>
-                      <span className="font-mono">{run.date_from}</span>
+                      <span>{fmtDataDate(run.date_from)}</span>
                       {run.date_to && run.date_to !== run.date_from &&
-                        <> → <span className="font-mono">{run.date_to}</span></>}
+                        <> → <span>{fmtDataDate(run.date_to)}</span></>}
                       {run.days_covered > 1 &&
                         <span className="ml-1.5 px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-xs">
-                          {run.days_covered}d
+                          {run.days_covered} days
                         </span>}
                     </>
                   : <span className="text-slate-400">All dates</span>}
@@ -1866,8 +1890,8 @@ const ATRModule = () => {
                 <h3 className="font-bold text-slate-800">Report audit</h3>
                 <p className="text-xs text-slate-400 mt-0.5">
                   {events.run.module} · {events.run.case_label} ·{" "}
-                  {events.run.date_from}
-                  {events.run.date_to !== events.run.date_from && ` → ${events.run.date_to}`}
+                  {fmtDataDate(events.run.date_from)}
+                  {events.run.date_to !== events.run.date_from && ` → ${fmtDataDate(events.run.date_to)}`}
                   {" "}· {fmt(events.rows.length)} entries
                 </p>
               </div>
@@ -1890,7 +1914,7 @@ const ATRModule = () => {
                   {events.rows.map((e) => (
                     <tr key={e.id} className="hover:bg-slate-50/60">
                       <td className="px-4 py-2.5 font-mono text-xs text-slate-700">{e.mobile_no}</td>
-                      <td className="px-4 py-2.5 font-mono text-xs text-slate-500">{e.feed_date || "—"}</td>
+                      <td className="px-4 py-2.5 text-xs text-slate-500">{fmtDataDate(e.feed_date)}</td>
                       <td className="px-4 py-2.5">
                         <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
                           e.outcome === "sent" ? "bg-green-100 text-green-700"
