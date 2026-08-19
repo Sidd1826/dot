@@ -809,6 +809,26 @@ def route_master_timeline(mobile_no):
         return _fail(e)
 
 
+@routes.route("/atr/diagnostics", methods=["GET"])
+def route_atr_diagnostics():
+    """GET /atr/diagnostics?type=MNRL&probe=1
+
+    Shows the endpoint, headers and identifiers this process will use, plus any
+    preflight problems. With probe=1 it also GETs the endpoint to tell a wrong
+    URL (404) apart from a working one (405 on a POST-only path).
+    """
+    try:
+        module = _validate_module(request.args.get("type", "MNRL"))
+        out = atr_service.describe_config(module)
+        if request.args.get("probe") in ("1", "true", "yes"):
+            out["probe"] = atr_service.probe_endpoint(module)
+        return jsonify(out)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
 @routes.route("/atr/schedule", methods=["GET"])
 def route_atr_schedule():
     """The fortnightly cycle settings and when it next runs."""

@@ -83,13 +83,40 @@ PG_DSN = os.environ["AZURE_POSTGRES_DSN"]
 #
 # C-DOT issues a SEPARATE RSA key for ATR — this is not the data-fetch key.
 
+def _clean_url(raw: str | None, default: str = "") -> str:
+    """Normalise a URL that came from a .env file.
+
+    C-DOT publishes these endpoints inside documents, and what lands in .env is
+    often not a bare URL: markdown link syntax `[https://x](https://x)`, angle
+    brackets, surrounding quotes, a trailing slash, or a stray newline. Every
+    one of those produces a 404 or a connection error that looks like a server
+    problem rather than a config typo, so they are stripped here once.
+    """
+    text = (raw or default or "").strip().strip('"').strip("'").strip()
+    if not text:
+        return ""
+
+    # markdown link: [label](target) -> target
+    md = re.match(r"^\[.*?\]\((.*?)\)$", text)
+    if md:
+        text = md.group(1).strip()
+
+    text = text.strip("<>").strip()
+
+    # a doubled URL from a bad paste: https://a...https://a...
+    if text.count("https://") > 1:
+        text = "https://" + text.split("https://")[-1]
+
+    return text.rstrip("/")
+
+
 ATR_URL = {
-    "FRI": os.getenv(
-        "FRI_ATR_URL",
+    "FRI": _clean_url(
+        os.getenv("FRI_ATR_URL"),
         "https://fritestgateway.sancharsaathi.gov.in/friatr/v2/atr",
     ),
-    "MNRL": os.getenv(
-        "MNRL_ATR_URL",
+    "MNRL": _clean_url(
+        os.getenv("MNRL_ATR_URL"),
         "https://mnrlbankapitestgateway.sancharsaathi.gov.in/mnrlbankapiatr/v2/atr",
     ),
 }
@@ -865,9 +892,38 @@ def submit_batch(module: str, records: list[dict]) -> dict:
             time.sleep(min(2 ** attempt, 20))
             continue
 
+        # A gateway-level rejection tells the operator nothing unless it says
+        # WHICH endpoint was called. "Not Found" on its own looks like a server
+        # fault; "404 from <url>" points straight at the config.
+        detail = message or (resp.text or "").strip()[:200] or resp.reason or ""
+        env_var = f"{module}_ATR_URL"
+
+        if resp.status_code == 404:
+            hint = (
+                f"404 Not Found from {url}. The gateway is reachable but that "
+                f"path does not exist — check {env_var} against the C-DOT "
+                f"specification (host AND path, including the /v2/atr suffix)."
+            )
+        elif resp.status_code == 401:
+            hint = (
+                f"401 Unauthorized from {url}. The ATR gateway rejected the "
+                f"token. C-DOT may issue separate credentials for ATR; check "
+                f"{module}_ATR_AUTH_* settings."
+            )
+        elif resp.status_code == 403:
+            hint = (
+                f"403 Forbidden from {url}. Credentials were accepted but this "
+                f"client is not permitted to submit ATRs — usually an "
+                f"onboarding or IP-allowlist issue at C-DOT's end."
+            )
+        else:
+            hint = f"HTTP {resp.status_code} from {url}."
+            if detail:
+                hint += f" Gateway said: {detail}"
+
         return {"outcome": "failed", "errors": errors, "request_id": request_id,
-                "http_status": resp.status_code,
-                "message": message or f"HTTP {resp.status_code}"}
+                "http_status": resp.status_code, "url": url,
+                "message": _redact(hint)}
 
     return {"outcome": "failed", "errors": {}, "request_id": None,
             "http_status": 0, "message": f"Exhausted {ATR_MAX_RETRIES} attempts"}
@@ -1326,9 +1382,10 @@ def run_atr(
     fatal_error: str | None = None
 
     print(
-        f"[ATR] {module}/{segment} run={run_id} eligible={eligible:,} "
+        f"[ATR] {module}/{segment} ({case_type}) run={run_id} eligible={eligible:,} "
         f"action={action_type}/{action_taken} source={trigger_source}"
     )
+    print(f"[ATR] endpoint: {ATR_URL.get(module)}")
 
     # Safety net. Each pass must consume rows, so the number of passes cannot
     # exceed the number of eligible rows. If it ever does, something is wrong
@@ -1687,3 +1744,101 @@ def iter_report_rows(run_id: str | None = None, module: str | None = None,
             _get_pool().putconn(conn)
         except Exception:
             pass
+
+
+# ── CONNECTIVITY DIAGNOSTICS ─────────────────────────────────────────────────
+def describe_config(module: str) -> dict:
+    """What this process will actually use for a module. Nothing secret.
+
+    Exists because a 404 is indistinguishable from a dozen config mistakes when
+    all you can see is the word "Not Found".
+    """
+    module = module.upper()
+    cfg = spec(module)
+    url = ATR_URL.get(module) or ""
+    key_id = ATR_KEY_ID.get(module) or ""
+    key_env = f"{key_id}_PUBLIC_KEY" if key_id else None
+
+    parsed = {}
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        parsed = {"scheme": u.scheme, "host": u.netloc, "path": u.path}
+    except Exception:
+        pass
+
+    return {
+        "module": module,
+        "url": url,
+        "url_parts": parsed,
+        "url_env_var": f"{module}_ATR_URL",
+        "key_id": key_id,
+        "key_env_var": key_env,
+        "public_key_present": bool(key_env and os.getenv(key_env)),
+        "id_field": cfg["id_field"],
+        "id_env_var": "FRI_CLIENT_ID" if module == "FRI" else "MNRL_BANK_ID",
+        "id_present": bool(ATR_CLIENT_ID.get(module)),
+        "extra_headers": cfg["extra_headers"],
+        "max_batch": cfg["max_batch"],
+        "rate_limit": cfg["rate_limit"],
+        "verify_ssl": ATR_VERIFY_SSL,
+        # Fail-soft: preflight reads atr_defaults, and diagnostics has to stay
+        # usable when the database is exactly what is broken.
+        "problems": _safe_problems(module),
+    }
+
+
+def _safe_problems(module: str) -> list[str]:
+    try:
+        return preflight(module).get("problems", [])
+    except Exception as exc:
+        return [f"Could not read ATR defaults from the database: {_redact(exc)}"]
+
+
+def probe_endpoint(module: str) -> dict:
+    """Check whether the configured ATR path exists, without submitting anything.
+
+    A GET on a POST-only endpoint should come back 405 Method Not Allowed —
+    which proves the path is right and only the method is wrong. A 404 means the
+    URL itself is wrong. That single distinction separates "my config is broken"
+    from "the gateway is broken", and costs nothing to check.
+    """
+    module = module.upper()
+    url = ATR_URL.get(module) or ""
+    if not url:
+        return {"ok": False, "reason": f"{module}_ATR_URL is not set."}
+
+    out = {"url": url}
+    try:
+        resp = _get_session().get(url, timeout=20, verify=ATR_VERIFY_SSL,
+                                  headers=spec(module)["extra_headers"])
+        out["http_status"] = resp.status_code
+        out["reason"] = resp.reason
+        body = (resp.text or "").strip()[:200]
+        out["body_preview"] = _redact(body) if body else ""
+
+        if resp.status_code in (405, 401, 403, 400, 422):
+            out["ok"] = True
+            out["verdict"] = (
+                f"The path exists (HTTP {resp.status_code} to a GET is expected "
+                f"on a POST-only endpoint). The URL is correct."
+            )
+        elif resp.status_code == 404:
+            out["ok"] = False
+            out["verdict"] = (
+                "404 — the host is reachable but this path does not exist. "
+                f"Check {module}_ATR_URL against the C-DOT specification."
+            )
+        else:
+            out["ok"] = True
+            out["verdict"] = f"Host reachable, returned HTTP {resp.status_code} to a GET."
+    except requests.exceptions.SSLError as exc:
+        out.update(ok=False, verdict=f"TLS failure: {exc}. Try ATR_VERIFY_SSL=0 for the test gateway.")
+    except requests.exceptions.ConnectionError as exc:
+        out.update(ok=False, verdict=(
+            f"Cannot reach the host at all: {exc}. Check the hostname, DNS, and "
+            f"whether this server needs a proxy to reach sancharsaathi.gov.in."
+        ))
+    except Exception as exc:
+        out.update(ok=False, verdict=f"Probe failed: {_redact(exc)}")
+    return out
