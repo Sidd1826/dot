@@ -1,8 +1,9 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
-from logging import logger
 import os
+import time
 import traceback
 import uuid
 
@@ -13,9 +14,29 @@ import psycopg2.pool
 
 from consts import get_azure_postgres_dsn
 
+# NOTE: `from logging import logger` is an ImportError - the stdlib logging
+# module has no `logger` attribute. Using the project logger factory, same as
+# gcp_function_app.py and indp.py.
+from inm_gcp_service.common.logging import get_logger
+
+logger = get_logger("jobs")
+
 PG_DSN = get_azure_postgres_dsn()
 MAX_WORKERS = int(os.environ.get("JOB_MAX_WORKERS", "4"))
 JOB_TTL_HOURS = int(os.environ.get("JOB_TTL_HOURS", "24"))
+
+# How often the waiter polls and heartbeats a running job.
+JOB_HEARTBEAT_SECONDS = int(os.environ.get("JOB_HEARTBEAT_SECONDS", "30"))
+
+# A running job with no heartbeat for this long is considered abandoned
+# (worker thread died, or the Function host recycled the whole process).
+JOB_STALE_MINUTES = int(os.environ.get("JOB_STALE_MINUTES", "15"))
+
+# Status writes are the one thing that must not be lost - a dropped write is
+# exactly what leaves a row stuck on 'running' with no error.
+STATUS_WRITE_ATTEMPTS = int(os.environ.get("JOB_STATUS_WRITE_ATTEMPTS", "4"))
+
+TERMINAL_STATES = ("done", "failed")
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
@@ -24,35 +45,81 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pool
     if _pool is None or _pool.closed:
         _pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2,
+            minconn=1,
             maxconn=MAX_WORKERS + 4,
-            dsn=PG_DSN
+            dsn=PG_DSN,
         )
     return _pool
 
 
-def _acquire() -> connection:
-    return _get_pool().getconn()
+def _is_alive(conn: connection) -> bool:
+    """Pre-ping.
 
-
-def _release(conn: connection) -> None:
+    The pipeline can run for 30+ minutes. Pooled connections sit idle that
+    whole time and Azure Postgres (and pgbouncer in front of it) will reap
+    them. Handing a dead connection to the final status write is how a job
+    ends up permanently 'running'.
+    """
+    if conn.closed:
+        return False
     try:
-        _get_pool().putconn(conn)
+        conn.rollback()  # clear any aborted-transaction state
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _acquire() -> connection:
+    pool = _get_pool()
+    for _ in range(3):
+        conn = pool.getconn()
+        if _is_alive(conn):
+            return conn
+        logger.warning("Discarding dead pooled connection")
+        try:
+            pool.putconn(conn, close=True)
+        except Exception:
+            pass
+    raise psycopg2.OperationalError("Could not obtain a live Postgres connection")
+
+
+def _release(conn: connection, broken: bool = False) -> None:
+    try:
+        _get_pool().putconn(conn, close=bool(broken or conn.closed))
+    except Exception:
+        logger.warning("Failed to return connection to pool", exc_info=True)
+
+
+@contextmanager
+def _db():
+    """Acquire a live connection; discard it from the pool if anything blows up."""
+    conn = _acquire()
+    broken = False
+    try:
+        yield conn
+    except Exception:
+        broken = True
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        _release(conn, broken=broken)
 
 
 executor = ThreadPoolExecutor(
     max_workers=MAX_WORKERS,
-    thread_name_prefix="export-worker"
+    thread_name_prefix="export-worker",
 )
 
 
 def _insert_job(job_id: str) -> None:
     """Create a new job row with status='pending'."""
-    conn = _acquire()
-    logger.info("Insert Job started")
-    try:
+    logger.info("Insert job %s", job_id)
+    with _db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -61,12 +128,7 @@ def _insert_job(job_id: str) -> None:
                 """,
                 (job_id,),
             )
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        _release(conn)
+        conn.commit()
 
 
 def _update_job(job_id: str, **fields) -> None:
@@ -86,7 +148,7 @@ def _update_job(job_id: str, **fields) -> None:
 
     if "error" in fields:
         set_parts.append("error = %s")
-        values.append(fields["error"])
+        values.append((fields["error"] or "")[:2000])
 
     if "finished_at" in fields:
         set_parts.append("finished_at = %s")
@@ -97,23 +159,42 @@ def _update_job(job_id: str, **fields) -> None:
 
     sql = f"UPDATE jobs SET {', '.join(set_parts)} WHERE id = %s"
 
-    conn = _acquire()
-    logger.info("Update job started")
-    try:
+    with _db() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, values)
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        _release(conn)
+        conn.commit()
+
+
+def _update_job_safe(job_id: str, **fields) -> bool:
+    """_update_job, but it retries and never raises.
+
+    Returns True if the write landed. A False here is the single most
+    important thing in the log: it means the DB no longer reflects reality.
+    """
+    delay = 2
+    for attempt in range(1, STATUS_WRITE_ATTEMPTS + 1):
+        try:
+            _update_job(job_id, **fields)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Status write failed for %s (attempt %d/%d): %s",
+                job_id, attempt, STATUS_WRITE_ATTEMPTS, exc,
+            )
+            if attempt < STATUS_WRITE_ATTEMPTS:
+                time.sleep(delay)
+                delay *= 2
+
+    logger.error(
+        "GAVE UP writing status for job %s - row will be reaped as stale. fields=%s",
+        job_id, {k: v for k, v in fields.items() if k != "result"},
+    )
+    return False
 
 
 def _select_job(job_id: str) -> dict | None:
     """Fetch a single job row as a plain dict, or None if not found."""
-    conn = _acquire()
-    try:
+    with _db() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
@@ -125,52 +206,122 @@ def _select_job(job_id: str) -> dict | None:
                 (job_id,),
             )
             row = cur.fetchone()
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        _release(conn)
+        conn.commit()
 
     if not row:
         return None
 
     d = dict(row)
-    d["started_at"] = d["started_at"].isoformat() if d["started_at"] else None
-    d["finished_at"] = d["finished_at"].isoformat() if d["finished_at"] else None
-    d["updated_at"] = d["updated_at"].isoformat() if d["updated_at"] else None
+    for col in ("started_at", "finished_at", "updated_at"):
+        d[col] = d[col].isoformat() if d[col] else None
 
     return d
 
 
+def touch_job(job_id: str) -> None:
+    """Heartbeat: move updated_at forward so the reaper knows this run is alive.
+
+    Without this, a legitimately long run and an abandoned one are
+    indistinguishable - both just have an old updated_at.
+    """
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE jobs SET updated_at = NOW()
+                    WHERE id = %s AND status IN ('pending', 'running')
+                    """,
+                    (job_id,),
+                )
+            conn.commit()
+    except Exception as exc:
+        # A missed heartbeat is not fatal on its own.
+        logger.warning("Heartbeat failed for job %s: %s", job_id, exc)
+
+
+def mark_stale_jobs_failed(stale_minutes: int = JOB_STALE_MINUTES) -> list[str]:
+    """Flip abandoned pending/running rows to failed.
+
+    These are the rows you have been seeing sit on 'running' forever: the
+    process died between the 'running' write and the terminal write, so no
+    code was ever left alive to mark them.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed',
+                    error = COALESCE(
+                        error,
+                        'abandoned - no heartbeat for %s min (worker thread or function host died)'
+                    ),
+                    finished_at = NOW()
+                WHERE status IN ('pending', 'running')
+                  AND updated_at < %s
+                RETURNING id
+                """,
+                (stale_minutes, cutoff),
+            )
+            ids = [r[0] for r in cur.fetchall()]
+        conn.commit()
+
+    if ids:
+        logger.warning("Reaped %d stale job(s): %s", len(ids), ", ".join(str(i) for i in ids))
+    return ids
+
+
 def _run(job_id: str, fn, *args, **kwargs) -> None:
-    """Executed inside a worker thread. Writes state to DB at each transition."""
-    _update_job(job_id, status="running")
+    """Executed inside a worker thread. Always writes a terminal state."""
+    _update_job_safe(job_id, status="running")
+
     try:
         result = fn(*args, **kwargs)
-        _update_job(
-            job_id,
-            result=result,
-            status="done",
-            finished_at=datetime.now(timezone.utc),
-        )
     except Exception:
         tb = traceback.format_exc()
         last_line = tb.strip().splitlines()[-1]
         logger.error("[JOB FAILED] %s:\n%s", job_id, tb)
-        _update_job(
+        _update_job_safe(
             job_id,
             status="failed",
             error=last_line,
+            finished_at=datetime.now(timezone.utc),
+        )
+        return
+
+    _update_job_safe(
+        job_id,
+        result=result,
+        status="done",
+        finished_at=datetime.now(timezone.utc),
+    )
+
+
+def _on_worker_done(job_id: str, fut: Future) -> None:
+    """A crash inside _run itself (not inside fn) would otherwise vanish.
+
+    executor.submit() swallows exceptions unless the future is inspected, and
+    the old code threw the future away.
+    """
+    exc = fut.exception()
+    if exc is not None:
+        logger.error("[JOB RUNNER CRASHED] %s: %s", job_id, exc, exc_info=exc)
+        _update_job_safe(
+            job_id,
+            status="failed",
+            error=f"job runner crashed: {exc}",
             finished_at=datetime.now(timezone.utc),
         )
 
 
 def start_job(fn, *args, **kwargs) -> str:
     job_id = str(uuid.uuid4())
-    logger.info("Start Job called")
+    logger.info("Start job %s -> %s", job_id, getattr(fn, "__name__", fn))
     _insert_job(job_id)
-    executor.submit(_run, job_id, fn, *args, **kwargs)
+    fut = executor.submit(_run, job_id, fn, *args, **kwargs)
+    fut.add_done_callback(lambda f: _on_worker_done(job_id, f))
     return job_id
 
 
@@ -179,11 +330,67 @@ def get_job(job_id: str) -> dict | None:
     return _select_job(job_id)
 
 
+def wait_for_job(
+    job_id: str,
+    timeout_seconds: int,
+    poll_interval: int = JOB_HEARTBEAT_SECONDS,
+) -> dict:
+    """Block until the job reaches a terminal state, or the deadline passes.
+
+    On deadline the job is marked failed and returned - the caller decides
+    whether to retry. Note the worker thread is NOT killed (Python cannot),
+    which is why indp_bq_to_az holds a process-wide lock.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    read_errors = 0
+    UNREADABLE = object()
+
+    while True:
+        try:
+            job = get_job(job_id)
+            read_errors = 0
+        except Exception as exc:
+            # A transient DB blip must not be mistaken for a finished job.
+            read_errors += 1
+            logger.warning(
+                "Could not read job %s (%d in a row): %s", job_id, read_errors, exc
+            )
+            if read_errors >= 5:
+                raise
+            job = UNREADABLE
+
+        if job is None:
+            raise RuntimeError(f"Job {job_id} disappeared from DB")
+
+        if job is not UNREADABLE and job["status"] in TERMINAL_STATES:
+            logger.info("Job %s finished: status=%s", job_id, job["status"])
+            return job
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.error(
+                "Job %s exceeded the %ds attempt budget - marking failed",
+                job_id, timeout_seconds,
+            )
+            _update_job_safe(
+                job_id,
+                status="failed",
+                error=f"attempt timed out after {timeout_seconds}s",
+                finished_at=datetime.now(timezone.utc),
+            )
+            timed_out = get_job(job_id) or {"id": job_id}
+            timed_out["status"] = "failed"
+            timed_out.setdefault("error", f"attempt timed out after {timeout_seconds}s")
+            return timed_out
+
+        touch_job(job_id)
+        time.sleep(min(poll_interval, remaining))
+
+
 def clean_old_jobs(hours: int = JOB_TTL_HOURS) -> int:
     """Delete done/failed jobs older than hours."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    conn = _acquire()
-    try:
+    with _db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -194,12 +401,7 @@ def clean_old_jobs(hours: int = JOB_TTL_HOURS) -> int:
                 (cutoff,),
             )
             removed = cur.rowcount
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        _release(conn)
+        conn.commit()
 
     logger.info("[jobs] Cleaned %s old job(s) older than %sh", removed, hours)
     return removed
