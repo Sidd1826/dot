@@ -21,28 +21,12 @@ logger = get_logger("GCP_function_app")
 
 INDP_SCHEDULE_TIME = get_indp_schedule()
 
-# How many full pipeline attempts before the timer trigger gives up.
-MAX_ATTEMPTS = int(os.environ.get("INDP_MAX_ATTEMPTS", "3"))
-
-# Hard ceiling on a single attempt. Must be comfortably longer than a healthy
-# run, or you will kill good runs and reload for nothing. Check your Azure
-# Monitor duration for a successful day and give it ~2x headroom.
-ATTEMPT_TIMEOUT_SECONDS = int(os.environ.get("INDP_ATTEMPT_TIMEOUT_SECONDS", str(40 * 60)))
-
-# Ceiling on the whole timer invocation (all attempts). Keep this BELOW the
-# host.json functionTimeout, otherwise the host kills the process mid-retry
-# and you are back to a row stuck on 'running'.
-TOTAL_BUDGET_SECONDS = int(os.environ.get("INDP_TOTAL_BUDGET_SECONDS", str(150 * 60)))
-
-# Pause before attempt 2 and attempt 3.
-RETRY_BACKOFF_SECONDS = [
-    int(x) for x in os.environ.get("INDP_RETRY_BACKOFF", "120,600").split(",")
-]
-
-# BQ returning zero rows usually means the upstream feed has not landed yet,
-# which a retry can fix. If it is still empty after every attempt, that is a
-# source problem, not a pipeline failure - log loudly but do not raise.
-RAISE_ON_EMPTY_SOURCE = os.environ.get("INDP_RAISE_ON_EMPTY_SOURCE", "false").lower() == "true"
+# Configuration constants with fixed default values
+MAX_ATTEMPTS = 3
+ATTEMPT_TIMEOUT_SECONDS = 40 * 60      # 2400 seconds (40 minutes)
+TOTAL_BUDGET_SECONDS = 150 * 60        # 9000 seconds (150 minutes)
+RETRY_BACKOFF_SECONDS = [120, 600]     # 2 minutes, then 10 minutes
+RAISE_ON_EMPTY_SOURCE = False
 
 
 def _backoff_for(attempt: int) -> int:
