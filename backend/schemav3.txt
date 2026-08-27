@@ -717,7 +717,12 @@ SET action_type = NULL,
     total_money_saved = NULL,
     transaction_declined = NULL,
     updated_at = NOW()
-WHERE module = 'MNRL';
+-- Scoped to rows that still carry a BOA/BOT action_type, i.e. ones this
+-- migration has not already converted. Two reasons that matters:
+--   * re-running must not reset action codes, and an unscoped UPDATE reset the
+--     cleared-case code from 3 back to 2/8 on every run;
+--   * any code an operator has since changed in the UI must survive.
+WHERE module = 'MNRL' AND action_type IS NOT NULL;
 
 -- Only now that the MNRL rows conform can the shape be enforced: FRI requires
 -- action_type, MNRL must not carry one and must have investigation_details.
@@ -941,6 +946,86 @@ CREATE OR REPLACE VIEW v_number_lifecycle AS
 -- =============================================================================
 UPDATE fri_master  SET atr_status = 'pending' WHERE atr_status = 'not_required';
 UPDATE mnrl_master SET atr_status = 'pending' WHERE atr_status = 'not_required';
+
+
+-- =============================================================================
+-- v3.7 — REACTIVATION REASON ON MNRL CLEARED ATRs
+--
+-- reactivation_id (spec table 6.3) describes WHY a number came back. Like
+-- disconnectionreason_id it is a property of the individual number, and it is
+-- already captured on mnrl_master at reconcile time. The value configured here
+-- is only the fallback used when the reactivation feed did not supply one.
+--
+-- NOTE: reactivation_id is not one of the six fields listed in the MNRL ATR
+-- payload spec. It is sent as an additional field, which can be switched off
+-- with MNRL_ATR_SEND_REACTIVATION_ID=0 if C-DOT rejects it.
+-- =============================================================================
+ALTER TABLE atr_defaults ADD COLUMN IF NOT EXISTS reactivation_id VARCHAR(5);
+
+DO $$ BEGIN
+    ALTER TABLE atr_defaults ADD CONSTRAINT chk_atr_reactivation_id CHECK (
+        reactivation_id IS NULL OR reactivation_id IN ('1', '2', '3', '4', '5')
+    );
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- Default fallback: "reactivation to same customer due to late reverification",
+-- the ordinary case for a number that clears after being revoked.
+UPDATE atr_defaults SET reactivation_id = '1'
+WHERE module = 'MNRL' AND case_type = 'cleared' AND reactivation_id IS NULL;
+
+ALTER TABLE atr_events ADD COLUMN IF NOT EXISTS reactivation_id VARCHAR(5);
+
+
+-- =============================================================================
+-- v3.7 — REPAIR reported status overwritten by a clearance
+--
+-- A clearing feed carries status = 'compliant'. That value was being written
+-- into fri_master.fri_status, which is meant to hold what the number was
+-- REPORTED as — so a number flagged on the 1st and compliant on the 3rd showed
+-- "compliant" in both the Reported Status and Current Status columns, losing
+-- the flagged/disconnected history.
+--
+-- The ingest no longer does this. master_history recorded the real value all
+-- along ('reported' events keep status_value), so it is restored from there.
+-- Safe to re-run: it only touches rows that currently hold a clearance value.
+-- =============================================================================
+
+UPDATE fri_master m
+SET fri_status = h.status_value,
+    updated_at = NOW()
+FROM (
+    SELECT DISTINCT ON (mobile_no) mobile_no, status_value
+    FROM master_history
+    WHERE module = 'FRI'
+      AND event_type = 'reported'
+      AND status_value IS NOT NULL
+      AND lower(status_value) NOT IN ('compliant', 'reactivated')
+    ORDER BY mobile_no, feed_date DESC
+) h
+WHERE h.mobile_no = m.mobile_no
+  AND lower(COALESCE(m.fri_status, '')) IN ('', 'compliant', 'reactivated');
+
+-- Anything still holding a clearance value has no usable history behind it.
+-- Blank is honest; a fabricated status in an audit column is not.
+UPDATE fri_master
+SET fri_status = NULL, updated_at = NOW()
+WHERE lower(COALESCE(fri_status, '')) IN ('compliant', 'reactivated');
+
+-- MNRL keeps the disconnection reason in this column, so the same overwrite
+-- would show up as a bogus reason code.
+UPDATE mnrl_master m
+SET disconnection_reason_id = h.status_value,
+    updated_at = NOW()
+FROM (
+    SELECT DISTINCT ON (mobile_no) mobile_no, status_value
+    FROM master_history
+    WHERE module = 'MNRL'
+      AND event_type = 'reported'
+      AND status_value ~ '^[1-6]$'
+    ORDER BY mobile_no, feed_date DESC
+) h
+WHERE h.mobile_no = m.mobile_no
+  AND (m.disconnection_reason_id IS NULL OR m.disconnection_reason_id !~ '^[1-6]$');
 
 
 -- =============================================================================

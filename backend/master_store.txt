@@ -136,35 +136,95 @@ CUSTOMER_COL_LIMITS: dict[str, int] = {
 }
 
 # Column order for the master download
+# ── EXPORT SHAPE ─────────────────────────────────────────────────────────────
+#
+# A number's life has two halves and the export has to show both. It was
+# reported as flagged / disconnected on one date, and may have become compliant
+# / reactivated on another. Collapsing that into a single "status" column loses
+# whichever half came first — which is exactly the history the row exists for.
+#
+# So the workbook carries three things per number:
+#
+#   REPORTED  what it was flagged as, and the first and last dates it appeared
+#             on the risk feed
+#   CLEARED   the reason it cleared and the date it did
+#   CURRENT   one plain word for where it stands right now
+#
+# All of it is derived from the master row itself. master_history holds the same
+# events, but joining a lakh-row export against it would cost far more than the
+# CASE expressions below, which the same index scan already has in hand.
+
+def _current_status_sql(module: str) -> str:
+    """One word for the state a number is in right now."""
+    if module == MODULE_FRI:
+        return (
+            "CASE WHEN status = 'cleared' THEN COALESCE(clear_reason, 'compliant') "
+            "ELSE COALESCE(NULLIF(fri_status, ''), 'flagged_for_reverification') END"
+        )
+    return (
+        "CASE WHEN status = 'cleared' THEN COALESCE(clear_reason, 'reactivated') "
+        "ELSE 'disconnected' END"
+    )
+
+
+def _reported_status_sql(module: str) -> str:
+    """What it was flagged as — preserved even after it clears.
+
+    The clearing feed does not carry this, and the cleared upsert keeps the
+    existing value rather than overwriting it with a blank, so it survives.
+    """
+    if module == MODULE_FRI:
+        # Blank when genuinely unknown. Never a clearance value, and never a
+        # fabricated default — a guess in an audit column is worse than a gap.
+        return (
+            "CASE WHEN lower(COALESCE(fri_status, '')) IN "
+            "('', 'compliant', 'reactivated') THEN NULL ELSE fri_status END"
+        )
+    # Every MNRL report is a disconnection, so the reported status is constant.
+    return "'disconnected'"
+
+
+def _export_select(module: str) -> list[tuple[str, str]]:
+    """(sql_expression, output_name) pairs, in workbook column order."""
+    common_head = [(c, c) for c in ["mobile_no", "cust_id", "segment"] + CUSTOMER_COLS]
+
+    lifecycle = [
+        (_reported_status_sql(module), "reported_status"),
+        ("first_reported_on", "first_reported_on"),
+        ("last_reported_on", "last_reported_on"),
+        ("clear_reason", "clear_reason"),
+        ("cleared_on", "cleared_on"),
+        (_current_status_sql(module), "current_status"),
+        ("(cleared_on - first_reported_on)", "days_to_clear"),
+        ("report_count", "report_count"),
+    ]
+
+    if module == MODULE_FRI:
+        feed = [("fri", "fri"), ("lsa_id", "lsa_id"), ("tsp_id", "tsp_id")]
+    else:
+        feed = [
+            ("date_of_disconnection", "date_of_disconnection"),
+            ("disconnection_reason_id", "disconnection_reason_id"),
+            ("reactivation_id", "reactivation_id"),
+            ("lsa_id", "lsa_id"), ("tsp_id", "tsp_id"),
+        ]
+
+    atr = [(c, c) for c in ["atr_status", "atr_action_taken", "atr_submitted_at"]]
+    return common_head + lifecycle + feed + atr
+
+
 EXPORT_COLUMNS: dict[str, list[str]] = {
-    MODULE_FRI: (
-        ["mobile_no", "cust_id", "segment"]
-        + CUSTOMER_COLS
-        + ["fri", "fri_status", "status", "clear_reason", "cleared_on",
-           "lsa_id", "tsp_id",
-           "first_reported_on", "last_reported_on", "report_count",
-           "atr_status", "atr_action_taken", "atr_submitted_at"]
-    ),
-    MODULE_MNRL: (
-        ["mobile_no", "cust_id", "segment"]
-        + CUSTOMER_COLS
-        + ["date_of_disconnection", "disconnection_reason_id",
-           "status", "clear_reason", "cleared_on", "lsa_id", "tsp_id",
-           "first_reported_on", "last_reported_on", "report_count",
-           "atr_status", "atr_action_taken", "atr_submitted_at"]
-    ),
+    MODULE_FRI: [alias for _, alias in _export_select(MODULE_FRI)],
+    MODULE_MNRL: [alias for _, alias in _export_select(MODULE_MNRL)],
 }
 
 # Excel header for each export column. Without this, openpyxl title-cases the
-# raw name and you get "Zbnad1". The five address lines are numbered so the
-# workbook has no two columns with the same heading.
+# raw name and you get "Zbnad1". Every heading is distinct, so no two columns in
+# the workbook share a name.
 EXPORT_LABELS: dict[str, str] = {
     "mobile_no": "Mobile Number",
     "cust_id": "Customer Id",
     "segment": "Classification",
-    "status": "Record Status",
-    "clear_reason": "Cleared Because",
-    "cleared_on": "Cleared On",
     "zbadid": "Address ID",
     "zbnad1": "Name & Address 1",
     "zbnad2": "Name & Address 2",
@@ -175,15 +235,28 @@ EXPORT_LABELS: dict[str, str] = {
     "zbten2": "Telephone No 2",
     "zbpscd": "Postal Code",
     "zbiadd": "Internet Address",
+
+    # ── the lifecycle block ──
+    "reported_status": "Reported Status",
+    "first_reported_on": "First Reported On",
+    "last_reported_on": "Last Reported On",
+    "clear_reason": "Cleared Reason",
+    "cleared_on": "Cleared On",
+    "current_status": "Current Status",
+    "days_to_clear": "Days To Clear",
+    "report_count": "Times Reported",
+
+    # ── feed columns ──
     "fri": "FRI",
     "fri_status": "FRI Status",
     "lsa_id": "LSA Id",
     "tsp_id": "TSP Id",
     "date_of_disconnection": "Date Of Disconnection",
     "disconnection_reason_id": "Disconnection Reason",
-    "first_reported_on": "First Reported On",
-    "last_reported_on": "Last Reported On",
-    "report_count": "Times Reported",
+    "reactivation_id": "Reactivation Reason",
+    "status": "Record Status",
+
+    # ── ATR ──
     "atr_status": "ATR Status",
     "atr_action_taken": "ATR Action Code",
     "atr_submitted_at": "ATR Sent At",
@@ -596,8 +669,14 @@ def _cleared_upsert_sql(module: str) -> tuple[str, str]:
         f"    {c} = COALESCE(EXCLUDED.{c}, m.{c})," for c in CUSTOMER_COLS
     )
     # Existing value first: clearing must not blank out the earlier state.
+    # The reported-status column is stricter still — it is never taken from the
+    # clearing feed at all, because a clearance describes the new state, not the
+    # state the number was reported in.
+    status_col = _STATUS_COL[module]
     feed_updates = "\n".join(
-        f"    {c} = COALESCE(m.{c}, EXCLUDED.{c})," for c, _ in mcols
+        (f"    {c} = m.{c}," if c == status_col
+         else f"    {c} = COALESCE(m.{c}, EXCLUDED.{c}),")
+        for c, _ in mcols
     )
 
     sql = f"""
@@ -619,7 +698,11 @@ ON CONFLICT (mobile_no) DO UPDATE SET
     -- than being written off as 'not_required'.
     atr_status   = 'pending',
     first_reported_on = LEAST(m.first_reported_on, EXCLUDED.first_reported_on),
-    last_reported_on  = GREATEST(m.last_reported_on, EXCLUDED.last_reported_on),
+    -- last_reported_on is deliberately NOT advanced. It means "the last date
+    -- this number appeared on the risk/revocation feed", and a clearance is not
+    -- such an appearance. Advancing it made a number flagged on the 10th and
+    -- compliant on the 15th read as though it had been flagged on the 15th,
+    -- and extended its 90-day retention window by the same slip.
     cust_id  = COALESCE(EXCLUDED.cust_id, m.cust_id),
     gho_code = COALESCE(EXCLUDED.gho_code, m.gho_code),
     segment  = CASE WHEN EXCLUDED.segment = 'UNKNOWN' THEN m.segment ELSE EXCLUDED.segment END,
@@ -872,7 +955,11 @@ def ingest_fri_reconciled(
             # clears without ever having been reported still keeps what the
             # clearing feed told us, instead of landing as a row of NULLs.
             _txt(_pick(record, hmap, "fri"), 50),
-            _txt(_pick(record, hmap, "status"), 50),
+            # fri_status is deliberately NULL here. The clearing record's own
+            # status is "compliant", and that is NOT what the number was
+            # REPORTED as — writing it here overwrote 'flagged_for_reverification'
+            # with 'compliant' and destroyed the very history this column keeps.
+            None,
             _txt(_pick(record, hmap, "lsa_id"), 20),
             _txt(_pick(record, hmap, "tsp_id"), 20),
             _payload(record) if record else None,
@@ -1090,17 +1177,23 @@ def _filter_clause(feed_date: Any = None, segment: str | None = None,
     dto = _to_date(date_to) or dfrom
 
     if dfrom:
+        # A number's reporting life is the window first_reported_on ..
+        # last_reported_on, so "was it on the feed during these dates" is a
+        # window OVERLAP, not equality against one endpoint. Testing
+        # last_reported_on alone dropped a number reported on the 10th and again
+        # on the 12th from the 10th's list, which is plainly wrong.
+        reported_overlap = "(first_reported_on <= %s AND last_reported_on >= %s)"
+        cleared_in_range = "(cleared_on BETWEEN %s AND %s)"
+
         if record_status == "active":
-            clauses.append("last_reported_on BETWEEN %s AND %s")
-            params.extend([dfrom, dto])
+            clauses.append(reported_overlap)
+            params.extend([dto, dfrom])
         elif record_status == "cleared":
-            clauses.append("cleared_on BETWEEN %s AND %s")
+            clauses.append(cleared_in_range)
             params.extend([dfrom, dto])
         else:
-            clauses.append(
-                "(last_reported_on BETWEEN %s AND %s OR cleared_on BETWEEN %s AND %s)"
-            )
-            params.extend([dfrom, dto, dfrom, dto])
+            clauses.append(f"({reported_overlap} OR {cleared_in_range})")
+            params.extend([dto, dfrom, dfrom, dto])
 
     if segment and segment.upper() not in ("ALL", ""):
         clauses.append("segment = %s")
@@ -1131,9 +1224,26 @@ def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
     """
     module = module.upper()
     table = _TABLES[module]
-    cols = columns or EXPORT_COLUMNS[module]
     where, params = _filter_clause(feed_date, segment, record_status=record_status,
                                    date_to=date_to)
+
+    # Some export columns are derived (current_status, days_to_clear), so the
+    # SELECT is built from expression/alias pairs rather than bare names. A
+    # caller passing plain column names still works.
+    # Callers pass EXPORT_COLUMNS, which is a list of output ALIASES — and some
+    # of those (current_status, days_to_clear, reported_status) are derived, not
+    # real columns. Resolve each alias back to its expression, so asking for the
+    # export's own column list cannot produce "column does not exist".
+    expr_for = {alias: expr for expr, alias in _export_select(module)}
+    if columns:
+        select_pairs = [(expr_for.get(c, c), c) for c in columns]
+    else:
+        select_pairs = _export_select(module)
+    cols = [alias for _, alias in select_pairs]
+    select_sql = ", ".join(
+        f'{expr} AS "{alias}"' if expr != alias else alias
+        for expr, alias in select_pairs
+    )
 
     conn = _get_pool().getconn()
     name = f"stream_{module.lower()}_{os.getpid()}_{id(params)}"
@@ -1141,7 +1251,7 @@ def iter_active(module: str, feed_date: Any = None, segment: str | None = None,
         cur = conn.cursor(name=name, cursor_factory=psycopg2.extras.RealDictCursor)
         cur.itersize = STREAM_SIZE
         cur.execute(
-            f"SELECT {', '.join(cols)} FROM {table} WHERE {where} "
+            f"SELECT {select_sql} FROM {table} WHERE {where} "
             f"ORDER BY GREATEST(last_reported_on, COALESCE(cleared_on, last_reported_on)) DESC, id",
             params,
         )
@@ -1416,12 +1526,15 @@ def claim_atr_batch(module: str, run_id: str, action_type: str, action_taken: st
     hash_expr = _hash_expr(module)
     status_col = _STATUS_COL[module]
 
-    select_cols = ", ".join(
-        ["id", "mobile_no", "cust_id", "segment", "gho_code", status_col,
-         "status", "clear_reason", "cleared_on", "last_reported_on",
-         "atr_state_hash", "atr_send_count", "atr_status", "atr_action_type",
-         "atr_action_taken"]
-    )
+    base_cols = ["id", "mobile_no", "cust_id", "segment", "gho_code", status_col,
+                 "status", "clear_reason", "cleared_on", "last_reported_on",
+                 "atr_state_hash", "atr_send_count", "atr_status",
+                 "atr_action_type", "atr_action_taken"]
+    # The reactivation reason is per number and captured at reconcile, so the
+    # report builder needs it on the row rather than falling back to a default.
+    if module == MODULE_MNRL:
+        base_cols.append("reactivation_id")
+    select_cols = ", ".join(base_cols)
 
     with _cursor(dict_cursor=True) as cur:
         cur.execute(
