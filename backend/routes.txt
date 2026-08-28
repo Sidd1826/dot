@@ -556,26 +556,17 @@ def route_master_lookup(mobile_no):
         return _fail(e)
 
 
-@routes.route("/master/refresh-customers", methods=["POST"])
-def route_master_refresh_customers():
-    """POST /master/refresh-customers {"type": "FRI", "force": false}
 
-    Re-syncs the customer name/address/email block from mobilecleanup. The
-    master stores a snapshot taken at reconcile time, so a value that was
-    truncated or missing in the source back then stays that way until the number
-    is reported again. This repairs those rows without waiting.
+@routes.route("/master/trace/<mobile_no>", methods=["GET"])
+def route_master_trace(mobile_no):
+    """GET /master/trace/919000000001?column=zbiadd
 
-    By default only values that are now LONGER replace what is stored, so a
-    since-blanked source cannot erase good data. Pass force=true for a full
-    re-sync.
+    Shows the value and its length at every stage — mobilecleanup, the column's
+    declared width, the master snapshot, and what the export emits — so a
+    shortened value can be traced to the exact stage that shortened it.
     """
-    req = request.get_json(silent=True) or {}
     try:
-        module = req.get("type")
-        module = _validate_module(module) if module else None
-        return jsonify(ms.refresh_customer_snapshot(
-            module, only_if_longer=not bool(req.get("force"))
-        ))
+        return jsonify(ms.trace_customer_value(mobile_no, request.args.get("column", "zbiadd")))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:

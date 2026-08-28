@@ -1828,47 +1828,72 @@ def atr_preview_counts(module: str, feed_date: Any = None, segment: str | None =
         return [dict(r) for r in cur.fetchall()]
 
 
-def refresh_customer_snapshot(module: str | None = None,
-                              only_if_longer: bool = True) -> dict:
-    """Re-sync the customer name/address/email block from mobilecleanup.
+def trace_customer_value(mobile_no: str, column: str = "zbiadd") -> dict:
+    """Follow one field through every stage, with lengths at each.
 
-    The master deliberately stores a SNAPSHOT of the customer taken at reconcile
-    time, so an address can't be rewritten under an old report. The cost is that
-    if mobilecleanup held a truncated or incomplete value when the number was
-    reconciled, the master keeps it until that number is reported again.
-
-    This repairs those rows in place.
-
-    only_if_longer=True (the default) is the conservative mode: a value is
-    replaced only when the current source value is strictly LONGER, which fixes
-    truncation without letting a since-shortened or blanked source erase good
-    data. Pass False to force a full re-sync.
+    Answers "where does the value get shortened?" without guesswork. If the
+    length is the same at every stage, nothing in this application truncated it
+    and the loss happened in whatever produced or opened the file.
     """
-    modules = [module.upper()] if module else list(_TABLES)
-    out: dict[str, int] = {}
+    mobile = _norm_mobile(mobile_no)
+    if column not in CUSTOMER_COLS:
+        raise ValueError(f"column must be one of: {', '.join(CUSTOMER_COLS)}")
 
-    for mod in modules:
-        table = _TABLES[mod]
-        sets, conds = [], []
-        for col in CUSTOMER_COLS:
-            sets.append(f"{col} = COALESCE(c.{col}, m.{col})")
-            if only_if_longer:
-                conds.append(
-                    f"(c.{col} IS NOT NULL AND "
-                    f"length(c.{col}) > length(COALESCE(m.{col}, '')))"
-                )
-            else:
-                conds.append(f"(c.{col} IS DISTINCT FROM m.{col})")
+    stages: list[dict] = []
 
-        sql = f"""
-            UPDATE {table} AS m
-            SET {", ".join(sets)}, updated_at = NOW()
-            FROM {MOBILECLEANUP_TABLE} AS c
-            WHERE c.final_mob_num = m.mobile_no
-              AND ({" OR ".join(conds)})
-        """
-        with _cursor() as cur:
-            cur.execute(sql)
-            out[f"{mod.lower()}_rows_refreshed"] = cur.rowcount
+    def add(stage: str, value: Any, note: str = ""):
+        text = None if value is None else str(value)
+        stages.append({
+            "stage": stage,
+            "value": text,
+            "length": len(text) if text is not None else None,
+            "note": note,
+        })
 
-    return out
+    with _cursor(dict_cursor=True) as cur:
+        # 1. the source of truth
+        cur.execute(
+            f"SELECT {column} AS v FROM {MOBILECLEANUP_TABLE} WHERE final_mob_num = %s LIMIT 1",
+            (mobile,),
+        )
+        row = cur.fetchone()
+        add("1. mobilecleanup (source)", row["v"] if row else None,
+            "not found" if not row else "")
+
+        # 2. the declared width of the master column — a cap we cannot exceed
+        for mod, table in _TABLES.items():
+            cur.execute(
+                """SELECT character_maximum_length AS n FROM information_schema.columns
+                   WHERE table_name = %s AND column_name = %s""",
+                (table, column),
+            )
+            w = cur.fetchone()
+            stages.append({
+                "stage": f"2. {table}.{column} declared width",
+                "value": None,
+                "length": w["n"] if w else None,
+                "note": "values longer than this are cut by Postgres itself",
+            })
+
+        # 3. what the master actually holds
+        for mod, table in _TABLES.items():
+            cur.execute(f"SELECT {column} AS v FROM {table} WHERE mobile_no = %s", (mobile,))
+            r = cur.fetchone()
+            if r:
+                add(f"3. {table} (snapshot taken at reconcile)", r["v"])
+
+    # 4. what the export emits for this row
+    for mod in _TABLES:
+        for r in iter_active(mod, columns=[column, "mobile_no"], record_status="all"):
+            if r.get("mobile_no") == mobile:
+                add(f"4. {mod} export value", r.get(column))
+                break
+
+    lengths = [s["length"] for s in stages if s["value"] is not None]
+    verdict = (
+        "Every stage holds the same length — nothing in this application "
+        "shortened it. Look at whatever produced or displayed the file."
+        if len(set(lengths)) <= 1 and lengths
+        else "Lengths differ between stages; the first drop is where it is lost."
+    )
+    return {"mobile_no": mobile, "column": column, "stages": stages, "verdict": verdict}

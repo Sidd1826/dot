@@ -219,6 +219,38 @@ def _detect_mnrl_data_type(file_name: str, headers: list[str]) -> str:
 
 
 # EXCEL BUILDERS
+# Sensible widths for columns whose content is routinely long. Excel CLIPS a
+# cell's text when the neighbouring cell is occupied, so a full 30-character
+# email in a default-width column looks truncated even though the value is
+# intact — the commonest false report of "the export cut my data".
+COLUMN_WIDTHS: dict[str, int] = {
+    "Internet Address": 42,
+    "Name & Address 1": 34, "Name & Address 2": 34, "Name & Address 3": 34,
+    "Name & Address 4": 34, "Name & Address 5": 34,
+    "Mobile Number": 16, "Customer Id": 16, "Address ID": 16,
+    "Telephone No": 18, "Telephone No 2": 18, "Postal Code": 12,
+    "Reported Status": 26, "Current Status": 26, "Cleared Reason": 16,
+    "First Reported On": 16, "Last Reported On": 16, "Cleared On": 14,
+    "Investigation Details": 42, "Response Message": 38, "C-DOT Request Id": 20,
+    "Data Date": 14, "Sent At": 20, "Why Sent": 24,
+}
+DEFAULT_COLUMN_WIDTH = 18
+
+
+def _apply_column_widths(ws, columns: list, labels: dict | None = None) -> None:
+    """Size columns before any row is written.
+
+    A write-only worksheet accepts column_dimensions only up front, which is why
+    this is called immediately after the sheet is created.
+    """
+    from openpyxl.utils import get_column_letter
+    labels = labels or {}
+    for idx, col in enumerate(columns, start=1):
+        heading = labels.get(col) or str(col).replace("_", " ").title()
+        width = COLUMN_WIDTHS.get(heading, DEFAULT_COLUMN_WIDTH)
+        ws.column_dimensions[get_column_letter(idx)].width = width
+
+
 def _make_header_cells(ws, columns: list, labels: dict | None = None) -> list:
     """Header row. `labels` maps column -> heading; without it a raw column name
     is title-cased, which turns 'zbnad1' into 'Zbnad1'."""
@@ -241,6 +273,7 @@ def build_excel(records: list, columns: list) -> io.BytesIO:
     buf = io.BytesIO()
     wb = Workbook(write_only=True)
     ws = wb.create_sheet("Data")
+    _apply_column_widths(ws, columns)
     ws.append(_make_header_cells(ws, columns))
     for chunk in _chunks(records, 5_000):
         for rec in chunk:
@@ -266,6 +299,7 @@ def build_excel_parts(
         buf = io.BytesIO()
         wb = Workbook(write_only=True)
         ws = wb.create_sheet("Data")
+        _apply_column_widths(ws, columns)
         ws.append(_make_header_cells(ws, columns))
         for row_chunk in _chunks(chunk, 5_000):
             for rec in row_chunk:
@@ -303,6 +337,7 @@ def build_excel_parts_stream(
         buf = io.BytesIO()
         wb = Workbook(write_only=True)
         ws = wb.create_sheet("Data")
+        _apply_column_widths(ws, columns, labels)
         ws.append(_make_header_cells(ws, columns, labels))
         rows_in_part = 0
 
@@ -342,6 +377,7 @@ def build_matched_excel(
     buf = io.BytesIO()
     wb = Workbook(write_only=True)
     ws = wb.create_sheet("Matched Data")
+    _apply_column_widths(ws, output_headers)
     ws.append(_make_header_cells(ws, output_headers))
 
     matched_count = 0
