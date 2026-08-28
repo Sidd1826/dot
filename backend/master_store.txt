@@ -1826,3 +1826,49 @@ def atr_preview_counts(module: str, feed_date: Any = None, segment: str | None =
     with _cursor(dict_cursor=True) as cur:
         cur.execute(sql, params + date_params)
         return [dict(r) for r in cur.fetchall()]
+
+
+def refresh_customer_snapshot(module: str | None = None,
+                              only_if_longer: bool = True) -> dict:
+    """Re-sync the customer name/address/email block from mobilecleanup.
+
+    The master deliberately stores a SNAPSHOT of the customer taken at reconcile
+    time, so an address can't be rewritten under an old report. The cost is that
+    if mobilecleanup held a truncated or incomplete value when the number was
+    reconciled, the master keeps it until that number is reported again.
+
+    This repairs those rows in place.
+
+    only_if_longer=True (the default) is the conservative mode: a value is
+    replaced only when the current source value is strictly LONGER, which fixes
+    truncation without letting a since-shortened or blanked source erase good
+    data. Pass False to force a full re-sync.
+    """
+    modules = [module.upper()] if module else list(_TABLES)
+    out: dict[str, int] = {}
+
+    for mod in modules:
+        table = _TABLES[mod]
+        sets, conds = [], []
+        for col in CUSTOMER_COLS:
+            sets.append(f"{col} = COALESCE(c.{col}, m.{col})")
+            if only_if_longer:
+                conds.append(
+                    f"(c.{col} IS NOT NULL AND "
+                    f"length(c.{col}) > length(COALESCE(m.{col}, '')))"
+                )
+            else:
+                conds.append(f"(c.{col} IS DISTINCT FROM m.{col})")
+
+        sql = f"""
+            UPDATE {table} AS m
+            SET {", ".join(sets)}, updated_at = NOW()
+            FROM {MOBILECLEANUP_TABLE} AS c
+            WHERE c.final_mob_num = m.mobile_no
+              AND ({" OR ".join(conds)})
+        """
+        with _cursor() as cur:
+            cur.execute(sql)
+            out[f"{mod.lower()}_rows_refreshed"] = cur.rowcount
+
+    return out

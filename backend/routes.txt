@@ -556,6 +556,32 @@ def route_master_lookup(mobile_no):
         return _fail(e)
 
 
+@routes.route("/master/refresh-customers", methods=["POST"])
+def route_master_refresh_customers():
+    """POST /master/refresh-customers {"type": "FRI", "force": false}
+
+    Re-syncs the customer name/address/email block from mobilecleanup. The
+    master stores a snapshot taken at reconcile time, so a value that was
+    truncated or missing in the source back then stays that way until the number
+    is reported again. This repairs those rows without waiting.
+
+    By default only values that are now LONGER replace what is stored, so a
+    since-blanked source cannot erase good data. Pass force=true for a full
+    re-sync.
+    """
+    req = request.get_json(silent=True) or {}
+    try:
+        module = req.get("type")
+        module = _validate_module(module) if module else None
+        return jsonify(ms.refresh_customer_snapshot(
+            module, only_if_longer=not bool(req.get("force"))
+        ))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return _fail(e)
+
+
 @routes.route("/master/purge", methods=["POST"])
 def route_master_purge():
     """Manual trigger; purge also runs after every reconcile."""
