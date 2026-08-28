@@ -1035,9 +1035,10 @@ const ReconcileModule = () => {
             ]} />
           <p className="text-xs text-slate-400 mt-1.5">
             {preview
-              ? `${fmt(preview.total)} records in this window — ${fmt(preview.active)} still open, ${fmt(preview.cleared)} cleared.`
+              ? `${fmt(preview.total)} records in this window — ${fmt(preview.active)} still open, ${fmt(preview.cleared)} cleared. The three always add up.`
               : "Loading…"}
-            {mDate !== "ALL" && " Cleared numbers are matched on the day they cleared."}
+            {mDate !== "ALL" &&
+              " A number belongs to a date if it was on the feed then, or cleared then."}
           </p>
         </div>
 
@@ -1221,6 +1222,16 @@ const BOA_LABELS = {
   "10": "Blacklisted",
 };
 const BOT_LABELS = { "5": "Transaction declined", "6": "User blacklisted" };
+
+// MNRL spec table 6.3. Only shown for MNRL reactivated cases — it is a separate
+// field from the action code, whose 1-5 mean entirely different things.
+const REACTIVATION_LABELS = {
+  "1": "Same customer, late reverification",
+  "2": "Activation after returning from MNP",
+  "3": "Same customer, due to grievance",
+  "4": "Same customer, request from LEA/DoT",
+  "5": "Other customer, other reason",
+};
 
 const TRIGGER_LABELS = {
   first_send: "First report",
@@ -1412,6 +1423,7 @@ const DefaultsEditor = ({ module, def, onSave, saving }) => {
 
   const set = (k, v) => { setDraft((d) => ({ ...d, [k]: v })); setDirty(true); };
   const isMnrl = module === "MNRL";
+  const isReactivated = isMnrl && draft.case_type === "cleared";
   const labels = codeLabels(module, draft.action_type);
   const maxInvestigation = isMnrl ? 250 : 500;
 
@@ -1434,6 +1446,21 @@ const DefaultsEditor = ({ module, def, onSave, saving }) => {
           onChange={(v) => set("action_taken", v)}
           options={Object.entries(labels).map(([c, t]) => ({ value: c, label: `${c} · ${t}` }))} />
       </div>
+
+      {isReactivated && (
+        <div className="mb-3">
+          <SearchableSelect label="Reactivation reason"
+            value={String(draft.reactivation_id || "1")}
+            onChange={(v) => set("reactivation_id", v)}
+            options={Object.entries(REACTIVATION_LABELS).map(([c, t]) => ({
+              value: c, label: `${c} · ${t}`,
+            }))} />
+          <p className="text-xs text-slate-400 mt-1.5">
+            Used only when the reactivation feed did not give a reason for that
+            number — each number's own reason is sent when it has one.
+          </p>
+        </div>
+      )}
 
       <div className="flex flex-col gap-1.5 mb-3">
         <label className="text-xs font-semibold text-slate-500 uppercase tracking-widest">

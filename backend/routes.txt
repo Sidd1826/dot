@@ -470,13 +470,15 @@ def route_master_count():
         date_to = _optional_date(request.args.get("date_to")) or feed_date
         record_status = (request.args.get("record_status") or "all").lower()
 
-        # All three counts every time, independent of the current selection.
-        # Returning only the selected one made "Everything" appear to change
-        # when the user picked "Still open" — it was the same field being
-        # rescoped, which read as the total moving.
+        # All three counts every time, independent of the current selection, and
+        # each from its own query rather than total = active + cleared. The
+        # buckets now share one date predicate so they do partition, but the
+        # total is still measured directly — it is the number the download will
+        # actually produce, and it should never be inferred from the parts.
+        total = ms.count_active(module, feed_date, segment, "all", date_to)
         active = ms.count_active(module, feed_date, segment, "active", date_to)
         cleared = ms.count_active(module, feed_date, segment, "cleared", date_to)
-        selected = {"active": active, "cleared": cleared}.get(record_status, active + cleared)
+        selected = {"active": active, "cleared": cleared}.get(record_status, total)
 
         return jsonify({
             "module": module,
@@ -484,8 +486,8 @@ def route_master_count():
             "date_to": date_to,
             "segment": segment or "All",
             "record_status": record_status,
-            "count": selected,          # what the current selection will download
-            "total": active + cleared,  # fixed
+            "count": selected,   # what the current selection will download
+            "total": total,      # fixed
             "active": active,           # fixed
             "cleared": cleared,         # fixed
             "atr_pending": (

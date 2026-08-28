@@ -1177,23 +1177,20 @@ def _filter_clause(feed_date: Any = None, segment: str | None = None,
     dto = _to_date(date_to) or dfrom
 
     if dfrom:
-        # A number's reporting life is the window first_reported_on ..
-        # last_reported_on, so "was it on the feed during these dates" is a
-        # window OVERLAP, not equality against one endpoint. Testing
-        # last_reported_on alone dropped a number reported on the 10th and again
-        # on the 12th from the 10th's list, which is plainly wrong.
+        # ONE date predicate for every record_status, so the buckets partition:
+        # Everything == Still-open + Cleared, exactly. Using a different
+        # predicate per bucket (reporting window for open, cleared_on for
+        # cleared) meant a number reported on the 6th but cleared on the 20th
+        # landed in "Everything" and in neither of the other two — the download
+        # returned 37 while the page added up to 35.
+        #
+        # A number belongs to a date range if EITHER its reporting window
+        # overlaps the range, OR it cleared inside it. record_status then only
+        # narrows by current state.
         reported_overlap = "(first_reported_on <= %s AND last_reported_on >= %s)"
         cleared_in_range = "(cleared_on BETWEEN %s AND %s)"
-
-        if record_status == "active":
-            clauses.append(reported_overlap)
-            params.extend([dto, dfrom])
-        elif record_status == "cleared":
-            clauses.append(cleared_in_range)
-            params.extend([dfrom, dto])
-        else:
-            clauses.append(f"({reported_overlap} OR {cleared_in_range})")
-            params.extend([dto, dfrom, dfrom, dto])
+        clauses.append(f"({reported_overlap} OR {cleared_in_range})")
+        params.extend([dto, dfrom, dfrom, dto])
 
     if segment and segment.upper() not in ("ALL", ""):
         clauses.append("segment = %s")
