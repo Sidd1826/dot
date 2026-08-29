@@ -174,11 +174,21 @@ def _reported_status_sql(module: str) -> str:
     existing value rather than overwriting it with a blank, so it survives.
     """
     if module == MODULE_FRI:
-        # Blank when genuinely unknown. Never a clearance value, and never a
-        # fabricated default — a guess in an audit column is worse than a gap.
+        # Prefer the stored column; fall back to the raw feed record kept in
+        # payload. Rows corrupted before the fix had 'compliant' written over
+        # fri_status, and the history seed copied that same bad value — so
+        # payload is the only surviving record of what the number was actually
+        # reported as. Clearance words are excluded from both sources, and a
+        # genuinely unknown value stays blank rather than being guessed.
         return (
-            "CASE WHEN lower(COALESCE(fri_status, '')) IN "
-            "('', 'compliant', 'reactivated') THEN NULL ELSE fri_status END"
+            "NULLIF(COALESCE("
+            "  CASE WHEN lower(COALESCE(fri_status, '')) IN ('', 'compliant', 'reactivated')"
+            "       THEN NULL ELSE fri_status END,"
+            "  CASE WHEN lower(COALESCE(payload->>'Status', '')) IN ('', 'compliant', 'reactivated')"
+            "       THEN NULL ELSE payload->>'Status' END,"
+            "  CASE WHEN lower(COALESCE(payload->>'status', '')) IN ('', 'compliant', 'reactivated')"
+            "       THEN NULL ELSE payload->>'status' END"
+            "), '')"
         )
     # Every MNRL report is a disconnection, so the reported status is constant.
     return "'disconnected'"

@@ -143,6 +143,13 @@ MNRL_ACTION_CODES = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
 # feed, not from the defaults. Anything outside 1-6 falls back to 6 (Others)
 # rather than failing the whole number.
 MNRL_DISCONNECTION_REASONS = {"1", "2", "3", "4", "5", "6"}
+
+# Spec table 6.3. Sent on MNRL CLEARED (reactivated) reports only.
+MNRL_REACTIVATION_REASONS = {"1", "2", "3", "4", "5"}
+# reactivation_id is not among the six fields the MNRL ATR spec lists, so it can
+# be suppressed without a code change if C-DOT rejects the extra key.
+MNRL_SEND_REACTIVATION_ID = os.getenv("MNRL_ATR_SEND_REACTIVATION_ID", "1") == "1"
+MNRL_DEFAULT_REACTIVATION_REASON = os.getenv("MNRL_DEFAULT_REACTIVATION_REASON", "1")
 MNRL_DEFAULT_DISCONNECTION_REASON = os.getenv("MNRL_DEFAULT_DISCONNECTION_REASON", "6")
 
 ACTION_TEXT = {
@@ -252,6 +259,11 @@ ATR_SCHEDULER_TICK_SECONDS = int(os.getenv("ATR_SCHEDULER_TICK_SECONDS", "300"))
 # flight while a background job and the scheduler tick are also running. Four
 # was too few: the Reports page alone issues a dozen queries.
 ATR_PG_MAXCONN = int(os.getenv("ATR_PG_MAXCONN", "12"))
+
+# Action codes are a compliance decision, not an operational setting. Locked by
+# default so they cannot be changed from the UI or by anyone calling the API
+# directly. Set ATR_DEFAULTS_LOCKED=0 to allow edits during configuration.
+ATR_DEFAULTS_LOCKED = os.getenv("ATR_DEFAULTS_LOCKED", "1") == "1"
 
 
 # ── RATE LIMITING ────────────────────────────────────────────────────────────
@@ -620,6 +632,12 @@ def get_defaults(module: str, segment: str | None = None,
 def save_defaults(module: str, segment: str, payload: dict,
                   updated_by: str | None = None, case_type: str = CASE_OPEN) -> dict:
     """Upsert one (module, segment, case_type) default set."""
+    if ATR_DEFAULTS_LOCKED:
+        raise PermissionError(
+            "ATR action codes are locked. They are a compliance decision and "
+            "cannot be changed from the application. Set ATR_DEFAULTS_LOCKED=0 "
+            "on the server to allow edits."
+        )
     module = module.upper()
     cfg = spec(module)
     action_taken = str(payload.get("action_taken", "")).strip()
@@ -667,22 +685,33 @@ def save_defaults(module: str, segment: str, payload: dict,
     if not cfg["supports_remarks"]:
         payload = {**payload, "remarks": None}
 
+    reactivation = str(payload.get("reactivation_id") or "").strip() or None
+    if reactivation and reactivation not in MNRL_REACTIVATION_REASONS:
+        raise ValueError(
+            f"reactivation_id '{reactivation}' is not valid. Allowed: "
+            f"{', '.join(sorted(MNRL_REACTIVATION_REASONS))}"
+        )
+    # Only meaningful on an MNRL reactivated report
+    if not (module == "MNRL" and case_type == CASE_CLEARED):
+        reactivation = None
+
     with _cursor() as cur:
         cur.execute(
             """
             INSERT INTO atr_defaults (
                 module, segment, case_type, action_type, action_taken,
                 investigation_details, grievance_received, remarks,
-                total_money_saved, transaction_declined,
+                total_money_saved, transaction_declined, reactivation_id,
                 is_active, updated_by, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (module, segment, case_type) DO UPDATE SET
                 action_type           = EXCLUDED.action_type,
                 action_taken          = EXCLUDED.action_taken,
                 investigation_details = EXCLUDED.investigation_details,
                 grievance_received    = EXCLUDED.grievance_received,
                 remarks               = EXCLUDED.remarks,
+                reactivation_id       = EXCLUDED.reactivation_id,
                 total_money_saved     = EXCLUDED.total_money_saved,
                 transaction_declined  = EXCLUDED.transaction_declined,
                 is_active             = EXCLUDED.is_active,
@@ -694,7 +723,7 @@ def save_defaults(module: str, segment: str, payload: dict,
                 (payload.get("investigation_details") or None),
                 grievance,
                 (payload.get("remarks") or None),
-                money, declined,
+                money, declined, reactivation,
                 bool(payload.get("is_active", True)),
                 updated_by,
             ),
@@ -727,8 +756,26 @@ def _mnrl_reason(row: dict) -> str:
     return raw if raw in MNRL_DISCONNECTION_REASONS else MNRL_DEFAULT_DISCONNECTION_REASON
 
 
+def _mnrl_reactivation_reason(row: dict, defaults: dict) -> str:
+    """reactivation_id for one number.
+
+    The number's OWN value wins: it is a property of why that number came back,
+    captured from the reactivation feed at reconcile time, exactly like
+    disconnectionreason_id. The configured default is only a fallback for rows
+    whose feed did not carry one. Anything outside 1-5 falls back rather than
+    failing the number.
+    """
+    raw = str(row.get("reactivation_id") or "").strip()
+    if raw in MNRL_REACTIVATION_REASONS:
+        return raw
+    configured = str(defaults.get("reactivation_id") or "").strip()
+    if configured in MNRL_REACTIVATION_REASONS:
+        return configured
+    return MNRL_DEFAULT_REACTIVATION_REASON
+
+
 def build_record(row: dict, defaults: dict, date_of_action: str,
-                 module: str = "FRI") -> dict:
+                 module: str = "FRI", case_type: str = "open") -> dict:
     """One atr_data entry, shaped to the module's contract.
 
     Raises ValueError if the row cannot be represented; the caller records that
@@ -753,7 +800,7 @@ def build_record(row: dict, defaults: dict, date_of_action: str,
                 "investigation_details is mandatory for MNRL — set it in the "
                 "ATR defaults for this classification"
             )
-        return {
+        record = {
             "mobile_no": mobile,
             "action_taken": action_taken,
             "investigation_details": str(investigation)[: cfg["max_investigation"]],
@@ -761,6 +808,10 @@ def build_record(row: dict, defaults: dict, date_of_action: str,
             "disconnectionreason_id": _mnrl_reason(row),
             "grievance_received": grievance,
         }
+        # Reactivated numbers additionally carry WHY they came back.
+        if case_type == CASE_CLEARED and MNRL_SEND_REACTIVATION_ID:
+            record["reactivation_id"] = _mnrl_reactivation_reason(row, defaults)
+        return record
 
     # FRI: action_type drives which fields apply
     record = {
@@ -1434,7 +1485,8 @@ def run_atr(
                 } if row.get("atr_state_hash") else None
 
                 try:
-                    record = build_record(row, defaults, date_of_action, module)
+                    record = build_record(row, defaults, date_of_action,
+                                          module, case_type)
                 except ValueError as exc:
                     failed[row["id"]] = ("skipped", str(exc))
                     events.append((
@@ -1587,7 +1639,8 @@ REPORT_COLUMNS: list[str] = [
     "mobile_no", "cust_id", "segment", "case_label", "feed_date", "outcome", "trigger",
     "action_type", "action_taken", "action_description",
     "date_of_action", "grievance_received",
-    "disconnection_reason_id", "disconnection_reason", "investigation_details",
+    "disconnection_reason_id", "disconnection_reason",
+    "reactivation_id", "reactivation_reason", "investigation_details",
     "remarks", "upi_id", "total_money_saved", "transaction_declined",
     "response_code", "response_message", "request_id",
     "attempt_no", "previous_action", "sent_at",
@@ -1608,6 +1661,8 @@ REPORT_LABELS: dict[str, str] = {
     "grievance_received": "Grievance Received",
     "disconnection_reason_id": "Disconnection Reason Code",
     "disconnection_reason": "Disconnection Reason",
+    "reactivation_id": "Reactivation Code",
+    "reactivation_reason": "Reactivation Reason",
     "investigation_details": "Investigation Details",
     "remarks": "Remarks",
     "upi_id": "UPI Id",
@@ -1640,6 +1695,7 @@ def _report_row(event: dict) -> dict:
     action_type = event.get("action_type") or ""
     action_taken = str(event.get("action_taken") or "")
     reason = str(payload.get("disconnectionreason_id") or "")
+    react = str(payload.get("reactivation_id") or "")
 
     prev_action = ""
     if prev.get("action_type"):
@@ -1661,6 +1717,8 @@ def _report_row(event: dict) -> dict:
         "grievance_received": payload.get("grievance_received", ""),
         "disconnection_reason_id": reason,
         "disconnection_reason": DISCONNECTION_REASON_TEXT.get(reason, ""),
+        "reactivation_id": react,
+        "reactivation_reason": REACTIVATION_REASON_TEXT.get(react, ""),
         "investigation_details": payload.get("investigation_details", ""),
         "remarks": payload.get("remarks", ""),
         "upi_id": payload.get("upi_id", ""),

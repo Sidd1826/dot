@@ -28,6 +28,14 @@ AZURE_CONTAINER_FRI = os.environ.get("AZURE_CONTAINER_FRI", "fri-exports")
 AZURE_CONTAINER_MNRL = os.environ.get("AZURE_CONTAINER_MNRL", "mnrl-exports")
 AZURE_CONTAINER_MATCHOFF_OUTPUT = os.environ.get("AZURE_CONTAINER_MATCHOFF_OUTPUT", "matchoff-output")
 
+# Reconciled downloads go to their OWN containers, not alongside the raw feed
+# downloads. Sharing a container meant every reconciled export created a date
+# folder named after the day it was BUILT, and those dates then appeared in the
+# "pick a file to reconcile" dropdown — 29 July offered as a data date because
+# that is when someone pressed download.
+AZURE_CONTAINER_FRI_RECONCILED = os.environ.get("AZURE_CONTAINER_FRI_RECONCILED", "fri-reconciled")
+AZURE_CONTAINER_MNRL_RECONCILED = os.environ.get("AZURE_CONTAINER_MNRL_RECONCILED", "mnrl-reconciled")
+
 PG_DSN = os.environ["AZURE_POSTGRES_DSN"]
 PG_MATCHOFF_TABLE = os.environ.get("PG_MATCHOFF_TABLE", "mobilecleanup")
 PG_MOB_COLUMN = os.environ.get("PG_MOB_COLUMN", "final_mob_num")
@@ -140,6 +148,24 @@ class _pg_cursor:
 
 
 # INTERNAL UTILITIES
+# Reconciled exports built BEFORE they were given their own containers are still
+# sitting in the feed containers. They are recognisable by name, and must be
+# excluded from the "pick a file to reconcile" lists — both the file itself and
+# the date folder it created.
+_RECONCILED_NAME_MARKERS = ("_all_", "_iwpb_", "_noniwpb_", "_master_",
+                            "_active_", "_cleared_")
+
+
+def _is_reconciled_export(file_name: str) -> bool:
+    name = (file_name or "").lower()
+    if not name.startswith(("fri_", "mnrl_")):
+        return False
+    # feed downloads are fri_data_… / mnrl_normal_… / mnrl_reactivated_…
+    if name.startswith(("fri_data_", "mnrl_normal_", "mnrl_reactivated_")):
+        return False
+    return any(m in name for m in _RECONCILED_NAME_MARKERS)
+
+
 def _ensure_container(name: str) -> None:
     try:
         cc = _blob_service().get_container_client(name)
@@ -151,7 +177,11 @@ def _ensure_container(name: str) -> None:
         raise RuntimeError(f"Failed to ensure container '{name}': {e.message}") from e
 
 
-def _get_container_name(module: str) -> str:
+def _get_container_name(module: str, source: str = "feed") -> str:
+    """Feed downloads and reconciled exports live in separate containers."""
+    if source == "reconciled":
+        return (AZURE_CONTAINER_FRI_RECONCILED if module.upper() == "FRI"
+                else AZURE_CONTAINER_MNRL_RECONCILED)
     return AZURE_CONTAINER_FRI if module.upper() == "FRI" else AZURE_CONTAINER_MNRL
 
 
@@ -463,7 +493,8 @@ def list_source_files(container: str, date_folder: str) -> list[str]:
     files = []
     for blob in cc.list_blobs(name_starts_with=prefix):
         fname = blob.name[len(prefix) :]
-        if fname and fname.endswith(".xlsx") and "/" not in fname:
+        if (fname and fname.endswith(".xlsx") and "/" not in fname
+                and not _is_reconciled_export(fname)):
             files.append(fname)
     return sorted(files)
 
@@ -739,7 +770,7 @@ def save_export_metadata(
     export. The two archives are listed separately so the FRI and MNRL tabs
     show only what those tabs produced."""
     row_id = str(uuid.uuid4())
-    container = _get_container_name(module)
+    container = _get_container_name(module, source)
     with _pg_cursor() as cur:
         cur.execute(
             """
@@ -924,7 +955,7 @@ def export_master(
     the next begins.
     """
     module = module.upper()
-    container = _get_container_name(module)
+    container = _get_container_name(module, "reconciled")
 
     total = ms.count_active(module, feed_date, segment, record_status, date_to)
     if total == 0:

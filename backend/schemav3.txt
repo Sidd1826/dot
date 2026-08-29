@@ -1029,6 +1029,43 @@ WHERE h.mobile_no = m.mobile_no
 
 
 -- =============================================================================
+-- v3.8 — RECOVER reported status from the raw feed record
+--
+-- v3.7 restored fri_status from master_history, then blanked anything still
+-- holding a clearance word. But the v3.5 history seed had itself copied
+-- fri_status — so for rows already corrupted at that point, history held
+-- 'compliant' too and there was nothing to restore. Those rows ended up blank.
+--
+-- payload keeps the raw feed record for the report that created the row, and
+-- the cleared upsert preserves it (COALESCE(m.payload, EXCLUDED.payload)), so
+-- it still carries the original status. This recovers from there.
+-- =============================================================================
+
+UPDATE fri_master
+SET fri_status = COALESCE(
+        NULLIF(payload->>'Status', ''),
+        NULLIF(payload->>'status', '')
+    ),
+    updated_at = NOW()
+WHERE COALESCE(fri_status, '') = ''
+  AND payload IS NOT NULL
+  AND lower(COALESCE(payload->>'Status', payload->>'status', '')) NOT IN
+      ('', 'compliant', 'reactivated');
+
+-- Repair the history rows the v3.5 seed populated with a clearance value, so a
+-- future restore has something correct to work from.
+UPDATE master_history h
+SET status_value = m.fri_status
+FROM fri_master m
+WHERE h.module = 'FRI'
+  AND h.event_type = 'reported'
+  AND h.mobile_no = m.mobile_no
+  AND lower(COALESCE(h.status_value, '')) IN ('', 'compliant', 'reactivated')
+  AND COALESCE(m.fri_status, '') <> ''
+  AND lower(m.fri_status) NOT IN ('compliant', 'reactivated');
+
+
+-- =============================================================================
 -- Done. Nothing above is applied unless every statement succeeded.
 -- =============================================================================
 COMMIT;
