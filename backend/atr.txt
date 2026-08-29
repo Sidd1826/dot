@@ -265,6 +265,11 @@ ATR_PG_MAXCONN = int(os.getenv("ATR_PG_MAXCONN", "12"))
 # directly. Set ATR_DEFAULTS_LOCKED=0 to allow edits during configuration.
 ATR_DEFAULTS_LOCKED = os.getenv("ATR_DEFAULTS_LOCKED", "1") == "1"
 
+# The fortnightly cycle is governed the same way: visible to everyone, editable
+# by nobody through the application. Set ATR_SCHEDULE_LOCKED=0 on the server to
+# change the interval, the hour, or to pause it.
+ATR_SCHEDULE_LOCKED = os.getenv("ATR_SCHEDULE_LOCKED", "1") == "1"
+
 
 # ── RATE LIMITING ────────────────────────────────────────────────────────────
 class _RateLimiter:
@@ -1163,7 +1168,18 @@ def run_now(module: str) -> dict:
 def save_schedule(module: str, enabled: bool | None = None,
                   interval_days: int | None = None,
                   run_at_hour: int | None = None,
-                  next_run_at: Any = None) -> dict:
+                  next_run_at: Any = None,
+                  _internal: bool = False) -> dict:
+    """Change the cycle settings.
+
+    Locked by default. `_internal=True` is for the scheduler's own bookkeeping
+    (advancing next_run_at after a run), which must keep working regardless.
+    """
+    if ATR_SCHEDULE_LOCKED and not _internal:
+        raise PermissionError(
+            "The ATR schedule is fixed and cannot be changed from the "
+            "application. Set ATR_SCHEDULE_LOCKED=0 on the server to change it."
+        )
     module = module.upper()
     sets, params = [], []
 

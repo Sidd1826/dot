@@ -91,7 +91,6 @@ const api = {
   fetchNumberHistory: (mob)  => api.get(`/atr/history/${mob}`),
   retryAtr:         (p)      => api.post("/atr/retry", p),
   fetchAtrSchedule: (type)   => api.get(`/atr/schedule?${qs({ type })}`),
-  saveAtrSchedule:  (body)   => api.put("/atr/schedule", body),
   buildAtrReport:   (body)   => api.post("/atr/report", body),
 };
 
@@ -1321,46 +1320,58 @@ const DateRangePicker = ({ from, to, onChange, disabled, days }) => {
 };
 
 // ── Schedule strip ───────────────────────────────────────────────────────────
-const ScheduleStrip = ({ schedule, onSave, saving }) => {
+// ── Schedule strip — read only ───────────────────────────────────────────────
+// The cycle is a compliance-governed setting, not an operational one, so this
+// reports what is configured and offers no way to change it. The interval, hour
+// and enabled flag are locked server-side by ATR_SCHEDULE_LOCKED; a UI that
+// appeared to edit them would only produce a 403.
+const ScheduleStrip = ({ schedule }) => {
   if (!schedule) return null;
   const next = schedule.next_run_at ? new Date(schedule.next_run_at) : null;
   const daysAway = next ? Math.max(0, Math.ceil((next - Date.now()) / 86400000)) : null;
 
+  const Fact = ({ label, value }) => (
+    <div className="flex flex-col">
+      <span className="text-xs text-slate-400 uppercase tracking-widest">{label}</span>
+      <span className="text-sm font-semibold text-slate-700 tabular-nums">{value}</span>
+    </div>
+  );
+
   return (
-    <div className="flex flex-wrap items-center gap-3 px-4 py-3 rounded-xl border border-slate-200 bg-slate-50">
-      <CalendarClock size={15} className={schedule.enabled ? "text-emerald-600" : "text-slate-400"} />
-      <div className="flex-1 min-w-[200px]">
-        <p className="text-sm font-semibold text-slate-700">
-          {schedule.enabled
-            ? `Runs automatically every ${schedule.interval_days} days`
-            : "Automatic sending is paused"}
-        </p>
-        <p className="text-xs text-slate-400 mt-0.5">
-          {schedule.enabled && next
-            ? `Next ${fmtDateTime(schedule.next_run_at)}${daysAway !== null ? ` · in ${daysAway} day${daysAway === 1 ? "" : "s"}` : ""}`
-            : "Reports only go when you press Send"}
-        </p>
+    <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+      <div className="flex flex-wrap items-center gap-x-8 gap-y-3">
+        <div className="flex items-center gap-2.5 flex-1 min-w-[220px]">
+          <CalendarClock size={16}
+            className={schedule.enabled ? "text-emerald-600" : "text-slate-400"} />
+          <div>
+            <p className="text-sm font-semibold text-slate-700">
+              {schedule.enabled
+                ? `Runs automatically every ${schedule.interval_days} days`
+                : "Automatic sending is paused"}
+            </p>
+            <p className="text-xs text-slate-400 mt-0.5">
+              {schedule.enabled && next
+                ? `Next run ${fmtDateTime(schedule.next_run_at)}`
+                  + (daysAway !== null ? ` · in ${daysAway} day${daysAway === 1 ? "" : "s"}` : "")
+                : "Reports only go when you press Send"}
+            </p>
+          </div>
+        </div>
+
+        <Fact label="Every" value={`${schedule.interval_days} days`} />
+        <Fact label="At" value={`${String(schedule.run_at_hour).padStart(2, "0")}:00 IST`} />
+        <Fact label="Last run"
+          value={schedule.last_run_at ? fmtDateTime(schedule.last_run_at) : "—"} />
+        <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
+          schedule.enabled ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"
+        }`}>
+          {schedule.enabled ? "Active" : "Paused"}
+        </span>
       </div>
-      <select value={schedule.interval_days} disabled={saving || !schedule.enabled}
-        onChange={(e) => onSave({ interval_days: Number(e.target.value) })}
-        className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white disabled:opacity-50">
-        {[7, 14, 21, 30].map((d) => <option key={d} value={d}>every {d} days</option>)}
-      </select>
-      <select value={schedule.run_at_hour} disabled={saving || !schedule.enabled}
-        onChange={(e) => onSave({ run_at_hour: Number(e.target.value) })}
-        className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white disabled:opacity-50">
-        {Array.from({ length: 24 }, (_, h) => (
-          <option key={h} value={h}>at {String(h).padStart(2, "0")}:00</option>
-        ))}
-      </select>
-      <button onClick={() => onSave({ enabled: !schedule.enabled })} disabled={saving}
-        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-          schedule.enabled
-            ? "bg-white border border-slate-300 text-slate-600 hover:bg-slate-100"
-            : "bg-emerald-600 text-white hover:bg-emerald-700"
-        } disabled:opacity-40`}>
-        {schedule.enabled ? "Pause" : "Resume"}
-      </button>
+
+      <p className="text-xs text-slate-400 mt-3 pt-3 border-t border-slate-200">
+        This schedule is fixed and cannot be changed from the application.
+      </p>
     </div>
   );
 };
@@ -1436,7 +1447,6 @@ const ATRModule = () => {
   const [lastRun, setLastRun]   = useState(null);
 
   const [schedule, setSchedule]     = useState(null);
-  const [savingSched, setSavingSch] = useState(false);
 
   const [runs, setRuns]         = useState([]);
   const [loadingRuns, setLR]    = useState(true);
@@ -1480,13 +1490,6 @@ const ATRModule = () => {
   useEffect(() => { loadMeta(module); }, [module, loadMeta]);
   useEffect(() => { loadRuns(); }, [loadRuns]);
   useEffect(() => { refreshPreview(); }, [refreshPreview]);
-
-  const handleSaveSchedule = async (patch) => {
-    setSavingSch(true);
-    try { setSchedule((await api.saveAtrSchedule({ type: module, ...patch })).saved); }
-    catch (e) { showAlert("error", e.message); }
-    finally { setSavingSch(false); }
-  };
 
   const handleSend = async () => {
     setStarting(true); setAlert(null); setLastRun(null);
@@ -1636,7 +1639,7 @@ const ATRModule = () => {
       </SectionCard>
 
       {/* ── Schedule ── */}
-      <ScheduleStrip schedule={schedule} onSave={handleSaveSchedule} saving={savingSched} />
+      <ScheduleStrip schedule={schedule} />
 
       {/* ── Log ── */}
       <SectionCard icon={ListChecks} iconBg="bg-slate-600" title="Submission log"

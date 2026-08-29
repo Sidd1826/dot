@@ -882,9 +882,10 @@ def route_atr_schedule():
     try:
         module = request.args.get("type")
         return jsonify({
+            "locked": atr_service.ATR_SCHEDULE_LOCKED,
             "schedule": atr_service.get_schedule(
                 _validate_module(module) if module else None
-            )
+            ),
         })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -894,7 +895,11 @@ def route_atr_schedule():
 
 @routes.route("/atr/schedule", methods=["PUT"])
 def route_atr_schedule_save():
-    """PUT /atr/schedule {type, enabled, interval_days, run_at_hour}"""
+    """PUT /atr/schedule {type, enabled, interval_days, run_at_hour}
+
+    Locked by default (ATR_SCHEDULE_LOCKED). Returns 403 rather than silently
+    accepting a change nobody is supposed to make.
+    """
     req = request.get_json(silent=True) or {}
     try:
         module = _validate_module(req.get("type", "FRI"))
@@ -904,6 +909,8 @@ def route_atr_schedule_save():
             interval_days=req.get("interval_days"),
             run_at_hour=req.get("run_at_hour"),
         )})
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
