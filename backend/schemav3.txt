@@ -1086,11 +1086,20 @@ SET segment = CASE
 WHERE data_type IS NOT NULL
   AND data_type NOT IN ('Normal', 'Reactivated');
 
--- Re-assert the constraint. A database created before it existed would
--- otherwise keep accepting values the application no longer writes.
+-- Widen the constraint rather than re-asserting the narrow one.
+--
+-- This column now serves two flows: the feed exports write a feed type, and
+-- older builds of export_master wrote a classification. Enforcing the narrow
+-- set would break the reconciled download on any environment still running an
+-- earlier build of the application — the schema must not be able to take a
+-- deployment down. The values are normalised above; this simply refuses
+-- genuine nonsense.
 ALTER TABLE export_files DROP CONSTRAINT IF EXISTS export_files_data_type_check;
 ALTER TABLE export_files ADD CONSTRAINT export_files_data_type_check
-    CHECK (data_type IS NULL OR data_type IN ('Normal', 'Reactivated'));
+    CHECK (data_type IS NULL OR data_type IN (
+        'Normal', 'Reactivated',              -- feed exports (the intended use)
+        'IWPB', 'Non-IWPB', 'All segments'    -- accepted from older builds
+    ));
 
 -- Reconciled exports now live in their own containers, so anything already
 -- recorded against a reconciled container is marked as such.
