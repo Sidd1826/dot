@@ -1066,6 +1066,41 @@ WHERE h.module = 'FRI'
 
 
 -- =============================================================================
+-- v3.9 — export_files.data_type holds the FEED type, not the classification
+--
+-- data_type is constrained to 'Normal' / 'Reactivated' / NULL. export_master
+-- was writing the classification there ('All segments', 'IWPB', 'Non-IWPB'),
+-- which violates that CHECK and failed every reconciled download.
+--
+-- The classification has had its own column since v3.2. This moves any values
+-- that landed in the wrong place and makes sure the constraint is in force.
+-- =============================================================================
+
+-- Move a misplaced classification into segment, then clear data_type.
+UPDATE export_files
+SET segment = CASE
+        WHEN data_type IN ('IWPB', 'Non-IWPB') THEN data_type
+        ELSE segment
+    END,
+    data_type = NULL
+WHERE data_type IS NOT NULL
+  AND data_type NOT IN ('Normal', 'Reactivated');
+
+-- Re-assert the constraint. A database created before it existed would
+-- otherwise keep accepting values the application no longer writes.
+ALTER TABLE export_files DROP CONSTRAINT IF EXISTS export_files_data_type_check;
+ALTER TABLE export_files ADD CONSTRAINT export_files_data_type_check
+    CHECK (data_type IS NULL OR data_type IN ('Normal', 'Reactivated'));
+
+-- Reconciled exports now live in their own containers, so anything already
+-- recorded against a reconciled container is marked as such.
+UPDATE export_files
+SET source = 'reconciled'
+WHERE source <> 'reconciled'
+  AND container IN ('fri-reconciled', 'mnrl-reconciled');
+
+
+-- =============================================================================
 -- Done. Nothing above is applied unless every statement succeeded.
 -- =============================================================================
 COMMIT;
