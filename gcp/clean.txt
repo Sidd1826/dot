@@ -1,0 +1,136 @@
+-- =============================================================================
+-- Control-character cleanup for Excel export
+--
+--   psql "$AZURE_POSTGRES_DSN" -v ON_ERROR_STOP=1 -f clean_control_chars.sql
+--
+-- openpyxl refuses \x00-\x08, \x0B, \x0C, \x0E-\x1F. Postgres [[:cntrl:]] also
+-- covers tab/LF/CR and \x7F, which openpyxl tolerates but which still wreck a
+-- spreadsheet cell, so we strip the lot and collapse the gap to one space.
+--
+-- READ THIS FIRST: on mobilecleanup this is a STOPGAP. The INDP pipeline
+-- truncates and reloads that table every day, so tomorrow's 12:30 run brings
+-- the same junk straight back. Only the indp.py insert-side fix is permanent.
+-- Run this to unblock today's export, then deploy the code change.
+-- =============================================================================
+
+
+-- ---------------------------------------------------------------------------
+-- STEP 1 - diagnose. Run this on its own first.
+-- Shows which column is dirty, which rows, and the exact offending byte.
+-- ---------------------------------------------------------------------------
+DO $diag$
+DECLARE
+    r        RECORD;
+    n        BIGINT;
+    sample   TEXT;
+    bytes    TEXT;
+BEGIN
+    RAISE NOTICE '--- columns containing control characters ---';
+    FOR r IN
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name  = 'mobilecleanup'
+          AND data_type IN ('character varying', 'text', 'character')
+        ORDER BY ordinal_position
+    LOOP
+        EXECUTE format(
+            'SELECT count(*) FROM mobilecleanup WHERE %I ~ ''[[:cntrl:]]''',
+            r.column_name
+        ) INTO n;
+
+        IF n > 0 THEN
+            EXECUTE format(
+                'SELECT %1$I, encode(convert_to(%1$I, ''UTF8''), ''hex'')
+                 FROM mobilecleanup WHERE %1$I ~ ''[[:cntrl:]]'' LIMIT 1',
+                r.column_name
+            ) INTO sample, bytes;
+
+            RAISE NOTICE '% : % row(s). sample=% hex=%',
+                rpad(r.column_name, 28), n, sample, bytes;
+        END IF;
+    END LOOP;
+END
+$diag$;
+
+
+-- ---------------------------------------------------------------------------
+-- STEP 2 - clean. Everything below runs in one transaction.
+-- ---------------------------------------------------------------------------
+BEGIN;
+
+DO $clean$
+DECLARE
+    r     RECORD;
+    n     BIGINT;
+    total BIGINT := 0;
+BEGIN
+    FOR r IN
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name  = 'mobilecleanup'
+          AND data_type IN ('character varying', 'text', 'character')
+    LOOP
+        EXECUTE format(
+            'UPDATE mobilecleanup
+                SET %1$I = btrim(
+                        regexp_replace(
+                            regexp_replace(%1$I, ''[[:cntrl:]]'', '' '', ''g''),
+                            ''[ ]+'', '' '', ''g''
+                        )
+                    )
+              WHERE %1$I ~ ''[[:cntrl:]]''',
+            r.column_name
+        );
+        GET DIAGNOSTICS n = ROW_COUNT;
+
+        IF n > 0 THEN
+            RAISE NOTICE 'cleaned % row(s) in %', n, r.column_name;
+            total := total + n;
+        END IF;
+    END LOOP;
+
+    RAISE NOTICE 'total cell updates: %', total;
+END
+$clean$;
+
+COMMIT;
+
+
+-- ---------------------------------------------------------------------------
+-- STEP 3 - verify. Should return zero rows.
+-- ---------------------------------------------------------------------------
+DO $verify$
+DECLARE
+    r RECORD;
+    n BIGINT;
+    remaining BIGINT := 0;
+BEGIN
+    FOR r IN
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name  = 'mobilecleanup'
+          AND data_type IN ('character varying', 'text', 'character')
+    LOOP
+        EXECUTE format(
+            'SELECT count(*) FROM mobilecleanup WHERE %I ~ ''[[:cntrl:]]''',
+            r.column_name
+        ) INTO n;
+        remaining := remaining + n;
+    END LOOP;
+
+    IF remaining = 0 THEN
+        RAISE NOTICE 'OK - no control characters left in mobilecleanup';
+    ELSE
+        RAISE EXCEPTION 'Still % dirty cell(s) - investigate', remaining;
+    END IF;
+END
+$verify$;
+
+
+-- ---------------------------------------------------------------------------
+-- To clean a different table, change 'mobilecleanup' above. fri_master and
+-- mnrl_master carry C-DOT feed data, which is worth checking with STEP 1.
+-- ---------------------------------------------------------------------------
