@@ -1,0 +1,149 @@
+-- =============================================================================
+-- DOT INTELLIGENCE PLATFORM — SCHEMA v4  (authentication + RBAC)
+--
+-- HOW TO RUN
+--     psql "$AZURE_POSTGRES_DSN" -v ON_ERROR_STOP=1 -f schema_v4_rbac.sql
+--
+-- Safe to run repeatedly. Every statement is guarded, and the whole file runs
+-- in ONE transaction: if anything fails, nothing is applied.
+--
+-- This replaces the Dataverse `cr1d9_users` entity from the previous app.
+--   cr1d9_emailid  ->  app_users.email_id
+--   cr1d9_role     ->  app_users.role
+--
+-- BEFORE YOU RUN: edit the seed block at the bottom and put your own address
+-- in. Without at least one Admin row, nobody can sign in — including you.
+-- =============================================================================
+
+BEGIN;
+
+-- =============================================================================
+-- TABLE: app_users
+-- The allow-list. A person with a valid Entra token but no row here is
+-- authenticated but not authorised, and gets the "ask an administrator" screen.
+--
+-- email_id is stored lower-cased and is the natural key. A plain UNIQUE
+-- constraint on it (rather than a UNIQUE index on LOWER(email_id)) keeps the
+-- ON CONFLICT clause in auth.py simple; the CHECK below stops mixed-case rows
+-- sneaking in through psql.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS app_users (
+    id            BIGSERIAL     PRIMARY KEY,
+
+    email_id      VARCHAR(255)  NOT NULL UNIQUE,
+    display_name  VARCHAR(200),
+    role          VARCHAR(20)   NOT NULL,
+
+    is_active     BOOLEAN       NOT NULL DEFAULT TRUE,
+
+    created_by    VARCHAR(255),
+    created_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_by    VARCHAR(255),
+    updated_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- Added separately so re-running against an existing table still applies them.
+ALTER TABLE app_users DROP CONSTRAINT IF EXISTS chk_app_users_role;
+ALTER TABLE app_users ADD  CONSTRAINT chk_app_users_role
+    CHECK (role IN ('Maker', 'Checker', 'Admin'));
+
+ALTER TABLE app_users DROP CONSTRAINT IF EXISTS chk_app_users_email_lower;
+ALTER TABLE app_users ADD  CONSTRAINT chk_app_users_email_lower
+    CHECK (email_id = LOWER(email_id) AND POSITION('@' IN email_id) > 1);
+
+CREATE INDEX IF NOT EXISTS idx_app_users_active ON app_users (is_active, role);
+
+COMMENT ON TABLE  app_users IS
+    'Application allow-list. Replaces the Dataverse cr1d9_users entity.';
+COMMENT ON COLUMN app_users.role IS
+    'Maker = pull feeds and reconcile. Checker = send to C-DOT. Admin = both, plus config and user maintenance.';
+
+
+-- =============================================================================
+-- TABLE: auth_events
+-- Audit trail. Every denial is written, plus every success on a write,
+-- atr_submit or admin permission. Reads are not logged — they would bury the
+-- rows that matter.
+--
+-- No foreign key to app_users on purpose: a denial for somebody who is NOT in
+-- app_users is exactly the row you most want to keep.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS auth_events (
+    id           BIGSERIAL    PRIMARY KEY,
+    occurred_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    email_id     VARCHAR(255),
+    role         VARCHAR(20),
+
+    -- allowed | denied | no_token | bad_token | not_provisioned | inactive
+    -- | user_upsert | user_delete
+    event        VARCHAR(30)  NOT NULL,
+    permission   VARCHAR(30),
+
+    endpoint     VARCHAR(120),
+    method       VARCHAR(10),
+    path         VARCHAR(300),
+    ip           VARCHAR(64),
+    detail       VARCHAR(500)
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_events_time  ON auth_events (occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_auth_events_email ON auth_events (email_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_auth_events_event ON auth_events (event, occurred_at DESC);
+
+
+-- =============================================================================
+-- SEED — EDIT THIS BEFORE RUNNING
+--
+-- Put the address of whoever will administer the platform here. This is the
+-- only bootstrap: after the first sign-in, that person adds everybody else
+-- through the Maintenance screen.
+--
+-- Addresses must be lower case. Add more rows as needed.
+-- =============================================================================
+INSERT INTO app_users (email_id, display_name, role, is_active, created_by)
+VALUES
+    ('siddhant.example@hsbc.co.in', 'Siddhant', 'Admin', TRUE, 'schema_v4_rbac.sql')
+    -- ,('maker.one@hsbc.co.in',   'Maker One',   'Maker',   TRUE, 'schema_v4_rbac.sql')
+    -- ,('checker.one@hsbc.co.in', 'Checker One', 'Checker', TRUE, 'schema_v4_rbac.sql')
+ON CONFLICT (email_id) DO NOTHING;
+
+
+-- =============================================================================
+-- GUARD — refuse to finish without a way in.
+-- =============================================================================
+DO $check$
+DECLARE
+    admins INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO admins FROM app_users WHERE role = 'Admin' AND is_active;
+    IF admins = 0 THEN
+        RAISE EXCEPTION
+            'No active Admin in app_users. Edit the seed block in this file and re-run, '
+            'otherwise nobody will be able to sign in.';
+    END IF;
+END
+$check$;
+
+COMMIT;
+
+
+-- =============================================================================
+-- HANDY QUERIES
+--
+--   Who has access:
+--     SELECT email_id, role, is_active FROM app_users ORDER BY role, email_id;
+--
+--   Recent refusals:
+--     SELECT occurred_at, email_id, event, permission, path
+--       FROM auth_events WHERE event <> 'allowed'
+--      ORDER BY occurred_at DESC LIMIT 50;
+--
+--   Everything sent to C-DOT, and by whom:
+--     SELECT occurred_at, email_id, role, path FROM auth_events
+--      WHERE permission = 'atr_submit' AND event = 'allowed'
+--      ORDER BY occurred_at DESC;
+--
+--   Trim the audit trail (keep two years):
+--     DELETE FROM auth_events WHERE occurred_at < NOW() - INTERVAL '2 years';
+-- =============================================================================

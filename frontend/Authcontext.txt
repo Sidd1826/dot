@@ -1,0 +1,58 @@
+import { createContext, useContext } from "react";
+
+/**
+ * Role and permission context.
+ *
+ * Populated once by App.js from GET /api/me and read anywhere below it.
+ *
+ * This is a CONVENIENCE, not a security boundary. Hiding a button stops an
+ * accidental click; it does not stop anyone who opens the network tab. Every
+ * one of these permissions is enforced again in auth.py before the request
+ * reaches a view function. If the two ever disagree, the server wins.
+ */
+
+export const PERMISSIONS = {
+  READ: "read",
+  WRITE: "write",
+  ATR_SUBMIT: "atr_submit",
+  ADMIN: "admin",
+};
+
+/** Mirrors ROLE_PERMISSIONS in auth.py. Kept only for labelling. */
+export const ROLE_DESCRIPTIONS = {
+  Maker: "Pull feeds, run reconcile and read everything. Cannot send to C-DOT.",
+  Checker: "Review and send action taken reports to C-DOT.",
+  Admin: "Everything, plus configuration and user maintenance.",
+};
+
+const AuthContext = createContext({
+  account: null,
+  email: null,
+  role: null,
+  permissions: [],
+  can: () => false,
+  logout: () => {},
+  refresh: async () => {},
+});
+
+export const AuthProvider = AuthContext.Provider;
+
+export function useAuth() {
+  return useContext(AuthContext);
+}
+
+/**
+ * Renders children only when the current role holds the permission.
+ * Pass `fallback` to show something instead — a disabled control, or a note
+ * explaining who can do this.
+ *
+ *   <Gate permission={PERMISSIONS.ATR_SUBMIT}>
+ *     <PrimaryBtn onClick={handleSend} ... />
+ *   </Gate>
+ */
+export function Gate({ permission, children, fallback = null }) {
+  const { can } = useAuth();
+  return can(permission) ? children : fallback;
+}
+
+export default AuthContext;

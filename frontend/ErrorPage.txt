@@ -1,0 +1,70 @@
+import { ShieldAlert, RefreshCw, LogOut } from "lucide-react";
+
+/**
+ * Shown when sign-in worked but access did not.
+ *
+ * The message deliberately separates the two: people who are told only
+ * "access denied" raise a password ticket. Telling them their sign-in was fine
+ * and the missing piece is an app_users row sends them to the right person.
+ */
+export default function ErrorPage({
+  title = "Something went wrong",
+  message = "We could not load the application. Try again, or contact the platform team.",
+  onRetry,
+  onSignOut,
+}) {
+  return (
+    <div className="min-h-screen bg-slate-50 flex items-center justify-center px-6">
+      <div className="w-full max-w-lg bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+        <div className="px-8 pt-8 pb-6">
+          <div className="flex items-center gap-3 mb-6">
+            <img
+              src="/HSBC_MASTERBRAND_LOGO_RGB.png"
+              alt="HSBC"
+              style={{ height: 36 }}
+            />
+            <div className="h-6 w-px bg-slate-200" />
+            <span className="text-sm font-semibold text-slate-600 tracking-wide">
+              DOT Intelligence Platform
+            </span>
+          </div>
+
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 h-9 w-9 shrink-0 rounded-xl bg-amber-50 flex items-center justify-center">
+              <ShieldAlert size={18} className="text-amber-600" />
+            </div>
+            <div>
+              <h1 className="text-lg font-semibold text-slate-800">{title}</h1>
+              <p className="text-sm text-slate-500 mt-1.5 leading-relaxed">
+                {message}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {(onRetry || onSignOut) && (
+          <div className="px-8 py-4 bg-slate-50 border-t border-slate-200 flex gap-3">
+            {onRetry && (
+              <button
+                onClick={onRetry}
+                className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold
+                  border border-slate-300 text-slate-700 bg-white hover:bg-slate-100 transition-all"
+              >
+                <RefreshCw size={14} /> Try again
+              </button>
+            )}
+            {onSignOut && (
+              <button
+                onClick={onSignOut}
+                className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold
+                  text-slate-500 hover:text-slate-700 transition-all"
+              >
+                <LogOut size={14} /> Sign in as someone else
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

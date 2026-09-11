@@ -1,0 +1,17 @@
+import { Loader2 } from "lucide-react";
+
+/** Full-screen spinner. Matches the slate palette used across HomeScreen. */
+export default function Loader({ label = "Loading…" }) {
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center gap-4">
+      <img
+        src="/HSBC_MASTERBRAND_LOGO_RGB.png"
+        alt="HSBC"
+        style={{ height: 40 }}
+        className="opacity-80"
+      />
+      <Loader2 size={26} className="animate-spin text-slate-400" />
+      <p className="text-sm text-slate-500">{label}</p>
+    </div>
+  );
+}

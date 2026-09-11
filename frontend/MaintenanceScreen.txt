@@ -1,0 +1,334 @@
+import { useCallback, useEffect, useState } from "react";
+import {
+  Users, UserPlus, Trash2, Check, X, Loader2, AlertCircle, ArrowLeft,
+} from "lucide-react";
+import { useNavigate } from "react-router-dom";
+
+import { authedFetch } from "../apiClient";
+import { useAuth, ROLE_DESCRIPTIONS } from "../AuthContext";
+
+const BASE_URL =
+  process.env.REACT_APP_ENV === "UAT"
+    ? process.env.REACT_APP_BASE_URL_UAT
+    : process.env.REACT_APP_BASE_URL_DEV;
+
+const ROLES = ["Maker", "Checker", "Admin"];
+
+const ROLE_TONE = {
+  Maker: "bg-blue-50 text-blue-700 border-blue-200",
+  Checker: "bg-amber-50 text-amber-700 border-amber-200",
+  Admin: "bg-violet-50 text-violet-700 border-violet-200",
+};
+
+export default function MaintenanceScreen() {
+  const { email: myEmail } = useAuth();
+  const navigate = useNavigate();
+
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [alert, setAlert] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  const [draft, setDraft] = useState({
+    email_id: "",
+    display_name: "",
+    role: "Maker",
+  });
+
+  const show = (tone, message) => {
+    setAlert({ tone, message });
+    setTimeout(() => setAlert(null), 6000);
+  };
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      setRows(await authedFetch(`${BASE_URL}/admin/users`));
+    } catch (e) {
+      show("error", e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const upsert = async (payload, successMessage) => {
+    setSaving(true);
+    try {
+      await authedFetch(`${BASE_URL}/admin/users`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      await load();
+      show("success", successMessage);
+      return true;
+    } catch (e) {
+      show("error", e.message);
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleAdd = async () => {
+    const email = draft.email_id.trim().toLowerCase();
+    if (!email.includes("@")) {
+      show("error", "Enter a valid email address.");
+      return;
+    }
+    const ok = await upsert(
+      { ...draft, email_id: email, is_active: true },
+      `${email} can now sign in as ${draft.role}.`
+    );
+    if (ok) setDraft({ email_id: "", display_name: "", role: "Maker" });
+  };
+
+  const handleRoleChange = (user, role) =>
+    upsert(
+      { email_id: user.email_id, display_name: user.display_name, role, is_active: user.is_active },
+      `${user.email_id} is now a ${role}.`
+    );
+
+  const handleToggleActive = (user) =>
+    upsert(
+      {
+        email_id: user.email_id,
+        display_name: user.display_name,
+        role: user.role,
+        is_active: !user.is_active,
+      },
+      user.is_active
+        ? `${user.email_id} has been deactivated.`
+        : `${user.email_id} has been reactivated.`
+    );
+
+  const handleDelete = async (user) => {
+    if (
+      !window.confirm(
+        `Remove ${user.email_id} completely?\n\nThey will lose access immediately. ` +
+          `Deactivating instead keeps the record for audit.`
+      )
+    )
+      return;
+    setSaving(true);
+    try {
+      await authedFetch(
+        `${BASE_URL}/admin/users/${encodeURIComponent(user.email_id)}`,
+        { method: "DELETE" }
+      );
+      await load();
+      show("success", `${user.email_id} removed.`);
+    } catch (e) {
+      show("error", e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
+        <div className="max-w-5xl mx-auto flex items-center justify-between h-16 px-6">
+          <div className="flex items-center gap-3">
+            <img src="/HSBC_MASTERBRAND_LOGO_RGB.png" alt="HSBC" style={{ height: 44 }} />
+            <div className="h-7 w-px bg-slate-200" />
+            <span className="text-sm font-semibold text-slate-600 tracking-wide">
+              User maintenance
+            </span>
+          </div>
+          <button
+            onClick={() => navigate("/")}
+            className="flex items-center gap-2 text-sm font-semibold text-slate-500 hover:text-slate-700"
+          >
+            <ArrowLeft size={15} /> Back to platform
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto px-6 py-8 space-y-6">
+        {alert && (
+          <div
+            className={`flex items-start gap-2 px-4 py-3 rounded-xl border text-sm ${
+              alert.tone === "error"
+                ? "bg-rose-50 border-rose-200 text-rose-700"
+                : "bg-emerald-50 border-emerald-200 text-emerald-700"
+            }`}
+          >
+            <AlertCircle size={16} className="mt-0.5 shrink-0" />
+            <span>{alert.message}</span>
+            <button onClick={() => setAlert(null)} className="ml-auto opacity-60">
+              <X size={15} />
+            </button>
+          </div>
+        )}
+
+        {/* ── add ── */}
+        <section className="bg-white rounded-2xl border border-slate-200 shadow-sm">
+          <div className="flex items-center gap-3 px-6 py-4 border-b border-slate-200">
+            <div className="h-9 w-9 rounded-xl bg-blue-700 flex items-center justify-center">
+              <UserPlus size={17} className="text-white" />
+            </div>
+            <div>
+              <h2 className="text-sm font-semibold text-slate-800">Add someone</h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Use the exact address they sign in with.
+              </p>
+            </div>
+          </div>
+
+          <div className="p-6 grid grid-cols-1 md:grid-cols-4 gap-3">
+            <input
+              value={draft.email_id}
+              onChange={(e) => setDraft({ ...draft, email_id: e.target.value })}
+              placeholder="name@hsbc.co.in"
+              className="md:col-span-2 px-3 py-2.5 rounded-xl border border-slate-300 text-sm
+                focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+            />
+            <input
+              value={draft.display_name}
+              onChange={(e) => setDraft({ ...draft, display_name: e.target.value })}
+              placeholder="Display name (optional)"
+              className="px-3 py-2.5 rounded-xl border border-slate-300 text-sm
+                focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+            />
+            <select
+              value={draft.role}
+              onChange={(e) => setDraft({ ...draft, role: e.target.value })}
+              className="px-3 py-2.5 rounded-xl border border-slate-300 text-sm bg-white
+                focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+            >
+              {ROLES.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+
+            <div className="md:col-span-4 flex items-center justify-between gap-4">
+              <p className="text-xs text-slate-400">
+                {ROLE_DESCRIPTIONS[draft.role]}
+              </p>
+              <button
+                onClick={handleAdd}
+                disabled={saving}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold
+                  text-white transition-all hover:opacity-90 disabled:opacity-40"
+                style={{ background: "linear-gradient(135deg, #1d4ed8, #1e3a8a)" }}
+              >
+                {saving ? <Loader2 size={15} className="animate-spin" /> : <UserPlus size={15} />}
+                Add
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {/* ── list ── */}
+        <section className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div className="flex items-center gap-3 px-6 py-4 border-b border-slate-200">
+            <div className="h-9 w-9 rounded-xl bg-slate-700 flex items-center justify-center">
+              <Users size={17} className="text-white" />
+            </div>
+            <h2 className="text-sm font-semibold text-slate-800">
+              Who has access{" "}
+              <span className="font-normal text-slate-400">({rows.length})</span>
+            </h2>
+          </div>
+
+          {loading ? (
+            <div className="py-16 flex justify-center">
+              <Loader2 size={22} className="animate-spin text-slate-300" />
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-400">
+                <tr>
+                  <th className="px-6 py-3 font-semibold">Email</th>
+                  <th className="px-4 py-3 font-semibold">Name</th>
+                  <th className="px-4 py-3 font-semibold">Role</th>
+                  <th className="px-4 py-3 font-semibold">Status</th>
+                  <th className="px-6 py-3" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {rows.map((u) => {
+                  const isMe = u.email_id === (myEmail || "").toLowerCase();
+                  return (
+                    <tr key={u.email_id} className={u.is_active ? "" : "bg-slate-50/60"}>
+                      <td className="px-6 py-3 text-slate-700">
+                        {u.email_id}
+                        {isMe && (
+                          <span className="ml-2 text-xs text-slate-400">(you)</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-slate-500">{u.display_name || "—"}</td>
+                      <td className="px-4 py-3">
+                        <select
+                          value={u.role}
+                          disabled={isMe || saving}
+                          onChange={(e) => handleRoleChange(u, e.target.value)}
+                          className={`px-2.5 py-1 rounded-lg border text-xs font-semibold
+                            disabled:opacity-60 disabled:cursor-not-allowed ${ROLE_TONE[u.role]}`}
+                        >
+                          {ROLES.map((r) => (
+                            <option key={r} value={r}>
+                              {r}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="px-4 py-3">
+                        <button
+                          onClick={() => handleToggleActive(u)}
+                          disabled={isMe || saving}
+                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs
+                            font-semibold border transition-all disabled:opacity-60
+                            disabled:cursor-not-allowed ${
+                              u.is_active
+                                ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                                : "bg-slate-100 text-slate-500 border-slate-200"
+                            }`}
+                        >
+                          {u.is_active ? <Check size={12} /> : <X size={12} />}
+                          {u.is_active ? "Active" : "Inactive"}
+                        </button>
+                      </td>
+                      <td className="px-6 py-3 text-right">
+                        <button
+                          onClick={() => handleDelete(u)}
+                          disabled={isMe || saving}
+                          title="Remove completely"
+                          className="text-slate-300 hover:text-rose-600 transition-colors
+                            disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {rows.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="px-6 py-12 text-center text-slate-400">
+                      Nobody has been added yet.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          )}
+
+          <div className="px-6 py-3 border-t border-slate-200 bg-slate-50">
+            <p className="text-xs text-slate-400">
+              Changes take effect within five minutes, or immediately on the next
+              sign-in. Deactivating keeps the record for audit; removing does not.
+              You cannot change your own role — ask another Admin.
+            </p>
+          </div>
+        </section>
+      </main>
+    </div>
+  );
+}

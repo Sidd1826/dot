@@ -1,10 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { getAccessToken, handleUnauthorized } from "../apiClient";
+import { useAuth, Gate, PERMISSIONS } from "../AuthContext";
+import { Link } from "react-router-dom";
 import {
   Info, Database, FileSpreadsheet, Download, RefreshCw,
   CheckCircle, AlertCircle, X, Calendar, Loader2,
   Cloud, HardDrive, Shield, Upload, BarChart3, Clock,
   GitMerge, ChevronDown, ArrowRight, Search, Send,
   Users, Filter, ListChecks, RotateCcw, CalendarClock,
+  LogOut, Settings, Lock,
 } from "lucide-react";
 
 // ─────────────────────────────────────────────
@@ -44,10 +48,26 @@ const qs = (obj) =>
 
 const api = {
   async request(path, options = {}) {
+    const token = await getAccessToken();
+
+    // Note the ordering: options is spread FIRST, then headers. The original
+    // spread options last, which meant any call passing its own headers threw
+    // away Content-Type. Nothing did, but it would have bitten eventually —
+    // and it would definitely bite now that Authorization lives here.
     const res = await fetch(`${BASE_URL}${path}`, {
-      headers: { "Content-Type": "application/json" },
       ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(options.headers || {}),
+      },
     });
+
+    if (res.status === 401) {
+      handleUnauthorized();
+      throw new Error("Your session expired. Sign in again.");
+    }
+
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || `Request failed: ${res.status}`);
@@ -91,7 +111,6 @@ const api = {
   fetchNumberHistory: (mob)  => api.get(`/atr/history/${mob}`),
   retryAtr:         (p)      => api.post("/atr/retry", p),
   fetchAtrSchedule: (type)   => api.get(`/atr/schedule?${qs({ type })}`),
-  saveAtrSchedule:  (body)   => api.put("/atr/schedule", body),
   buildAtrReport:   (body)   => api.post("/atr/report", body),
 };
 
@@ -252,6 +271,23 @@ const PrimaryBtn = ({ onClick, loading, disabled, label, Icon = Upload, gradient
     }}>
     {loading ? <><Loader2 size={16} className="animate-spin" /> Working…</> : <><Icon size={16} /> {label}</>}
   </button>
+);
+
+/**
+ * Shown in place of an action the current role cannot perform. Saying who CAN
+ * do it beats a greyed-out button with no explanation — people otherwise
+ * assume the page is broken and raise a ticket.
+ */
+const NoPermission = ({ action, who, note }) => (
+  <div className="flex items-start gap-3 px-4 py-3.5 rounded-xl border border-slate-200 bg-slate-50">
+    <Lock size={15} className="text-slate-400 mt-0.5 shrink-0" />
+    <div>
+      <p className="text-sm text-slate-600">
+        Your role cannot {action}. Ask {who} to do it.
+      </p>
+      {note && <p className="text-xs text-slate-400 mt-1 leading-relaxed">{note}</p>}
+    </div>
+  </div>
 );
 
 const StatChip = ({ label, value, tone = "slate" }) => {
@@ -571,8 +607,11 @@ const FRIModule = () => {
             <div className="flex items-center gap-2 text-slate-400 text-xs font-medium"><Shield size={14} /> Time-limited download links</div>
           </div>
         </div>
-        <PrimaryBtn onClick={handleDownload} loading={starting}
-          disabled={count === 0 || starting || !!jobId} label="Download FRI data" />
+        <Gate permission={PERMISSIONS.WRITE}
+          fallback={<NoPermission action="pull the FRI feed" who="a Maker" />}>
+          <PrimaryBtn onClick={handleDownload} loading={starting}
+            disabled={count === 0 || starting || !!jobId} label="Download FRI data" />
+        </Gate>
         {jobId && <RunningBanner title="Downloading and saving…" subtitle="Running in the background" />}
         {alert && <Alert {...alert} onClose={() => setAlert(null)} />}
       </SectionCard>
@@ -670,20 +709,23 @@ const MNRLModule = () => {
           <CountBadge label="Normal" count={normalCount} color="teal" />
           <CountBadge label="Reactivated" count={reactCount} color="violet" />
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div>
-            <PrimaryBtn onClick={() => start("Normal")} loading={startingN}
-              disabled={normalCount === 0 || busy}
-              gradient="linear-gradient(135deg, #0d9488, #0891b2)" label="Download normal" />
-            {jobNormal && <RunningBanner title="Downloading normal list…" subtitle="Running in the background" />}
+        <Gate permission={PERMISSIONS.WRITE}
+          fallback={<NoPermission action="pull the MNRL feed" who="a Maker" />}>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <PrimaryBtn onClick={() => start("Normal")} loading={startingN}
+                disabled={normalCount === 0 || busy}
+                gradient="linear-gradient(135deg, #0d9488, #0891b2)" label="Download normal" />
+              {jobNormal && <RunningBanner title="Downloading normal list…" subtitle="Running in the background" />}
+            </div>
+            <div>
+              <PrimaryBtn onClick={() => start("Reactivated")} loading={startingR}
+                disabled={reactCount === 0 || busy}
+                gradient="linear-gradient(135deg, #7c3aed, #6d28d9)" label="Download reactivated" />
+              {jobReact && <RunningBanner title="Downloading reactivated list…" subtitle="Running in the background" />}
+            </div>
           </div>
-          <div>
-            <PrimaryBtn onClick={() => start("Reactivated")} loading={startingR}
-              disabled={reactCount === 0 || busy}
-              gradient="linear-gradient(135deg, #7c3aed, #6d28d9)" label="Download reactivated" />
-            {jobReact && <RunningBanner title="Downloading reactivated list…" subtitle="Running in the background" />}
-          </div>
-        </div>
+        </Gate>
         {alert && <Alert {...alert} onClose={() => setAlert(null)} />}
       </SectionCard>
 
@@ -982,9 +1024,12 @@ const ReconcileModule = () => {
           </div>
         )}
 
-        <PrimaryBtn onClick={handleReconcile} loading={startingRun} Icon={GitMerge}
-          disabled={!srcFile || reconciling}
-          gradient="linear-gradient(135deg, #4f46e5, #6d28d9)" label="Reconcile into master" />
+        <Gate permission={PERMISSIONS.WRITE}
+          fallback={<NoPermission action="run a reconciliation" who="a Maker" />}>
+          <PrimaryBtn onClick={handleReconcile} loading={startingRun} Icon={GitMerge}
+            disabled={!srcFile || reconciling}
+            gradient="linear-gradient(135deg, #4f46e5, #6d28d9)" label="Reconcile into master" />
+        </Gate>
 
         {runJob && <RunningBanner tone="indigo" title="Matching against HSBC data…"
           subtitle="Writing reconciled numbers to the master table" />}
@@ -1321,46 +1366,58 @@ const DateRangePicker = ({ from, to, onChange, disabled, days }) => {
 };
 
 // ── Schedule strip ───────────────────────────────────────────────────────────
-const ScheduleStrip = ({ schedule, onSave, saving }) => {
+// ── Schedule strip — read only ───────────────────────────────────────────────
+// The cycle is a compliance-governed setting, not an operational one, so this
+// reports what is configured and offers no way to change it. The interval, hour
+// and enabled flag are locked server-side by ATR_SCHEDULE_LOCKED; a UI that
+// appeared to edit them would only produce a 403.
+const ScheduleStrip = ({ schedule }) => {
   if (!schedule) return null;
   const next = schedule.next_run_at ? new Date(schedule.next_run_at) : null;
   const daysAway = next ? Math.max(0, Math.ceil((next - Date.now()) / 86400000)) : null;
 
+  const Fact = ({ label, value }) => (
+    <div className="flex flex-col">
+      <span className="text-xs text-slate-400 uppercase tracking-widest">{label}</span>
+      <span className="text-sm font-semibold text-slate-700 tabular-nums">{value}</span>
+    </div>
+  );
+
   return (
-    <div className="flex flex-wrap items-center gap-3 px-4 py-3 rounded-xl border border-slate-200 bg-slate-50">
-      <CalendarClock size={15} className={schedule.enabled ? "text-emerald-600" : "text-slate-400"} />
-      <div className="flex-1 min-w-[200px]">
-        <p className="text-sm font-semibold text-slate-700">
-          {schedule.enabled
-            ? `Runs automatically every ${schedule.interval_days} days`
-            : "Automatic sending is paused"}
-        </p>
-        <p className="text-xs text-slate-400 mt-0.5">
-          {schedule.enabled && next
-            ? `Next ${fmtDateTime(schedule.next_run_at)}${daysAway !== null ? ` · in ${daysAway} day${daysAway === 1 ? "" : "s"}` : ""}`
-            : "Reports only go when you press Send"}
-        </p>
+    <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+      <div className="flex flex-wrap items-center gap-x-8 gap-y-3">
+        <div className="flex items-center gap-2.5 flex-1 min-w-[220px]">
+          <CalendarClock size={16}
+            className={schedule.enabled ? "text-emerald-600" : "text-slate-400"} />
+          <div>
+            <p className="text-sm font-semibold text-slate-700">
+              {schedule.enabled
+                ? `Runs automatically every ${schedule.interval_days} days`
+                : "Automatic sending is paused"}
+            </p>
+            <p className="text-xs text-slate-400 mt-0.5">
+              {schedule.enabled && next
+                ? `Next run ${fmtDateTime(schedule.next_run_at)}`
+                  + (daysAway !== null ? ` · in ${daysAway} day${daysAway === 1 ? "" : "s"}` : "")
+                : "Reports only go when you press Send"}
+            </p>
+          </div>
+        </div>
+
+        <Fact label="Every" value={`${schedule.interval_days} days`} />
+        <Fact label="At" value={`${String(schedule.run_at_hour).padStart(2, "0")}:00 IST`} />
+        <Fact label="Last run"
+          value={schedule.last_run_at ? fmtDateTime(schedule.last_run_at) : "—"} />
+        <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
+          schedule.enabled ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"
+        }`}>
+          {schedule.enabled ? "Active" : "Paused"}
+        </span>
       </div>
-      <select value={schedule.interval_days} disabled={saving || !schedule.enabled}
-        onChange={(e) => onSave({ interval_days: Number(e.target.value) })}
-        className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white disabled:opacity-50">
-        {[7, 14, 21, 30].map((d) => <option key={d} value={d}>every {d} days</option>)}
-      </select>
-      <select value={schedule.run_at_hour} disabled={saving || !schedule.enabled}
-        onChange={(e) => onSave({ run_at_hour: Number(e.target.value) })}
-        className="px-2 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 bg-white disabled:opacity-50">
-        {Array.from({ length: 24 }, (_, h) => (
-          <option key={h} value={h}>at {String(h).padStart(2, "0")}:00</option>
-        ))}
-      </select>
-      <button onClick={() => onSave({ enabled: !schedule.enabled })} disabled={saving}
-        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-          schedule.enabled
-            ? "bg-white border border-slate-300 text-slate-600 hover:bg-slate-100"
-            : "bg-emerald-600 text-white hover:bg-emerald-700"
-        } disabled:opacity-40`}>
-        {schedule.enabled ? "Pause" : "Resume"}
-      </button>
+
+      <p className="text-xs text-slate-400 mt-3 pt-3 border-t border-slate-200">
+        This schedule is fixed and cannot be changed from the application.
+      </p>
     </div>
   );
 };
@@ -1436,7 +1493,6 @@ const ATRModule = () => {
   const [lastRun, setLastRun]   = useState(null);
 
   const [schedule, setSchedule]     = useState(null);
-  const [savingSched, setSavingSch] = useState(false);
 
   const [runs, setRuns]         = useState([]);
   const [loadingRuns, setLR]    = useState(true);
@@ -1480,13 +1536,6 @@ const ATRModule = () => {
   useEffect(() => { loadMeta(module); }, [module, loadMeta]);
   useEffect(() => { loadRuns(); }, [loadRuns]);
   useEffect(() => { refreshPreview(); }, [refreshPreview]);
-
-  const handleSaveSchedule = async (patch) => {
-    setSavingSch(true);
-    try { setSchedule((await api.saveAtrSchedule({ type: module, ...patch })).saved); }
-    catch (e) { showAlert("error", e.message); }
-    finally { setSavingSch(false); }
-  };
 
   const handleSend = async () => {
     setStarting(true); setAlert(null); setLastRun(null);
@@ -1605,20 +1654,28 @@ const ATRModule = () => {
           <span className="text-3xl font-bold tabular-nums">{fmt(total)}</span>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <button onClick={handleRetry} disabled={running}
-            className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold
-              border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 transition-all
-              disabled:opacity-40 disabled:cursor-not-allowed">
-            <RotateCcw size={15} /> Requeue rejected
-          </button>
-          <div className="md:col-span-2">
-            <PrimaryBtn onClick={handleSend} loading={starting} Icon={Send}
-              disabled={running || !total}
-              gradient="linear-gradient(135deg, #d97706, #b45309)"
-              label={total ? `Send ${fmt(total)} reports` : "Nothing to send"} />
+        <Gate permission={PERMISSIONS.ATR_SUBMIT}
+          fallback={
+            <NoPermission
+              action="send action taken reports to C-DOT"
+              who="a Checker"
+              note="Submissions cannot be withdrawn, so this step is deliberately separate from everything else you can do here." />
+          }>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <button onClick={handleRetry} disabled={running}
+              className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold
+                border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 transition-all
+                disabled:opacity-40 disabled:cursor-not-allowed">
+              <RotateCcw size={15} /> Requeue rejected
+            </button>
+            <div className="md:col-span-2">
+              <PrimaryBtn onClick={handleSend} loading={starting} Icon={Send}
+                disabled={running || !total}
+                gradient="linear-gradient(135deg, #d97706, #b45309)"
+                label={total ? `Send ${fmt(total)} reports` : "Nothing to send"} />
+            </div>
           </div>
-        </div>
+        </Gate>
 
         {jobId && <RunningBanner tone="amber" title="Sending to C-DOT…"
           subtitle="Encrypted batches; every attempt is logged per number" />}
@@ -1636,7 +1693,7 @@ const ATRModule = () => {
       </SectionCard>
 
       {/* ── Schedule ── */}
-      <ScheduleStrip schedule={schedule} onSave={handleSaveSchedule} saving={savingSched} />
+      <ScheduleStrip schedule={schedule} />
 
       {/* ── Log ── */}
       <SectionCard icon={ListChecks} iconBg="bg-slate-600" title="Submission log"
@@ -1822,27 +1879,59 @@ const TABS = [
   { key: "ATR",       label: "Reports" },
 ];
 
-const Header = ({ active, setActive }) => (
-  <header className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
-    <div className="max-w-6xl mx-auto flex items-center justify-between h-16 px-6">
-      <div className="flex items-center gap-3">
-        <img src="/HSBC_MASTERBRAND_LOGO_RGB.png" alt="HSBC" style={{ height: 44 }} />
-        <div className="h-7 w-px bg-slate-200" />
-        <span className="text-sm font-semibold text-slate-600 tracking-wide">DOT Intelligence Platform</span>
-      </div>
-      <nav className="flex gap-1 bg-slate-100 rounded-xl p-1">
-        {TABS.map(({ key, label }) => (
-          <button key={key} onClick={() => setActive(key)}
-            className={`px-5 py-1.5 rounded-lg text-sm font-semibold transition-all ${
-              active === key ? "bg-white shadow-sm text-blue-700" : "text-slate-500 hover:text-slate-700"
-            }`}>
-            {label}
+const ROLE_TONE = {
+  Maker:   "bg-blue-50 text-blue-700 border-blue-200",
+  Checker: "bg-amber-50 text-amber-700 border-amber-200",
+  Admin:   "bg-violet-50 text-violet-700 border-violet-200",
+};
+
+const Header = ({ active, setActive }) => {
+  const { name, email, role, can, logout } = useAuth();
+
+  return (
+    <header className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
+      <div className="max-w-6xl mx-auto flex items-center justify-between h-16 px-6">
+        <div className="flex items-center gap-3">
+          <img src="/HSBC_MASTERBRAND_LOGO_RGB.png" alt="HSBC" style={{ height: 44 }} />
+          <div className="h-7 w-px bg-slate-200" />
+          <span className="text-sm font-semibold text-slate-600 tracking-wide">DOT Intelligence Platform</span>
+        </div>
+
+        <nav className="flex gap-1 bg-slate-100 rounded-xl p-1">
+          {TABS.map(({ key, label }) => (
+            <button key={key} onClick={() => setActive(key)}
+              className={`px-5 py-1.5 rounded-lg text-sm font-semibold transition-all ${
+                active === key ? "bg-white shadow-sm text-blue-700" : "text-slate-500 hover:text-slate-700"
+              }`}>
+              {label}
+            </button>
+          ))}
+        </nav>
+
+        <div className="flex items-center gap-3">
+          <div className="text-right leading-tight hidden sm:block">
+            <p className="text-sm font-semibold text-slate-700">{name || email}</p>
+            <span className={`inline-block mt-0.5 px-2 py-0.5 rounded-md border text-[11px] font-semibold ${ROLE_TONE[role] || "bg-slate-50 text-slate-500 border-slate-200"}`}>
+              {role}
+            </span>
+          </div>
+
+          {can(PERMISSIONS.ADMIN) && (
+            <Link to="/maintenance" title="User maintenance"
+              className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-all">
+              <Settings size={17} />
+            </Link>
+          )}
+
+          <button onClick={logout} title="Sign out"
+            className="p-2 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-slate-100 transition-all">
+            <LogOut size={17} />
           </button>
-        ))}
-      </nav>
-    </div>
-  </header>
-);
+        </div>
+      </div>
+    </header>
+  );
+};
 
 export default function HomeScreen() {
   const [active, setActive] = useState("FRI");

@@ -1,0 +1,734 @@
+"""
+Authentication + role-based access control for the DOT Intelligence Platform.
+
+WHAT THIS DOES
+    1. Verifies the Microsoft Entra ID (Azure AD) token on every /api/* request.
+    2. Resolves the caller's email FROM THE SIGNED TOKEN — never from the body,
+       the query string or the URL path.
+    3. Looks that email up in the `app_users` table in Azure PostgreSQL
+       (this replaces the Dataverse `cr1d9_users` entity in the old app).
+    4. Maps the row's role to a permission set and checks it against the
+       permission the endpoint requires.
+    5. Writes an audit row to `auth_events` for every denial and every
+       sensitive success.
+
+WHY THE LOOKUP IS NOT DRIVEN BY THE URL
+    The old app called GET /api/user/<email_id> and trusted whatever came back.
+    That is fine as a convenience for the UI, but it cannot be the security
+    boundary: anyone can type a different address into that URL. Here the URL
+    form is kept so the React code stays familiar, but the server only answers
+    for the email inside the token (or for anybody, if the caller is an Admin).
+
+NOT A SINGLE APPLICATION ROUTE CHANGES.
+    The guard is installed with `before_request` at the app level and keys off
+    the view function name, so routes.py is untouched.
+
+ENV VARS
+    AAD_TENANT_ID            required — your Entra tenant GUID
+    AAD_CLIENT_ID            required — the SPA app registration client id
+    AAD_ALLOWED_AUDIENCES    optional — comma separated. Defaults to
+                             "<client_id>,api://<client_id>", which accepts both
+                             an ID token and an access token for your own API.
+    AUTH_ENABLED             optional — "0" turns the guard off for local dev.
+                             Never set this to 0 in UAT or PROD.
+    AUTH_CACHE_TTL           optional — seconds to cache a user row. Default 300.
+    AUTH_JWKS_TTL            optional — seconds to cache signing keys. Default 3600.
+    AUTH_CLOCK_SKEW          optional — seconds of leeway on exp/nbf. Default 60.
+    INTERNAL_API_KEY         optional — shared secret for machine callers
+                             (the external ATR scheduler). Sent as
+                             X-Internal-Key. Leave unset to disable.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+import traceback
+
+from flask import Blueprint, g, jsonify, request
+import jwt
+from jwt import PyJWKClient
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+AAD_TENANT_ID = os.environ.get("AAD_TENANT_ID", "")
+AAD_CLIENT_ID = os.environ.get("AAD_CLIENT_ID", "")
+
+_aud_env = os.environ.get("AAD_ALLOWED_AUDIENCES", "").strip()
+if _aud_env:
+    ALLOWED_AUDIENCES = {a.strip() for a in _aud_env.split(",") if a.strip()}
+else:
+    ALLOWED_AUDIENCES = {AAD_CLIENT_ID, f"api://{AAD_CLIENT_ID}"} if AAD_CLIENT_ID else set()
+
+ALLOWED_ISSUERS = {
+    f"https://login.microsoftonline.com/{AAD_TENANT_ID}/v2.0",
+    f"https://sts.windows.net/{AAD_TENANT_ID}/",
+}
+
+JWKS_URL = f"https://login.microsoftonline.com/{AAD_TENANT_ID}/discovery/v2.0/keys"
+
+AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "1") != "0"
+AUTH_CACHE_TTL = int(os.environ.get("AUTH_CACHE_TTL", "300"))
+AUTH_JWKS_TTL = int(os.environ.get("AUTH_JWKS_TTL", "3600"))
+AUTH_CLOCK_SKEW = int(os.environ.get("AUTH_CLOCK_SKEW", "60"))
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
+
+PG_DSN = os.environ["AZURE_POSTGRES_DSN"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROLE MODEL
+#
+# Same three roles as the old app. Change the mapping here and nowhere else.
+#
+#   Maker    pulls feeds, runs reconcile, refreshes customer data, reads
+#            everything. Cannot send anything to C-DOT.
+#   Checker  reviews and sends. Owns the irreversible step.
+#   Admin    both, plus configuration and user maintenance.
+#
+# `atr_submit` is deliberately NOT folded into `write`. Submitting an action
+# taken report to C-DOT cannot be undone, so it gets its own gate — a Maker
+# with full write access still cannot fire it.
+# ─────────────────────────────────────────────────────────────────────────────
+PERM_READ = "read"
+PERM_WRITE = "write"
+PERM_ATR_SUBMIT = "atr_submit"
+PERM_ADMIN = "admin"
+
+ROLE_PERMISSIONS: dict[str, set[str]] = {
+    "Maker":   {PERM_READ, PERM_WRITE},
+    "Checker": {PERM_READ, PERM_ATR_SUBMIT},
+    "Admin":   {PERM_READ, PERM_WRITE, PERM_ATR_SUBMIT, PERM_ADMIN},
+}
+
+VALID_ROLES = tuple(ROLE_PERMISSIONS)
+
+# Successes are only audited for these. Logging every GET would bury the rows
+# that matter under a million reads.
+SENSITIVE_PERMISSIONS = {PERM_WRITE, PERM_ATR_SUBMIT, PERM_ADMIN}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT -> PERMISSION
+#
+# Keyed on the view function name, so GET /atr/defaults (route_atr_defaults)
+# and PUT /atr/defaults (route_atr_defaults_save) are separate entries with
+# no method juggling.
+#
+# Anything not listed falls back to PERM_READ: a new route is reachable by any
+# provisioned user but never silently open to the internet. A warning is
+# printed so unmapped endpoints show up in the logs.
+# ─────────────────────────────────────────────────────────────────────────────
+ENDPOINT_PERMISSIONS: dict[str, str] = {
+    # ── open, no token needed ──
+    "health": None,
+
+    # ── C-DOT gateway credentials / crypto helpers ──
+    "encrypt":            PERM_WRITE,
+    "decrypt":            PERM_WRITE,
+    "auth":               PERM_WRITE,      # /fri/auth
+    "auth_mnrl":          PERM_WRITE,      # /mnrl/auth
+
+    # ── FRI / MNRL: counting is a read, exporting writes files ──
+    "route_fri_count":             PERM_READ,
+    "route_mnrl_count":            PERM_READ,
+    "route_mnrl_count_reactivated": PERM_READ,
+    "route_fri_export":            PERM_WRITE,
+    "route_mnrl_export":           PERM_WRITE,
+
+    # ── jobs and files ──
+    "route_export_status":      PERM_READ,
+    "route_files_list":         PERM_READ,
+    "route_files_download_url": PERM_READ,
+
+    # ── reconcile ──
+    "route_reconcile_folders": PERM_READ,
+    "route_reconcile_files":   PERM_READ,
+    "route_reconcile_start":   PERM_WRITE,
+    "route_reconcile_history": PERM_READ,
+    "route_reconcile_run":     PERM_READ,
+
+    # ── master store ──
+    "route_master_segments":          PERM_READ,
+    "route_master_gho_codes":         PERM_READ,
+    "route_master_dates":             PERM_READ,
+    "route_master_count":             PERM_READ,
+    "route_master_download":          PERM_READ,   # an export, not a mutation
+    "route_master_stats":             PERM_READ,
+    "route_master_conflicts":         PERM_READ,
+    "route_master_lookup":            PERM_READ,
+    "route_master_trace":             PERM_READ,
+    "route_master_timeline":          PERM_READ,
+    "route_master_refresh_customers": PERM_WRITE,
+    "route_master_purge":             PERM_ADMIN,  # destructive
+
+    # ── ATR ──
+    "route_atr_defaults":       PERM_READ,
+    "route_atr_defaults_save":  PERM_ADMIN,
+    "route_atr_config":         PERM_READ,
+    "route_atr_preview":        PERM_READ,
+    "route_atr_submit":         PERM_ATR_SUBMIT,   # irreversible
+    "route_atr_retry":          PERM_ATR_SUBMIT,   # requeues for sending
+    "route_atr_runs":           PERM_READ,
+    "route_atr_run_events":     PERM_READ,
+    "route_atr_number_history": PERM_READ,
+    "route_atr_events":         PERM_READ,
+    "route_atr_report":         PERM_READ,
+    "route_atr_diagnostics":    PERM_READ,
+    "route_atr_schedule":       PERM_READ,
+    "route_atr_schedule_save":  PERM_ADMIN,
+    "route_atr_schedule_tick":  PERM_ATR_SUBMIT,   # actually sends
+
+    # ── legacy matchoff aliases ──
+    "route_matchoff_folders_legacy": PERM_READ,
+    "route_matchoff_files_legacy":   PERM_READ,
+    "route_matchoff_start_legacy":   PERM_WRITE,
+    "route_matchoff_history_legacy": PERM_READ,
+
+    # ── this module ──
+    "me":            PERM_READ,
+    "read_users":    PERM_READ,
+    "admin_list":    PERM_ADMIN,
+    "admin_upsert":  PERM_ADMIN,
+    "admin_delete":  PERM_ADMIN,
+}
+
+# Callers that hold a valid token but have no app_users row still need to reach
+# these, otherwise the UI cannot tell them why they are locked out.
+PROVISIONING_EXEMPT = {"me"}
+
+# Machine callers with INTERNAL_API_KEY may hit these without a user token.
+INTERNAL_KEY_ENDPOINTS = {"route_atr_schedule_tick"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATABASE
+# Auth keeps its own tiny pool. User rows are TTL-cached, so this sees almost
+# no traffic, and an independent pool means a fault in the data path cannot
+# take sign-in down with it.
+# ─────────────────────────────────────────────────────────────────────────────
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pool
+    with _pool_lock:
+        if _pool is None or _pool.closed:
+            _pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=4, dsn=PG_DSN)
+    return _pool
+
+
+class _cursor:
+    """Borrows a connection, yields a dict cursor, always returns the connection."""
+
+    def __init__(self, commit: bool = False):
+        self.commit = commit
+        self._conn = None
+        self._cur = None
+
+    def __enter__(self):
+        self._conn = _get_pool().getconn()
+        self._cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        return self._cur
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._cur is not None:
+                self._cur.close()
+            if self._conn is not None:
+                if exc_type is None and self.commit:
+                    self._conn.commit()
+                else:
+                    self._conn.rollback()
+        finally:
+            if self._conn is not None:
+                try:
+                    _get_pool().putconn(self._conn)
+                except Exception:
+                    pass
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOKEN VERIFICATION
+# ─────────────────────────────────────────────────────────────────────────────
+class AuthError(Exception):
+    def __init__(self, message: str, status: int = 401, code: str = "unauthorized"):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+_jwk_client: PyJWKClient | None = None
+_jwk_lock = threading.Lock()
+
+
+def _get_jwk_client() -> PyJWKClient:
+    global _jwk_client
+    with _jwk_lock:
+        if _jwk_client is None:
+            if not AAD_TENANT_ID:
+                raise AuthError("AAD_TENANT_ID is not configured on the server.", 500,
+                                "server_misconfigured")
+            try:
+                _jwk_client = PyJWKClient(JWKS_URL, cache_keys=True, lifespan=AUTH_JWKS_TTL)
+            except TypeError:
+                # Older PyJWT without the lifespan kwarg.
+                _jwk_client = PyJWKClient(JWKS_URL, cache_keys=True)
+    return _jwk_client
+
+
+def _bearer_token() -> str | None:
+    header = request.headers.get("Authorization", "")
+    if header.lower().startswith("bearer "):
+        token = header[7:].strip()
+        return token or None
+    return None
+
+
+def verify_token(token: str) -> dict:
+    """Returns the verified claims, or raises AuthError."""
+    if not ALLOWED_AUDIENCES:
+        raise AuthError("AAD_CLIENT_ID is not configured on the server.", 500,
+                        "server_misconfigured")
+
+    try:
+        signing_key = _get_jwk_client().get_signing_key_from_jwt(token).key
+    except AuthError:
+        raise
+    except Exception as exc:
+        raise AuthError(f"Could not verify the signing key: {exc}", 401, "bad_token")
+
+    # The issuer is checked by hand below because Entra hands out v1.0 and v2.0
+    # issuer strings depending on the app registration, and PyJWT only accepts
+    # one issuer value.
+    try:
+        claims = jwt.decode(
+            token,
+            signing_key,
+            algorithms=["RS256"],
+            audience=list(ALLOWED_AUDIENCES),
+            leeway=AUTH_CLOCK_SKEW,
+            options={"verify_iss": False, "require": ["exp", "aud"]},
+        )
+    except jwt.ExpiredSignatureError:
+        raise AuthError("Your session expired. Sign in again.", 401, "expired")
+    except jwt.InvalidAudienceError:
+        raise AuthError("This token was issued for a different application.", 401, "bad_audience")
+    except jwt.PyJWTError as exc:
+        raise AuthError(f"Invalid token: {exc}", 401, "bad_token")
+
+    issuer = claims.get("iss", "")
+    if issuer not in ALLOWED_ISSUERS:
+        raise AuthError("This token came from a different tenant.", 401, "bad_issuer")
+
+    tid = claims.get("tid")
+    if tid and AAD_TENANT_ID and tid != AAD_TENANT_ID:
+        raise AuthError("This token came from a different tenant.", 401, "bad_tenant")
+
+    return claims
+
+
+def email_from_claims(claims: dict) -> str:
+    """Entra puts the sign-in name in different claims depending on the flow."""
+    for key in ("preferred_username", "upn", "email", "unique_name"):
+        value = claims.get(key)
+        if value and "@" in str(value):
+            return str(value).strip().lower()
+    raise AuthError(
+        "This token carries no email address. Add the 'email' optional claim to "
+        "the app registration.",
+        401, "no_email",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USER LOOKUP  (this is the Dataverse -> PostgreSQL swap)
+# ─────────────────────────────────────────────────────────────────────────────
+_user_cache: dict[str, tuple[float, dict | None]] = {}
+_user_cache_lock = threading.Lock()
+
+
+def _fetch_user(email: str) -> dict | None:
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT email_id, display_name, role, is_active
+              FROM app_users
+             WHERE email_id = %s
+            """,
+            (email,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_user(email: str, use_cache: bool = True) -> dict | None:
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+
+    now = time.time()
+    if use_cache:
+        with _user_cache_lock:
+            hit = _user_cache.get(email)
+        if hit and now - hit[0] < AUTH_CACHE_TTL:
+            return hit[1]
+
+    user = _fetch_user(email)
+    with _user_cache_lock:
+        _user_cache[email] = (now, user)
+    return user
+
+
+def invalidate_user(email: str | None = None) -> None:
+    """Called after any change to app_users so a revoked role takes effect now."""
+    with _user_cache_lock:
+        if email:
+            _user_cache.pop(email.strip().lower(), None)
+        else:
+            _user_cache.clear()
+
+
+def permissions_for(role: str | None) -> set[str]:
+    return set(ROLE_PERMISSIONS.get(role or "", set()))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUDIT
+# ─────────────────────────────────────────────────────────────────────────────
+def _client_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return (request.remote_addr or "")[:64]
+
+
+def audit(event: str, email: str | None = None, role: str | None = None,
+          permission: str | None = None, detail: str | None = None) -> None:
+    """Best effort. An audit failure must never break a request."""
+    try:
+        with _cursor(commit=True) as cur:
+            cur.execute(
+                """
+                INSERT INTO auth_events
+                    (email_id, role, event, permission, endpoint, method, path, ip, detail)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    (email or None) and email[:255],
+                    (role or None) and role[:20],
+                    event[:30],
+                    (permission or None) and permission[:30],
+                    (request.endpoint or "")[:120] or None,
+                    (request.method or "")[:10] or None,
+                    (request.path or "")[:300] or None,
+                    _client_ip() or None,
+                    (detail or None) and detail[:500],
+                ),
+            )
+    except Exception:
+        print("[AUTH] audit write failed:\n" + traceback.format_exc())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE GUARD
+# ─────────────────────────────────────────────────────────────────────────────
+def _required_permission(view_name: str) -> str | None:
+    if view_name in ENDPOINT_PERMISSIONS:
+        return ENDPOINT_PERMISSIONS[view_name]
+    print(f"[AUTH] endpoint '{view_name}' is not in ENDPOINT_PERMISSIONS — "
+          f"defaulting to '{PERM_READ}'. Add it to the map.")
+    return PERM_READ
+
+
+def _deny(message: str, status: int, code: str):
+    return jsonify({"error": message, "code": code}), status
+
+
+def install_auth(app) -> None:
+    """Attach the guard and register the auth endpoints. Call once from create_app()."""
+    app.register_blueprint(auth_api, url_prefix="/api")
+
+    @app.before_request
+    def _guard():
+        # Static assets and the SPA shell stay open; only the API is guarded.
+        if not request.path.startswith("/api/"):
+            return None
+
+        # CORS preflight carries no Authorization header by design.
+        if request.method == "OPTIONS":
+            return None
+
+        view_name = (request.endpoint or "").split(".")[-1]
+
+        # Unknown path — let Flask return its own 404 rather than a confusing 401.
+        if not request.endpoint:
+            return None
+
+        required = _required_permission(view_name)
+        if required is None:
+            return None  # explicitly public, e.g. /api/health
+
+        if not AUTH_ENABLED:
+            g.user = {"email_id": "auth-disabled@local", "display_name": "Auth disabled",
+                      "role": "Admin", "is_active": True}
+            g.permissions = permissions_for("Admin")
+            return None
+
+        # Machine callers (the external ATR scheduler) on a narrow allow-list.
+        if INTERNAL_API_KEY and view_name in INTERNAL_KEY_ENDPOINTS:
+            supplied = request.headers.get("X-Internal-Key", "")
+            if supplied and supplied == INTERNAL_API_KEY:
+                g.user = {"email_id": "internal-scheduler", "role": "Admin", "is_active": True}
+                g.permissions = permissions_for("Admin")
+                audit("allowed", email="internal-scheduler", role="Admin",
+                      permission=required, detail="internal key")
+                return None
+
+        token = _bearer_token()
+        if not token:
+            audit("no_token", permission=required)
+            return _deny("Sign in to continue.", 401, "no_token")
+
+        try:
+            claims = verify_token(token)
+            email = email_from_claims(claims)
+        except AuthError as exc:
+            audit("bad_token", permission=required, detail=str(exc))
+            return _deny(str(exc), exc.status, exc.code)
+
+        try:
+            user = get_user(email)
+        except Exception as exc:
+            print("[AUTH] user lookup failed:\n" + traceback.format_exc())
+            return _deny("Could not check your access right now. Try again.", 503, "lookup_failed")
+
+        g.claims = claims
+        g.email = email
+
+        if user is None:
+            g.user = None
+            g.permissions = set()
+            if view_name in PROVISIONING_EXEMPT:
+                return None
+            audit("not_provisioned", email=email, permission=required)
+            return _deny(
+                "Your account is not set up for this application. Ask an administrator "
+                "to add you.", 403, "not_provisioned",
+            )
+
+        if not user.get("is_active", False):
+            g.user = None
+            g.permissions = set()
+            if view_name in PROVISIONING_EXEMPT:
+                g.user = user
+                return None
+            audit("inactive", email=email, role=user.get("role"), permission=required)
+            return _deny("Your access has been deactivated.", 403, "inactive")
+
+        role = user.get("role")
+        perms = permissions_for(role)
+        g.user = user
+        g.permissions = perms
+
+        if required not in perms:
+            audit("denied", email=email, role=role, permission=required)
+            return _deny(
+                f"Your role ({role}) cannot perform this action.", 403, "forbidden",
+            )
+
+        if required in SENSITIVE_PERMISSIONS:
+            audit("allowed", email=email, role=role, permission=required)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS FOR APPLICATION CODE
+#
+# Optional. routes.py needs none of this — the guard has already run by the
+# time a view executes. Use current_user_email() when you want to stamp an
+# action with who did it, e.g. atr_defaults.updated_by.
+# ─────────────────────────────────────────────────────────────────────────────
+def current_user() -> dict | None:
+    return getattr(g, "user", None)
+
+
+def current_user_email() -> str | None:
+    user = current_user()
+    return user.get("email_id") if user else None
+
+
+def current_role() -> str | None:
+    user = current_user()
+    return user.get("role") if user else None
+
+
+def has_permission(permission: str) -> bool:
+    return permission in getattr(g, "permissions", set())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+auth_api = Blueprint("auth_api", __name__)
+
+
+def _shape(user: dict | None) -> dict | None:
+    """The object the React side reads. `role` here replaces `cr1d9_role`."""
+    if not user:
+        return None
+    return {
+        "email_id": user["email_id"],
+        "display_name": user.get("display_name"),
+        "role": user["role"],
+        "is_active": user.get("is_active", True),
+        "permissions": sorted(permissions_for(user["role"])),
+    }
+
+
+@auth_api.route("/me", methods=["GET"])
+def me():
+    """Who am I, according to the token plus app_users.
+
+    Always 200 so the UI can tell the difference between "not signed in"
+    (handled by MSAL) and "signed in but not provisioned" (show the error page).
+    """
+    user = current_user()
+    if not user:
+        return jsonify({
+            "authenticated": True,
+            "provisioned": False,
+            "email_id": getattr(g, "email", None),
+            "role": None,
+            "permissions": [],
+        })
+    return jsonify({"authenticated": True, "provisioned": bool(user.get("is_active")),
+                    **_shape(user)})
+
+
+@auth_api.route("/user/<path:email_id>", methods=["GET"])
+def read_users(email_id):
+    """Kept in the shape the old app used: a list, empty when there is no match.
+
+    The email in the URL is only honoured when it matches the token, or when
+    the caller is an Admin. That keeps the React code identical while removing
+    the ability to look up — or impersonate — anybody else.
+    """
+    requested = (email_id or "").strip().lower()
+    caller = (current_user_email() or "").lower()
+
+    if requested != caller and not has_permission(PERM_ADMIN):
+        audit("denied", email=caller, role=current_role(), permission=PERM_ADMIN,
+              detail=f"tried to read {requested[:100]}")
+        return jsonify({"error": "You can only look up your own account.",
+                        "code": "forbidden"}), 403
+
+    try:
+        user = get_user(requested)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify([_shape(user)] if user else [])
+
+
+# ── user maintenance (Admin only) ────────────────────────────────────────────
+@auth_api.route("/admin/users", methods=["GET"])
+def admin_list():
+    try:
+        with _cursor() as cur:
+            cur.execute(
+                """
+                SELECT email_id, display_name, role, is_active,
+                       created_by, created_at, updated_by, updated_at
+                  FROM app_users
+                 ORDER BY email_id
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        return jsonify(rows)
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@auth_api.route("/admin/users", methods=["POST", "PUT"])
+def admin_upsert():
+    body = request.get_json(silent=True) or {}
+    email = (body.get("email_id") or "").strip().lower()
+    role = (body.get("role") or "").strip()
+    display_name = (body.get("display_name") or "").strip() or None
+    is_active = bool(body.get("is_active", True))
+
+    if "@" not in email:
+        return jsonify({"error": "A valid email address is required."}), 400
+    if role not in ROLE_PERMISSIONS:
+        return jsonify({"error": f"Role must be one of: {', '.join(VALID_ROLES)}"}), 400
+
+    actor = current_user_email()
+
+    # An Admin removing their own admin rights locks the last door behind them.
+    if email == (actor or "").lower() and (role != "Admin" or not is_active):
+        return jsonify({
+            "error": "You cannot remove your own Admin access. Ask another Admin.",
+        }), 400
+
+    try:
+        with _cursor(commit=True) as cur:
+            cur.execute(
+                """
+                INSERT INTO app_users (email_id, display_name, role, is_active,
+                                       created_by, updated_by)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (email_id) DO UPDATE
+                   SET display_name = EXCLUDED.display_name,
+                       role         = EXCLUDED.role,
+                       is_active    = EXCLUDED.is_active,
+                       updated_by   = EXCLUDED.updated_by,
+                       updated_at   = NOW()
+                RETURNING email_id, display_name, role, is_active
+                """,
+                (email, display_name, role, is_active, actor, actor),
+            )
+            row = dict(cur.fetchone())
+        invalidate_user(email)
+        audit("user_upsert", email=actor, role=current_role(), permission=PERM_ADMIN,
+              detail=f"{email} -> {role} active={is_active}")
+        return jsonify(row)
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@auth_api.route("/admin/users/<path:email_id>", methods=["DELETE"])
+def admin_delete(email_id):
+    email = (email_id or "").strip().lower()
+    actor = current_user_email()
+
+    if email == (actor or "").lower():
+        return jsonify({"error": "You cannot remove your own account."}), 400
+
+    try:
+        with _cursor(commit=True) as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM app_users "
+                        "WHERE role = 'Admin' AND is_active AND email_id <> %s", (email,))
+            remaining = cur.fetchone()["n"]
+            if remaining == 0:
+                return jsonify({"error": "That is the last active Admin. "
+                                         "Promote someone else first."}), 400
+
+            cur.execute("DELETE FROM app_users WHERE email_id = %s", (email,))
+            deleted = cur.rowcount
+        invalidate_user(email)
+        audit("user_delete", email=actor, role=current_role(), permission=PERM_ADMIN,
+              detail=email)
+        return jsonify({"deleted": deleted})
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500

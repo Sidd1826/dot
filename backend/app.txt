@@ -13,10 +13,32 @@ def create_app():
     app = Flask(__name__, static_folder="frontend", static_url_path="")
 
     # Enable Cross-Origin Resource Sharing (CORS)
-    CORS(app)
+    #
+    # Authorization is now a real header on every API call, so it has to be on
+    # the allow-list and the browser has to be told the preflight answer can be
+    # cached. Origins are pinned in UAT/PROD via CORS_ORIGINS (comma separated);
+    # "*" stays the default so local development is unchanged.
+    origins = os.getenv("CORS_ORIGINS", "*")
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": [o.strip() for o in origins.split(",")]
+                               if origins != "*" else "*"}},
+        allow_headers=["Content-Type", "Authorization", "X-Internal-Key"],
+        expose_headers=["Content-Disposition"],
+        max_age=3600,
+    )
 
     # Register blueprints
     app.register_blueprint(routes, url_prefix="/api")
+
+    # Authentication + RBAC.
+    #
+    # Installed BEFORE the scheduler so a misconfigured tenant fails loudly at
+    # boot rather than at the first request. install_auth() registers the
+    # /api/me, /api/user/<email> and /api/admin/users endpoints and attaches a
+    # before_request guard covering every /api/* path — routes.py is untouched.
+    from auth import install_auth
+    install_auth(app)
 
     # Fortnightly ATR cycle.
     #
@@ -26,7 +48,7 @@ def create_app():
     # process to deploy, and no risk of the cycle firing several times.
     #
     # Set ATR_SCHEDULER_ENABLED=0 to run it from an external scheduler instead,
-    # by POSTing to /api/atr/schedule/tick.
+    # by POSTing to /api/atr/schedule/tick with the X-Internal-Key header.
     try:
         from atr import start_scheduler
         start_scheduler()
@@ -35,6 +57,16 @@ def create_app():
 
     @app.route("/")
     def root():
+        return send_from_directory(app.static_folder, "index.html")
+
+    # The SPA owns its own routing. Any unknown non-API path returns index.html
+    # so a hard refresh on /maker or /error does not 404. API paths fall through
+    # to Flask's normal 404.
+    @app.errorhandler(404)
+    def _spa_fallback(err):
+        from flask import request, jsonify
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "Not found"}), 404
         return send_from_directory(app.static_folder, "index.html")
 
     return app

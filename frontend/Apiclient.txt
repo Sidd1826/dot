@@ -1,0 +1,74 @@
+/**
+ * Token bridge.
+ *
+ * The `api` object inside HomeScreen.jsx is a plain module-level constant, not
+ * a React component, so it cannot read context or call hooks. Rather than
+ * rewrite 1,800 lines to thread an instance through every call site, App.js
+ * registers a token provider here once and HomeScreen's fetch wrapper asks for
+ * a token through this module.
+ *
+ * One import and one `await` inside `api.request` is the whole change on the
+ * HomeScreen side.
+ */
+
+let tokenProvider = null;
+let onUnauthorized = null;
+
+/** Called once by App.js, after MSAL is ready. */
+export function setTokenProvider(fn) {
+  tokenProvider = fn;
+}
+
+/** Called once by App.js. Runs when the API returns 401. */
+export function setUnauthorizedHandler(fn) {
+  onUnauthorized = fn;
+}
+
+/**
+ * Returns a bearer token, or null. MSAL caches and refreshes internally, so
+ * calling this on every request is cheap — it only hits the network when the
+ * cached token is close to expiry.
+ */
+export async function getAccessToken() {
+  if (!tokenProvider) return null;
+  try {
+    return await tokenProvider();
+  } catch (err) {
+    console.error("Could not acquire a token", err);
+    return null;
+  }
+}
+
+export function handleUnauthorized() {
+  if (onUnauthorized) onUnauthorized();
+}
+
+/**
+ * Wraps fetch with the Authorization header and turns 401/403 into readable
+ * messages. Exported for anything outside HomeScreen that needs to call the
+ * API — the Maintenance screen uses it.
+ */
+export async function authedFetch(url, options = {}) {
+  const token = await getAccessToken();
+
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options.headers || {}),
+    },
+  });
+
+  if (res.status === 401) {
+    handleUnauthorized();
+    throw new Error("Your session expired. Sign in again.");
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Request failed: ${res.status}`);
+  }
+
+  return res.json();
+}
