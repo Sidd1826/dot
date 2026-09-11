@@ -204,6 +204,7 @@ def _export_select(module: str) -> list[tuple[str, str]]:
         ("last_reported_on", "last_reported_on"),
         ("clear_reason", "clear_reason"),
         ("cleared_on", "cleared_on"),
+        ("cleared_feed_date", "cleared_feed_date"),
         (_current_status_sql(module), "current_status"),
         ("(cleared_on - first_reported_on)", "days_to_clear"),
         ("report_count", "report_count"),
@@ -252,6 +253,7 @@ EXPORT_LABELS: dict[str, str] = {
     "last_reported_on": "Last Reported On",
     "clear_reason": "Cleared Reason",
     "cleared_on": "Cleared On",
+    "cleared_feed_date": "Cleared Reported On",
     "current_status": "Current Status",
     "days_to_clear": "Days To Clear",
     "report_count": "Times Reported",
@@ -497,34 +499,36 @@ def _clear_sql(module: str) -> tuple[str, str]:
         return (
             f"""
 UPDATE {table} AS m
-SET status          = 'cleared',
-    clear_reason    = '{reason}',
-    cleared_on      = v.clear_date,
-    cleared_at      = NOW(),
-    reactivation_id = COALESCE(v.reactivation_id, m.reactivation_id),
-    updated_at      = NOW()
-FROM (VALUES %s) AS v(mobile_no, clear_date, reactivation_id)
+SET status            = 'cleared',
+    clear_reason      = '{reason}',
+    cleared_on        = v.clear_date,
+    cleared_feed_date = v.feed_date,
+    cleared_at        = NOW(),
+    reactivation_id   = COALESCE(v.reactivation_id, m.reactivation_id),
+    updated_at        = NOW()
+FROM (VALUES %s) AS v(mobile_no, clear_date, feed_date, reactivation_id)
 WHERE m.mobile_no = v.mobile_no
   AND (m.cleared_on IS NULL OR v.clear_date > m.cleared_on)
 RETURNING m.mobile_no
 """,
-            "(%s, %s::date, %s)",
+            "(%s, %s::date, %s::date, %s)",
         )
 
     return (
         f"""
 UPDATE {table} AS m
-SET status       = 'cleared',
-    clear_reason = '{reason}',
-    cleared_on   = v.clear_date,
-    cleared_at   = NOW(),
-    updated_at   = NOW()
-FROM (VALUES %s) AS v(mobile_no, clear_date)
+SET status            = 'cleared',
+    clear_reason      = '{reason}',
+    cleared_on        = v.clear_date,
+    cleared_feed_date = v.feed_date,
+    cleared_at        = NOW(),
+    updated_at        = NOW()
+FROM (VALUES %s) AS v(mobile_no, clear_date, feed_date)
 WHERE m.mobile_no = v.mobile_no
   AND (m.cleared_on IS NULL OR v.clear_date > m.cleared_on)
 RETURNING m.mobile_no
 """,
-        "(%s, %s::date)",
+        "(%s, %s::date, %s::date)",
     )
 
 
@@ -632,6 +636,12 @@ def _upsert(module: str, rows: list[tuple]) -> dict:
     return {"received": len(rows), "inserted": inserted, "updated": len(result) - inserted}
 
 
+# A clearance is newer when the FILE that carried it is newer.
+_FRESHER_CLEAR = (
+    "(COALESCE(m.cleared_feed_date, m.cleared_on) IS NULL "
+    " OR EXCLUDED.cleared_feed_date >= COALESCE(m.cleared_feed_date, m.cleared_on))"
+)
+
 _CLEARED_UPSERT_CACHE: dict[str, tuple[str, str]] = {}
 
 
@@ -664,14 +674,14 @@ def _cleared_upsert_sql(module: str) -> tuple[str, str]:
 
     cols = (["mobile_no", "cust_id", "gho_code", "segment"] + CUSTOMER_COLS
             + [c for c, _ in mcols] + ["payload"]
-            + ["status", "clear_reason", "cleared_on", "cleared_at",
+            + ["status", "clear_reason", "cleared_on", "cleared_feed_date", "cleared_at",
                "first_reported_on", "last_reported_on", "report_count", "atr_status"])
 
     template = (
         "(%s, %s, %s, %s, "
         + ", ".join(["%s"] * len(CUSTOMER_COLS)) + ", "
         + ", ".join(p for _, p in mcols) + ", %s"
-        + f", 'cleared', '{reason}', %s::date, NOW(), %s::date, %s::date, 1, 'pending'"
+        + f", 'cleared', '{reason}', %s::date, %s::date, NOW(), %s::date, %s::date, 1, 'pending'"
         + extra_val + ")"
     )
 
@@ -693,16 +703,15 @@ def _cleared_upsert_sql(module: str) -> tuple[str, str]:
 INSERT INTO {table} AS m ({", ".join(cols)}{extra_col})
 VALUES %s
 ON CONFLICT (mobile_no) DO UPDATE SET
-    -- Only a clearance NEWER than the one on file wins, so replaying an old
-    -- file can never un-clear or re-date a number.
-    status       = CASE WHEN m.cleared_on IS NULL OR EXCLUDED.cleared_on > m.cleared_on
-                        THEN 'cleared' ELSE m.status END,
-    clear_reason = CASE WHEN m.cleared_on IS NULL OR EXCLUDED.cleared_on > m.cleared_on
-                        THEN '{reason}' ELSE m.clear_reason END,
-    cleared_on   = CASE WHEN m.cleared_on IS NULL OR EXCLUDED.cleared_on > m.cleared_on
-                        THEN EXCLUDED.cleared_on ELSE m.cleared_on END,
-    cleared_at   = CASE WHEN m.cleared_on IS NULL OR EXCLUDED.cleared_on > m.cleared_on
-                        THEN NOW() ELSE m.cleared_at END,
+    -- "Newer" is judged on the FILE date, not the inner clearance date. A file
+    -- published on the 31st reporting a reactivation dated the 29th is still
+    -- newer information than one published on the 30th.
+    status       = CASE WHEN {_FRESHER_CLEAR} THEN 'cleared' ELSE m.status END,
+    clear_reason = CASE WHEN {_FRESHER_CLEAR} THEN '{reason}' ELSE m.clear_reason END,
+    cleared_on   = CASE WHEN {_FRESHER_CLEAR} THEN EXCLUDED.cleared_on ELSE m.cleared_on END,
+    cleared_feed_date = CASE WHEN {_FRESHER_CLEAR}
+                        THEN EXCLUDED.cleared_feed_date ELSE m.cleared_feed_date END,
+    cleared_at   = CASE WHEN {_FRESHER_CLEAR} THEN NOW() ELSE m.cleared_at END,
     -- Clearing is itself reportable: C-DOT is told the number is now compliant,
     -- with a different action code. So the row goes back in the queue rather
     -- than being written off as 'not_required'.
@@ -951,7 +960,7 @@ def ingest_fri_reconciled(
     for mobile, clear_date in clear_dates.items():
         hsbc = matched.get(mobile)
         if hsbc is None:
-            unmatched_clears.append((mobile, clear_date))
+            unmatched_clears.append((mobile, clear_date, fdate))
             continue
         gho = _txt(hsbc.get(gho_key), 20)
         record = compliant_records.get(mobile, {})
@@ -973,7 +982,9 @@ def ingest_fri_reconciled(
             _txt(_pick(record, hmap, "lsa_id"), 20),
             _txt(_pick(record, hmap, "tsp_id"), 20),
             _payload(record) if record else None,
-            clear_date, clear_date, clear_date,
+            # cleared_on = the real date, cleared_feed_date = the file's date.
+            # For FRI they are the same; the feed carries no separate date.
+            clear_date, fdate, clear_date, clear_date,
         ))
         cleared_history.append((
             MODULE_FRI, mobile, _txt(hsbc.get(cust_id_key), 100), segment_for(gho),
@@ -1065,12 +1076,12 @@ def ingest_mnrl_reconciled(
             react_id = _txt(_pick(record, hmap, "reactivation_id"), 50)
             hsbc = matched.get(mobile)
             if hsbc is None:
-                unmatched.append((mobile, clear_date, react_id))
+                unmatched.append((mobile, clear_date, fdate, react_id))
                 continue
             gho = _txt(hsbc.get(gho_key), 20)
             cleared_history.append((
                 MODULE_MNRL, mobile, _txt(hsbc.get(cust_id_key), 100),
-                segment_for(gho), "reactivated", clear_date,
+                segment_for(gho), "reactivated", fdate,
                 react_id or "reactivated", source_file,
             ))
             cleared_rows.append((
@@ -1086,7 +1097,10 @@ def ingest_mnrl_reconciled(
                 _txt(_pick(record, hmap, "lsa_id"), 20),
                 _txt(_pick(record, hmap, "tsp_id"), 20),
                 _payload(record),
-                clear_date, clear_date, clear_date,
+                # date_of_reactivation can precede the file that reports it — a
+                # 31 Aug file routinely carries 29/30 Aug reactivations. Both
+                # are kept; the file date is what the platform filters on.
+                clear_date, fdate, clear_date, clear_date,
                 react_id,
             ))
         cleared_stats = _upsert_cleared(MODULE_MNRL, _dedupe_rows(cleared_rows),
@@ -1178,9 +1192,15 @@ def _filter_clause(feed_date: Any = None, segment: str | None = None,
     clauses: list[str] = []
     params: list[Any] = []
 
+    # record_status also accepts two finer values, because "cleared" against a
+    # date is ambiguous: it can mean "cleared ON that date" or "relates to that
+    # date and is now cleared". Conflating them made a day with 10 reactivations
+    # report 24.
+    #   'cleared_on_date'   cleared ON the selected date  (the 10)
+    #   'cleared_elsewhere' reported on it, cleared another day (the other 14)
     if not include_cleared and record_status == "active":
         clauses.append("status = 'active'")
-    elif record_status == "cleared":
+    elif record_status in ("cleared", "cleared_on_date", "cleared_elsewhere"):
         clauses.append("status = 'cleared'")
 
     dfrom = _to_date(feed_date)
@@ -1198,9 +1218,23 @@ def _filter_clause(feed_date: Any = None, segment: str | None = None,
         # overlaps the range, OR it cleared inside it. record_status then only
         # narrows by current state.
         reported_overlap = "(first_reported_on <= %s AND last_reported_on >= %s)"
-        cleared_in_range = "(cleared_on BETWEEN %s AND %s)"
-        clauses.append(f"({reported_overlap} OR {cleared_in_range})")
-        params.extend([dto, dfrom, dfrom, dto])
+        # Match the FILE that reported the clearance, not the inner clearance
+        # date. Reconciling a 31 Aug reactivation file whose rows are dated the
+        # 29th must show those numbers under 31 Aug — that is the day they were
+        # processed. COALESCE covers rows written before cleared_feed_date
+        # existed.
+        cleared_in_range = "(COALESCE(cleared_feed_date, cleared_on) BETWEEN %s AND %s)"
+
+        if record_status == "cleared_on_date":
+            clauses.append(cleared_in_range)
+            params.extend([dfrom, dto])
+        elif record_status == "cleared_elsewhere":
+            # On the feed during the range, but it cleared outside it.
+            clauses.append(f"({reported_overlap} AND NOT {cleared_in_range})")
+            params.extend([dto, dfrom, dfrom, dto])
+        else:
+            clauses.append(f"({reported_overlap} OR {cleared_in_range})")
+            params.extend([dto, dfrom, dfrom, dto])
 
     if segment and segment.upper() not in ("ALL", ""):
         clauses.append("segment = %s")
@@ -1803,10 +1837,13 @@ def atr_preview_counts(module: str, feed_date: Any = None, segment: str | None =
 
     dfrom = _to_date(feed_date)
     dto = _to_date(date_to) or dfrom
-    date_params = [dfrom, dto, dfrom, dto] if dfrom else []
+    date_params = [dto, dfrom, dfrom, dto] if dfrom else []
+    # Must mirror _filter_clause exactly, or this aggregate and
+    # count_atr_eligible disagree — the same union predicate, on the FILE date
+    # for clearances.
     date_filter = (
-        """AND ((c.case_type = 'open'    AND m.last_reported_on BETWEEN %s AND %s)
-             OR (c.case_type = 'cleared' AND m.cleared_on        BETWEEN %s AND %s))"""
+        """AND ((m.first_reported_on <= %s AND m.last_reported_on >= %s)
+             OR (COALESCE(m.cleared_feed_date, m.cleared_on) BETWEEN %s AND %s))"""
         if dfrom else ""
     )
 
@@ -1836,6 +1873,52 @@ def atr_preview_counts(module: str, feed_date: Any = None, segment: str | None =
     with _cursor(dict_cursor=True) as cur:
         cur.execute(sql, params + date_params)
         return [dict(r) for r in cur.fetchall()]
+
+
+def refresh_customer_snapshot(module: str | None = None,
+                              only_if_longer: bool = True) -> dict:
+    """Re-sync the customer name/address/email block from mobilecleanup.
+
+    The master deliberately stores a SNAPSHOT of the customer taken at reconcile
+    time, so an address can't be rewritten under an old report. The cost is that
+    if mobilecleanup held a truncated or incomplete value when the number was
+    reconciled, the master keeps it until that number is reported again.
+
+    This repairs those rows in place.
+
+    only_if_longer=True (the default) is the conservative mode: a value is
+    replaced only when the current source value is strictly LONGER, which fixes
+    truncation without letting a since-shortened or blanked source erase good
+    data. Pass False to force a full re-sync.
+    """
+    modules = [module.upper()] if module else list(_TABLES)
+    out: dict[str, int] = {}
+
+    for mod in modules:
+        table = _TABLES[mod]
+        sets, conds = [], []
+        for col in CUSTOMER_COLS:
+            sets.append(f"{col} = COALESCE(c.{col}, m.{col})")
+            if only_if_longer:
+                conds.append(
+                    f"(c.{col} IS NOT NULL AND "
+                    f"length(c.{col}) > length(COALESCE(m.{col}, '')))"
+                )
+            else:
+                conds.append(f"(c.{col} IS DISTINCT FROM m.{col})")
+
+        sql = f"""
+            UPDATE {table} AS m
+            SET {", ".join(sets)}, updated_at = NOW()
+            FROM {MOBILECLEANUP_TABLE} AS c
+            WHERE c.final_mob_num = m.mobile_no
+              AND ({" OR ".join(conds)})
+        """
+        with _cursor() as cur:
+            cur.execute(sql)
+            out[f"{mod.lower()}_rows_refreshed"] = cur.rowcount
+
+    return out
 
 
 def trace_customer_value(mobile_no: str, column: str = "zbiadd") -> dict:

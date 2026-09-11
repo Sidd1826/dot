@@ -999,7 +999,11 @@ def export_master(
         row_id = save_export_metadata(
             module=module, file_name=part_fname, blob_name=blob_name,
             record_count=row_count, export_date=label_date,
-            data_type=(segment or "All segments"),
+            # data_type means the FEED type and is constrained to
+            # Normal / Reactivated / NULL. A reconciled export has no feed type,
+            # so it stays NULL; the classification goes in its own column.
+            # Putting "All segments" in data_type violated that CHECK.
+            data_type=None,
             source="reconciled", segment=segment,
         )
         parts_meta.append({

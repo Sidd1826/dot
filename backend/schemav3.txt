@@ -382,8 +382,13 @@ END $$;
 -- =============================================================================
 -- VIEWS
 -- =============================================================================
-CREATE OR REPLACE VIEW v_fri_active  AS SELECT * FROM fri_master  WHERE status = 'active';
-CREATE OR REPLACE VIEW v_mnrl_active AS SELECT * FROM mnrl_master WHERE status = 'active';
+-- Dropped first, not REPLACEd: they select *, and Postgres refuses to replace a
+-- view whose column list has changed — which happens every time a later section
+-- of this file adds a column to a master table.
+DROP VIEW IF EXISTS v_fri_active;
+CREATE VIEW v_fri_active  AS SELECT * FROM fri_master  WHERE status = 'active';
+DROP VIEW IF EXISTS v_mnrl_active;
+CREATE VIEW v_mnrl_active AS SELECT * FROM mnrl_master WHERE status = 'active';
 
 -- what the ATR tab shows before you press send
 CREATE OR REPLACE VIEW v_atr_queue AS
@@ -673,11 +678,18 @@ CREATE INDEX IF NOT EXISTS idx_mnrl_master_report_dates
 
 -- ── 3. What the reconciled report shows for a date ──────────────────────────
 -- Active numbers reported that day, PLUS numbers that cleared that day.
-CREATE OR REPLACE VIEW v_fri_daily_report AS
+--
+-- Dropped and recreated rather than CREATE OR REPLACE: these select *, and
+-- Postgres refuses to REPLACE a view whose column list has changed. Every later
+-- section of this file that adds a column to the master tables would otherwise
+-- break the migration on its second run.
+DROP VIEW IF EXISTS v_fri_daily_report;
+CREATE VIEW v_fri_daily_report AS
     SELECT *, CASE WHEN status = 'cleared' THEN clear_reason ELSE fri_status END AS report_status
     FROM fri_master;
 
-CREATE OR REPLACE VIEW v_mnrl_daily_report AS
+DROP VIEW IF EXISTS v_mnrl_daily_report;
+CREATE VIEW v_mnrl_daily_report AS
     SELECT *, CASE WHEN status = 'cleared' THEN clear_reason ELSE 'disconnected' END AS report_status
     FROM mnrl_master;
 
@@ -1107,6 +1119,62 @@ UPDATE export_files
 SET source = 'reconciled'
 WHERE source <> 'reconciled'
   AND container IN ('fri-reconciled', 'mnrl-reconciled');
+
+
+-- =============================================================================
+-- v3.10 — SEPARATE the date a number cleared from the file that reported it
+--
+-- An MNRL reactivation file published on 31 Aug can contain numbers whose
+-- date_of_reactivation is the 29th or 30th. cleared_on stored that inner date,
+-- and the date filter matched on it — so reconciling the 31 Aug file and then
+-- asking for "now reactivated on 31 Aug" returned nothing, even though those
+-- numbers had just been processed.
+--
+-- Two different facts were sharing one column:
+--   cleared_on         when the number ACTUALLY cleared (business truth)
+--   cleared_feed_date  the data date of the FILE that told us (processing truth)
+--
+-- Filtering and reporting use the file date, because that is how every other
+-- date in the platform behaves — first_reported_on and last_reported_on are
+-- feed dates too. cleared_on keeps the real date for the audit and the ATR.
+--
+-- This also removes an inconsistency between the modules: FRI set cleared_on to
+-- the feed date (the FRI feed carries no separate compliance date) while MNRL
+-- set it to date_of_reactivation. Same column, two meanings.
+-- =============================================================================
+
+ALTER TABLE fri_master  ADD COLUMN IF NOT EXISTS cleared_feed_date DATE;
+ALTER TABLE mnrl_master ADD COLUMN IF NOT EXISTS cleared_feed_date DATE;
+
+-- Existing rows: the best available value is the one already stored. For FRI it
+-- is already the feed date; for MNRL it may be a day or two early, which is
+-- exactly the discrepancy this column now makes visible.
+UPDATE fri_master  SET cleared_feed_date = cleared_on
+WHERE cleared_on IS NOT NULL AND cleared_feed_date IS NULL;
+UPDATE mnrl_master SET cleared_feed_date = cleared_on
+WHERE cleared_on IS NOT NULL AND cleared_feed_date IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_fri_master_cleared_feed
+    ON fri_master (cleared_feed_date) WHERE status = 'cleared';
+CREATE INDEX IF NOT EXISTS idx_mnrl_master_cleared_feed
+    ON mnrl_master (cleared_feed_date) WHERE status = 'cleared';
+
+-- master_history records what a FILE said on its data date, so a reactivation
+-- event belongs to the file date. Rows written before this used the inner
+-- reactivation date; realign them where the master knows better.
+UPDATE master_history h
+SET feed_date = m.cleared_feed_date
+FROM mnrl_master m
+WHERE h.module = 'MNRL'
+  AND h.event_type = 'reactivated'
+  AND h.mobile_no = m.mobile_no
+  AND m.cleared_feed_date IS NOT NULL
+  AND h.feed_date <> m.cleared_feed_date
+  AND NOT EXISTS (
+      SELECT 1 FROM master_history x
+      WHERE x.module = h.module AND x.mobile_no = h.mobile_no
+        AND x.event_type = h.event_type AND x.feed_date = m.cleared_feed_date
+  );
 
 
 -- =============================================================================
