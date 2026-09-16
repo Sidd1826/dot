@@ -7,40 +7,51 @@ import { PublicClientApplication, EventType } from "@azure/msal-browser";
 import { msalConfig } from "./authConfig";
 import { BrowserRouter } from "react-router-dom";
 
-const msalInstance = new PublicClientApplication(msalConfig);
+// A window opened via loginPopup() is a scratch tab whose only job is to let
+// MSAL's opener-side monitor read the auth response off its URL. If our full
+// app — router included — mounts inside it, a route like
+// <Navigate to="/login" replace /> rewrites the URL before MSAL's poll ever
+// sees the hash, and acquireToken times out waiting for something that just
+// got erased. So: when this script is running inside a popup, render nothing
+// and let MSAL do its thing and close the window itself.
+const isMsalPopup =
+  !!window.opener &&
+  window.opener !== window &&
+  !!window.name &&
+  window.name.indexOf("msal.") === 0;
 
-/**
- * MSAL v3 requires initialize() to resolve before any other call. The old app
- * called getAllAccounts() straight after the constructor, which happens to work
- * on v2 but throws BrowserAuthError: uninitialized_public_client_application
- * on v3. Doing the account wiring inside the promise covers both.
- */
-msalInstance.initialize().then(() => {
-  if (
-    !msalInstance.getActiveAccount() &&
-    msalInstance.getAllAccounts().length > 0
-  ) {
-    msalInstance.setActiveAccount(msalInstance.getAllAccounts()[0]);
-  }
+if (isMsalPopup) {
+  // Deliberately no React app, no router, no navigation of any kind here.
+} else {
+  const msalInstance = new PublicClientApplication(msalConfig);
 
-  msalInstance.addEventCallback((event) => {
+  msalInstance.initialize().then(() => {
     if (
-      (event.eventType === EventType.LOGIN_SUCCESS ||
-        event.eventType === EventType.ACQUIRE_TOKEN_SUCCESS) &&
-      event.payload?.account
+      !msalInstance.getActiveAccount() &&
+      msalInstance.getAllAccounts().length > 0
     ) {
-      msalInstance.setActiveAccount(event.payload.account);
+      msalInstance.setActiveAccount(msalInstance.getAllAccounts()[0]);
     }
-  });
 
-  const root = ReactDOM.createRoot(document.getElementById("root"));
-  root.render(
-    <React.StrictMode>
-      <BrowserRouter>
-        <App instance={msalInstance} />
-      </BrowserRouter>
-    </React.StrictMode>
-  );
-});
+    msalInstance.addEventCallback((event) => {
+      if (
+        (event.eventType === EventType.LOGIN_SUCCESS ||
+          event.eventType === EventType.ACQUIRE_TOKEN_SUCCESS) &&
+        event.payload?.account
+      ) {
+        msalInstance.setActiveAccount(event.payload.account);
+      }
+    });
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(
+      <React.StrictMode>
+        <BrowserRouter>
+          <App instance={msalInstance} />
+        </BrowserRouter>
+      </React.StrictMode>
+    );
+  });
+}
 
 reportWebVitals();
