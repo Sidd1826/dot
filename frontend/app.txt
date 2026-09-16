@@ -1,0 +1,237 @@
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  AuthenticatedTemplate,
+  UnauthenticatedTemplate,
+  MsalProvider,
+  useMsal,
+} from "@azure/msal-react";
+import {
+  EventType,
+  InteractionStatus,
+  InteractionRequiredAuthError,
+} from "@azure/msal-browser";
+import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+
+import { loginRequest, tokenRequest } from "./authConfig";
+import {
+  setTokenProvider,
+  setUnauthorizedHandler,
+  authedFetch,
+} from "./apiClient";
+import { AuthProvider, PERMISSIONS } from "./AuthContext";
+
+import Loader from "./components/Loader";
+import ErrorPage from "./components/ErrorPage";
+import LoginPage from "./components/LoginPage";
+import MaintenanceScreen from "./components/MaintenanceScreen";
+import HomeScreen from "./pages/HomeScreen";
+
+const BASE_URL =
+  process.env.REACT_APP_ENV === "UAT"
+    ? process.env.REACT_APP_BASE_URL_UAT
+    : process.env.REACT_APP_BASE_URL_DEV;
+
+/**
+ * Guards a route by permission rather than by role name.
+ *
+ * The old app listed allowed roles per route. Permissions are one level of
+ * indirection better: adding a fourth role later means editing the map in
+ * auth.py, not hunting through JSX for every allowedRoles array.
+ */
+const ProtectedRoute = ({ permission, permissions, children }) => {
+  if (!permissions) return <Loader />;
+  if (!permissions.includes(permission)) {
+    return <Navigate to="/" replace />;
+  }
+  return children;
+};
+
+const WrappedView = () => {
+  const { instance, inProgress, accounts } = useMsal();
+
+  const [activeAccount, setActiveAccount] = useState(null);
+  const [profile, setProfile] = useState(null); // the /api/me body
+  const [loadingProfile, setLoadingProfile] = useState(false);
+  const [profileError, setProfileError] = useState(null);
+  const [ready, setReady] = useState(false);
+
+  const navigate = useNavigate();
+
+  // ── token provider ────────────────────────────────────────────────────────
+  // Registered once. Everything that calls the API — HomeScreen's `api`
+  // object, the Maintenance screen, this component — goes through it.
+  useEffect(() => {
+    setTokenProvider(async () => {
+      const account = instance.getActiveAccount() || accounts[0];
+      if (!account) return null;
+      try {
+        const result = await instance.acquireTokenSilent({
+          ...tokenRequest,
+          account,
+        });
+        return result.accessToken || result.idToken;
+      } catch (err) {
+        if (err instanceof InteractionRequiredAuthError) {
+          const result = await instance.acquireTokenPopup(tokenRequest);
+          return result.accessToken || result.idToken;
+        }
+        throw err;
+      }
+    });
+
+    setUnauthorizedHandler(() => {
+      // The token went stale mid-session. Clear the profile so the shell shows
+      // the loader, then let MSAL re-acquire on the next call.
+      setProfile(null);
+      setProfileError(null);
+    });
+  }, [instance, accounts]);
+
+  // ── who am I ──────────────────────────────────────────────────────────────
+  // One call, and the email comes from the token on the server side. Nothing
+  // identifying is sent from the browser.
+  const loadProfile = useCallback(async () => {
+    setLoadingProfile(true);
+    setProfileError(null);
+    try {
+      const me = await authedFetch(`${BASE_URL}/me`);
+      if (!me.provisioned) {
+        setProfile(null);
+        setProfileError({
+          title: "You do not have access yet",
+          message:
+            `${me.email_id || "Your account"} signed in successfully, but it is ` +
+            "not set up for the DOT Intelligence Platform. Ask an administrator " +
+            "to add you.",
+        });
+        return;
+      }
+      setProfile(me);
+    } catch (err) {
+      setProfile(null);
+      setProfileError({
+        title: "Could not check your access",
+        message: err.message,
+      });
+    } finally {
+      setLoadingProfile(false);
+    }
+  }, []);
+
+  // ── MSAL bootstrap ────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (inProgress !== InteractionStatus.None) return;
+
+    let account = instance.getActiveAccount();
+    if (!account && accounts.length > 0) {
+      account = accounts[0];
+      instance.setActiveAccount(account);
+    }
+    setActiveAccount(account || null);
+    setReady(true);
+
+    if (account) loadProfile();
+  }, [instance, inProgress, accounts, loadProfile]);
+
+  useEffect(() => {
+    const callbackId = instance.addEventCallback((event) => {
+      if (
+        (event.eventType === EventType.LOGIN_SUCCESS ||
+          event.eventType === EventType.ACCOUNT_ADDED) &&
+        event.payload?.account
+      ) {
+        const account = event.payload.account;
+        if (!instance.getActiveAccount()) instance.setActiveAccount(account);
+        setActiveAccount(account);
+        loadProfile();
+      }
+    });
+    return () => {
+      if (callbackId) instance.removeEventCallback(callbackId);
+    };
+  }, [instance, loadProfile]);
+
+  const handleLogin = () =>
+    instance
+      .loginPopup({ ...loginRequest, prompt: "select_account" })
+      .catch((err) => console.error("Login error", err));
+
+  const handleLogout = () => instance.logoutPopup();
+
+  // ── context value ─────────────────────────────────────────────────────────
+  const permissions = profile?.permissions || null;
+
+  const authValue = useMemo(
+    () => ({
+      account: activeAccount,
+      name: activeAccount?.name || profile?.display_name || null,
+      email: profile?.email_id || activeAccount?.username || null,
+      role: profile?.role || null,
+      permissions: permissions || [],
+      can: (permission) => !!permissions && permissions.includes(permission),
+      logout: handleLogout,
+      refresh: loadProfile,
+      goToMaintenance: () => navigate("/maintenance"),
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeAccount, profile, permissions, loadProfile]
+  );
+
+  if (!ready || inProgress !== InteractionStatus.None) return <Loader />;
+
+  return (
+    <div className="App min-h-screen">
+      <AuthenticatedTemplate>
+        {!activeAccount ? (
+          <Loader />
+        ) : loadingProfile ? (
+          <Loader label="Checking your access…" />
+        ) : profileError ? (
+          <ErrorPage
+            title={profileError.title}
+            message={profileError.message}
+            onRetry={loadProfile}
+            onSignOut={handleLogout}
+          />
+        ) : !profile ? (
+          <Loader />
+        ) : (
+          <AuthProvider value={authValue}>
+            <Routes>
+              <Route path="/" element={<HomeScreen />} />
+              <Route
+                path="/maintenance"
+                element={
+                  <ProtectedRoute
+                    permission={PERMISSIONS.ADMIN}
+                    permissions={permissions}
+                  >
+                    <MaintenanceScreen />
+                  </ProtectedRoute>
+                }
+              />
+              <Route path="/error" element={<ErrorPage />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </AuthProvider>
+        )}
+      </AuthenticatedTemplate>
+
+      <UnauthenticatedTemplate>
+        <Routes>
+          <Route path="/login" element={<LoginPage onLogin={handleLogin} />} />
+          <Route path="/error" element={<ErrorPage />} />
+          <Route path="*" element={<Navigate to="/login" replace />} />
+        </Routes>
+      </UnauthenticatedTemplate>
+    </div>
+  );
+};
+
+const App = ({ instance }) => (
+  <MsalProvider instance={instance}>
+    <WrappedView />
+  </MsalProvider>
+);
+
+export default App;
