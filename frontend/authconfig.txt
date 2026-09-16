@@ -1,0 +1,85 @@
+import { LogLevel } from "@azure/msal-browser";
+
+/**
+ * MSAL configuration for the DOT Intelligence Platform.
+ *
+ * Same shape as the previous application. Two things differ:
+ *
+ *  1. The ids and tenant come from environment variables rather than being
+ *     hard-coded, so the DEV / UAT / PROD registrations are set at build time
+ *     instead of in source control.
+ *
+ *  2. `loginRequest` asks for a scope on OUR OWN API. The old app used an
+ *     empty scope array, which gets you an ID token and nothing the Flask
+ *     side can properly validate as an API credential. Exposing
+ *     api://<clientId>/access_as_user on the app registration and asking for
+ *     it here means the backend receives a real access token with our client
+ *     id as the audience.
+ *
+ *     If you have not set that up yet, leave REACT_APP_API_SCOPE unset. The
+ *     code falls back to the ID token, and auth.py accepts it because the
+ *     client id is in AAD_ALLOWED_AUDIENCES by default. Do the app-registration
+ *     step before PROD though — it is five minutes of work and it is the
+ *     difference between an identity assertion and an API credential.
+ */
+
+const clientIdDev = process.env.REACT_APP_AAD_CLIENT_ID_DEV || "";
+const clientIdProd = process.env.REACT_APP_AAD_CLIENT_ID_PROD || "";
+const tenantId = process.env.REACT_APP_AAD_TENANT_ID || "";
+
+export const CLIENT_ID =
+  process.env.REACT_APP_ENV === "PROD" ? clientIdProd : clientIdDev;
+
+export const msalConfig = {
+  auth: {
+    clientId: CLIENT_ID,
+    authority: `https://login.microsoftonline.com/${tenantId}`,
+    redirectUri: "/", // Points to window.location.origin
+    postLogoutRedirectUri: "/",
+    navigateToLoginRequestUrl: false,
+  },
+  cache: {
+    cacheLocation: "sessionStorage", // "sessionStorage" or "localStorage"
+    storeAuthStateInCookie: false,
+  },
+  system: {
+    loggerOptions: {
+      loggerCallback: (level, message, containsPii) => {
+        if (containsPii) {
+          return;
+        }
+        switch (level) {
+          case LogLevel.Error:
+            console.error(message);
+            return;
+          case LogLevel.Warning:
+            console.warn(message);
+            return;
+          case LogLevel.Info:
+            if (process.env.NODE_ENV !== "production") console.info(message);
+            return;
+          default:
+            return;
+        }
+      },
+    },
+  },
+};
+
+/**
+ * The scope for our own Flask API. Set REACT_APP_API_SCOPE to
+ * `api://<clientId>/access_as_user` once the app registration exposes it.
+ */
+export const API_SCOPE =
+  process.env.REACT_APP_API_SCOPE ||
+  (CLIENT_ID ? `api://${CLIENT_ID}/access_as_user` : "");
+
+/** Scopes prompted for at sign-in. */
+export const loginRequest = {
+  scopes: API_SCOPE ? [API_SCOPE] : ["openid", "profile"],
+};
+
+/** Scopes requested silently before each API call. */
+export const tokenRequest = {
+  scopes: API_SCOPE ? [API_SCOPE] : ["openid", "profile"],
+};
